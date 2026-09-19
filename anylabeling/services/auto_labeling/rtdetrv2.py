@@ -53,6 +53,11 @@ class RTDETRv2(Model):
         self.net = OnnxBaseModel(model_abs_path, __preferred_device__)
         self.classes = self.config["classes"]
         self.input_shape = self.net.get_input_shape()[-2:]
+        # 优先用 YAML 里写的 input_height / input_width（动态输入的模型必须写）
+        input_height = self.config.get("input_height")
+        input_width = self.config.get("input_width")
+        if input_height and input_width:
+            self.input_shape = [int(input_height), int(input_width)]
         self.conf_thres = self.config["conf_threshold"]
         self.replace = True
         self.filter_classes = self.config.get("filter_classes", None)

@@ -70,8 +70,6 @@
   config_file: ":/internimage_l_22kto1k_384.yaml"
 - model_name: "japan_ppocr-r20240803"
   config_file: ":/japan_ppocr.yaml"
-- model_name: "ppocr_v6-r20260613"
-  config_file: ":/ppocr_v6.yaml"
 - model_name: "mobile_sam_vit_h-r20230810"
   config_file: ":/mobile_sam_vit_h.yaml"
 - model_name: "open_vision-r20241010"
@@ -348,10 +346,6 @@
   config_file: ":/yolox_l_dwpose_ucoco.yaml"
 - model_name: "yolox_s-r20230520"
   config_file: ":/yolox_s.yaml"
-- model_name: "comic_text_bubble_int8-r20250626"
-  config_file: "D:/Ddown/X-AnyLabeling-Hmogai260621_02/anylabeling/configs/auto_labeling/comic_text_bubble_int8.yaml"
-- model_name: "comic_text_bubble_v4s-r20250626"
-  config_file: "D:/Ddown/X-AnyLabeling-Hmogai260621_02/anylabeling/configs/auto_labeling/comic_text_bubble_v4s.yaml"
 
 - model_name: "manga_ocr-r20260627"
   config_file: ":/manga_ocr.yaml"
@@ -387,8 +381,3 @@
   config_file: ":/rio_detr_x_diorr.yaml"
 - model_name: "rio_detr_x_dota_1_ss-r20260808"
   config_file: ":/rio_detr_x_dota_1_ss.yaml"
-
-- model_name: "koharu_layout_rfdetr_seg_2xl_1152-local"
-  config_file: ":/koharu_layout_rfdetr_seg_2xl_1152.yaml"
-- model_name: "hayai_ocr_v21"
-  config_file: ":/hayai_ocr.yaml"

@@ -3,6 +3,8 @@ name: comic_text_bubble_int8-r20250626
 provider: ogkalu
 display_name: Comic-Text-Bubble-INT8
 model_path: D:/Ddown/comic-text-and-bubble-detector/detector_int8.onnx
+input_height: 640
+input_width: 640
 conf_threshold: 0.5
 classes:
   - bubble

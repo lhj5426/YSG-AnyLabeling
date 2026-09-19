@@ -17790,7 +17790,7 @@ class LabelingWidget(QtWidgets.QWidget):
         image_files = [i for i in items if i.lower().endswith(tuple(extensions))]
         if image_files:
             # 取第一个图片文件，打开其所在文件夹
-            first_image = image_files[0]
+            first_image = osp.normpath(image_files[0])
             folder_path = osp.dirname(first_image)
             recursive = self._config.get("load_subfolders", False)
             self.import_image_folder(folder_path, recursive=recursive)

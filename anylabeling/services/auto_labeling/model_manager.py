@@ -110,10 +110,20 @@ class ModelManager(QObject):
                 resource_path = pkg_resources.files(
                     auto_labeling_configs
                 ).joinpath("auto_labeling", config_file_name)
+                if not os.path.isfile(str(resource_path)):
+                    logger.warning(
+                        f"Skipped model config (file not found): {config_file}"
+                    )
+                    continue
                 with open(resource_path, "r", encoding="utf-8") as f:
                     model_config = yaml.safe_load(f)
                     model_config["config_file"] = str(config_file)
             else:  # Config file is in local file system
+                if not os.path.isfile(config_file):
+                    logger.warning(
+                        f"Skipped model config (file not found): {config_file}"
+                    )
+                    continue
                 with open(config_file, "r", encoding="utf-8") as f:
                     model_config = yaml.safe_load(f)
                     model_config["config_file"] = os.path.normpath(

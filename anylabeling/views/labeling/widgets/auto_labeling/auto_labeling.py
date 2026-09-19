@@ -578,8 +578,15 @@ class AutoLabelingWidget(QWidget):
                 and model_name in local_model_data[provider_name]
             ):
                 local_model_data[provider_name][model_name]["selected"] = False
-                model_data[provider_name].update(
-                    local_model_data[provider_name]
+                # 只合并这一个真实存在的模型，保留收藏名，丢弃存档里的失效条目
+                model_data[provider_name][model_name] = local_model_data[
+                    provider_name
+                ][model_name]
+                model_data[provider_name][model_name][
+                    "display_name"
+                ] = model_dict.get("display_name", model_name)
+                model_data[provider_name][model_name]["config_path"] = (
+                    model_dict.get("config_file")
                 )
             else:
                 model_data[provider_name][model_name] = {
