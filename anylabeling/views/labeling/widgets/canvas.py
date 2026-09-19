@@ -4298,9 +4298,16 @@ class Canvas(
         return self.drawing() and self.current and len(self.current) > 2
 
     # QT Overload
-    def mouseDoubleClickEvent(self, _):
+    def mouseDoubleClickEvent(self, event):
         """Mouse double click event"""
         if self.is_loading:
+            return
+
+        # 裁切检测：裁切框已画好时，双击 = 确认裁切区域，弹出裁切窗口
+        pan_duan = getattr(self.parent, "is_crop_pick_pending", None)
+        if callable(pan_duan) and pan_duan():
+            self.parent.confirm_crop_pick()
+            event.accept()
             return
 
         # Handle auto decode mode double click to finish
@@ -6353,12 +6360,9 @@ class Canvas(
                         shape_bg.setAlpha(235)
 
                 description_active = is_description_overlay_active(shape)
+                # 悬停/选中也按形状自己的 fg / bg 画，画布上任何时候都是真实颜色
                 desc_fg = shape_fg
                 desc_bg = shape_bg
-                if description_active:
-                    # The displaced source layer must remain visually distinct from the normal overlay.
-                    desc_fg = QtGui.QColor(20, 20, 20)
-                    desc_bg = QtGui.QColor(255, 210, 45, 245)
 
                 # 合并保留的文字层：按每个原框分别渲染，不重新排版（保持原字号/原位置）
                 if show_desc and attrs and attrs.get("merged_texts"):

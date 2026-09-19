@@ -229,6 +229,13 @@
       </widget>
      </item>
      <item>
+      <widget class="QPushButton" name="button_crop_detect">
+       <property name="text">
+        <string>裁切检测</string>
+       </property>
+      </widget>
+     </item>
+     <item>
       <widget class="QLineEdit" name="edit_text">
         <property name="placeholderText">
             <string>Enter text prompt here, e.g., person.car.bicycle</string>

@@ -110,6 +110,21 @@ from ...services import merger, tag_sorting
 LABEL_COLORMAP = utils.label_colormap()
 LABEL_OPACITY = 128
 
+# 菜单"视图"里的显示开关：主画布改了要同步到裁切检测的小画布
+_TONG_BU_DAO_XIAOHUABU = (
+    "show_texts",
+    "show_translations",
+    "show_labels",
+    "show_scores",
+    "show_degrees",
+    "show_wh",
+    "show_attributes",
+    "show_linking",
+    "show_groups",
+    "show_order",
+    "show_edge_direction",
+)
+
 
 class ShrinkableWidget(QtWidgets.QWidget):
     """QWidget whose minimumSizeHint returns (0, 0).
@@ -1547,7 +1562,7 @@ class LabelingWidget(QtWidgets.QWidget):
             "auto_highlight_shape", False
         )
         if self._config["auto_switch_to_edit_mode"]:
-            self.canvas.mode_changed.connect(self.set_edit_mode)
+            self.canvas.mode_changed.connect(self.on_canvas_mode_changed)
 
         # Crosshair
         self.crosshair_settings = self._config["canvas"]["crosshair"]
@@ -10954,6 +10969,15 @@ class LabelingWidget(QtWidgets.QWidget):
         preserve_brush_mode=False,
         preserve_magic_wand=False,
     ):
+        # 切到别的工具或编辑模式时，退出裁切框选流程（含待确认的框）
+        # 注意：画布画完框后自动切回编辑态（canvas.mode_changed）也走这里，
+        # 那种自动切换不算“用户换了工具”，不能把刚画好的裁切框清掉
+        if (edit or create_mode != "rectangle") and not getattr(
+            self, "_zidong_qiehuan_biaozhi", False
+        ):
+            self._crop_pick_active = False
+            if getattr(self, "_crop_pending_shape", None) is not None:
+                self._discard_pending_crop()
         if not preserve_brush_mode:
             self._digit_shortcut_used_brush = False
             if getattr(self.canvas, "is_brush_mode", False):
@@ -11243,6 +11267,159 @@ class LabelingWidget(QtWidgets.QWidget):
         self.set_text_editing(True)
         self.label_instruction.setText(self.get_labeling_instruction())
 
+    # ------------------------------------------------------------------
+    # 裁切检测的框选流程：
+    #   点“裁切检测” -> 在图上点两下画一个矩形（不进标注、不弹标签框）
+    #   -> 框留在画布上可以拖动 / 改顶点微调
+    #   -> 在框内双击确认，才按这块区域开小画布（Esc 放弃）
+    # ------------------------------------------------------------------
+    def start_crop_pick(self):
+        """进入框选模式：在图上点两下画一个矩形区域"""
+        if self.filename is None:
+            return False
+        self._crop_pick_active = True
+        self._crop_pending_shape = None
+        self.toggle_draw_mode(False, create_mode="rectangle")
+        self.label_instruction.setText(
+            self.tr("裁切检测：在图上点两下画一个矩形区域（按 Esc 取消）")
+        )
+        return True
+
+    def is_crop_pick_pending(self):
+        """是否已经画好框、正在等用户确认"""
+        return getattr(self, "_crop_pending_shape", None) is not None
+
+    def on_canvas_mode_changed(self):
+        """画布画完一个框后会自动切回编辑态（canvas.mode_changed）
+
+        这段自动切换要跳过“裁切框选收尾”，否则刚画好的裁切框会被当场清掉；
+        切完之后再把裁切的提示补回去（set_edit_mode 会覆盖提示文字）。
+        """
+        self._zidong_qiehuan_biaozhi = True
+        try:
+            self.set_edit_mode()
+        finally:
+            self._zidong_qiehuan_biaozhi = False
+        if self.is_crop_pick_pending():
+            self._show_crop_pending_hint()
+
+    def _show_crop_pending_hint(self):
+        """裁切框已就绪：提示微调方式与确认方式"""
+        self.label_instruction.setText(
+            self.tr(
+                "裁切区域已就绪：拖动框或顶点可微调，"
+                "在框内双击完成裁切（按 Esc 放弃）"
+            )
+        )
+
+    def _qingli_linshi_kuang_kuaiszhao(self):
+        """撤掉撤销栈里含临时裁切框的快照
+
+        临时框不是标注，按 Ctrl+Z 不该把它变回画布上。
+        """
+        canvas = self.canvas
+        backups = getattr(canvas, "shapes_backups", None)
+        if not backups:
+            return
+        while backups and any(
+            getattr(shape, "_caiqie_linshi", False) for shape in backups[-1]
+        ):
+            backups.pop()
+
+    def _discard_pending_crop(self):
+        """丢掉待确认的裁切框（不改动当前工具状态）"""
+        canvas = self.canvas
+        pending = getattr(self, "_crop_pending_shape", None)
+        self._crop_pending_shape = None
+        if pending is not None and pending in canvas.shapes:
+            canvas.shapes.remove(pending)
+            canvas.selected_shapes = [
+                shape
+                for shape in canvas.selected_shapes
+                if shape is not pending
+            ]
+            self._qingli_linshi_kuang_kuaiszhao()
+            canvas.store_shapes()
+        canvas.update()
+
+    def _end_crop_pick(self):
+        """收尾：清掉临时框、回到编辑状态"""
+        self._discard_pending_crop()
+        self._crop_pick_active = False
+        self.set_edit_mode()
+
+    def cancel_crop_pick(self):
+        """放弃框选"""
+        if self.canvas.drawing():
+            self.canvas.cancel_drawing()
+        self._end_crop_pick()
+
+    def confirm_crop_pick(self):
+        """确认裁切区域：读临时框的坐标，摘掉它，开小画布"""
+        shape = getattr(self, "_crop_pending_shape", None)
+        coords = None
+        if (
+            shape is not None
+            and shape in self.canvas.shapes
+            and shape.points
+        ):
+            xs = [point.x() for point in shape.points]
+            ys = [point.y() for point in shape.points]
+            coords = (
+                int(math.floor(min(xs))),
+                int(math.floor(min(ys))),
+                int(math.ceil(max(xs))),
+                int(math.ceil(max(ys))),
+            )
+        self._end_crop_pick()
+        if coords is None:
+            return
+        self.auto_labeling_widget.open_crop_dialog_for_rect(*coords)
+
+    def _finish_crop_pick(self):
+        """框画完了：先留着，等用户微调后双击确认"""
+        canvas = self.canvas
+        shape = canvas.shapes[-1] if canvas.shapes else None
+        old = getattr(self, "_crop_pending_shape", None)
+        if old is not None and old is not shape and old in canvas.shapes:
+            canvas.shapes.remove(old)
+        self._crop_pending_shape = None
+        if shape is None or len(shape.points) < 2:
+            self.cancel_crop_pick()
+            return
+
+        # 临时框不参与标注：清空标签、给个醒目颜色，
+        # 并打标记，便于从撤销栈里认出它
+        shape.label = ""
+        shape._caiqie_linshi = True
+        shape.line_color = QtGui.QColor(255, 140, 0)
+        shape.fill_color = QtGui.QColor(255, 140, 0, 60)
+        shape.select_line_color = QtGui.QColor(255, 140, 0)
+        shape.select_fill_color = QtGui.QColor(255, 140, 0, 90)
+
+        # 切回编辑态。这段 set_edit_mode 自己发起，不是用户换工具，
+        # 所以屏蔽掉“离开矩形工具就清掉裁切框”的判断
+        self._zidong_qiehuan_biaozhi = True
+        try:
+            self.set_edit_mode()
+        finally:
+            self._zidong_qiehuan_biaozhi = False
+        self._crop_pending_shape = shape
+
+        # finalise() 刚把含临时框的状态压进了撤销栈，撤掉它
+        self._qingli_linshi_kuang_kuaiszhao()
+
+        # 选中它，这样能直接用主画布那套拖动 / 顶点编辑来微调
+        for other in canvas.shapes:
+            other.selected = False
+            other.is_mouse_selected = False
+        shape.selected = True
+        shape.is_mouse_selected = True
+        canvas.selected_shapes = [shape]
+        canvas.update()
+
+        self._show_crop_pending_hint()
+
     def update_file_menu(self):
         """Update the 'Open Recent' menu with recent folders (not files)."""
         def exists(path):
@@ -11320,6 +11497,53 @@ class LabelingWidget(QtWidgets.QWidget):
                 self.canvas.set_shape_rotation(shape, angle_radians)
         self.set_dirty()  # Mark as dirty to enable saving
 
+    def _shishi_yanse_gengxin(self, shapes, jiu_shuxing, fg, bg):
+        """标签窗口里颜色一改就立刻写回形状并重绘画布
+
+        jiu_shuxing 是打开窗口那一刻各形状 attributes 的原样快照，
+        只用来当底子（保住 merged_texts 等别的字段）。
+        """
+        for shape, jiu in zip(shapes, jiu_shuxing):
+            shuxing = dict(jiu or {})
+            for ming, zhi in (("fg", fg), ("bg", bg)):
+                if zhi is None:
+                    shuxing.pop(ming, None)
+                else:
+                    shuxing[ming] = [int(zhi[0]), int(zhi[1]), int(zhi[2])]
+            shape.attributes = shuxing
+        self.canvas.update()
+
+    def _huanyuan_yanse(self, shapes, jiu_shuxing):
+        """点了 Cancel：把颜色恢复成打开窗口前的样子"""
+        for shape, jiu in zip(shapes, jiu_shuxing):
+            shape.attributes = jiu
+        self.canvas.update()
+
+    def _xie_hui_yanse(self, shape):
+        """把标签窗口里的文字色/背景色写回 shape.attributes 的 fg / bg
+
+        窗口里两个框都空着时不写，保持形状原有的 attributes 不动。
+        """
+        shuxing = dict(getattr(shape, "attributes", None) or {})
+        gai_le = False
+        for ming, zhi in (
+            ("fg", self.label_dialog.get_fg()),
+            ("bg", self.label_dialog.get_bg()),
+        ):
+            if zhi is None:
+                if ming in shuxing:
+                    shuxing.pop(ming, None)
+                    gai_le = True
+            else:
+                xin = [int(zhi[0]), int(zhi[1]), int(zhi[2])]
+                if list(shuxing.get(ming) or []) != xin:
+                    shuxing[ming] = xin
+                    gai_le = True
+        if not gai_le:
+            return
+        shape.attributes = shuxing
+        self.canvas.update()
+
     def batch_edit_labels(self, shapes):
         # 直接执行批量编辑，不再显示警告窗口
         first_shape = shapes[0]
@@ -11335,6 +11559,12 @@ class LabelingWidget(QtWidgets.QWidget):
         # Direction can be None, which will default to 0 in the dialog.
         shape_type_for_dialog = 'rotation' if are_all_rotation else None
         
+        # 颜色实时生效：窗口里改一下颜色，画布上立刻跟着变；取消则还原
+        yanse_jiu = [getattr(s, "attributes", None) for s in shapes]
+        self.label_dialog.set_yanse_shishi(
+            lambda fg, bg: self._shishi_yanse_gengxin(shapes, yanse_jiu, fg, bg)
+        )
+
         result = self.label_dialog.pop_up(
             text=first_shape.label,
             flags=first_shape.flags,
@@ -11345,7 +11575,9 @@ class LabelingWidget(QtWidgets.QWidget):
             move_mode="center",
             order=None,  # Disable order editing in batch mode
             shape_type=shape_type_for_dialog,
-            direction=None # Let dialog default to 0 for batch edit
+            direction=None,  # Let dialog default to 0 for batch edit
+            fg=(getattr(first_shape, "attributes", None) or {}).get("fg"),
+            bg=(getattr(first_shape, "attributes", None) or {}).get("bg"),
         )
 
         # Disconnect after dialog is closed
@@ -11355,8 +11587,11 @@ class LabelingWidget(QtWidgets.QWidget):
             except TypeError:
                 pass
 
+        self.label_dialog.set_yanse_shishi(None)
+
         if result[0] is None:
             # User cancelled, revert any preview changes
+            self._huanyuan_yanse(shapes, yanse_jiu)
             self.load_shapes(self.canvas.shapes, replace=True)
             return
 
@@ -11381,7 +11616,8 @@ class LabelingWidget(QtWidgets.QWidget):
             shape.description = description
             shape.difficult = difficult
             shape.kie_linking = kie_linking
-            
+            self._xie_hui_yanse(shape)
+
             if are_all_rotation and new_direction is not None:
                 shape.direction = new_direction
 
@@ -11441,6 +11677,12 @@ class LabelingWidget(QtWidgets.QWidget):
             self.label_dialog.angle_changed.connect(self._on_angle_preview_changed)
 
         direction = getattr(shape, 'direction', None)
+        shuxing_jiu = getattr(shape, "attributes", None) or {}
+        # 颜色实时生效：窗口里改一下颜色，画布上立刻跟着变；取消则还原
+        yanse_jiu = [getattr(shape, "attributes", None)]
+        self.label_dialog.set_yanse_shishi(
+            lambda fg, bg: self._shishi_yanse_gengxin([shape], yanse_jiu, fg, bg)
+        )
         (
             text,
             flags,
@@ -11461,6 +11703,8 @@ class LabelingWidget(QtWidgets.QWidget):
             order=current_order,
             direction=direction,
             shape_type=shape.shape_type,
+            fg=shuxing_jiu.get("fg"),
+            bg=shuxing_jiu.get("bg"),
         )
 
         # Disconnect after dialog is closed
@@ -11470,8 +11714,11 @@ class LabelingWidget(QtWidgets.QWidget):
             except TypeError:
                 pass # Fails if the connection was already broken, which is fine.
 
+        self.label_dialog.set_yanse_shishi(None)
+
         if text is None:
             # User cancelled, revert any preview changes by reloading the shape state
+            self._huanyuan_yanse([shape], yanse_jiu)
             self.load_shapes(self.canvas.shapes, replace=True)
             return
 
@@ -11491,6 +11738,7 @@ class LabelingWidget(QtWidgets.QWidget):
         shape.description = description
         shape.difficult = difficult
         shape.kie_linking = kie_linking
+        self._xie_hui_yanse(shape)
         if shape.shape_type == "rotation" and new_direction is not None:
             # Use set_shape_rotation to ensure points are updated to match the final angle
             self.canvas.set_shape_rotation(shape, new_direction)
@@ -15212,6 +15460,14 @@ class LabelingWidget(QtWidgets.QWidget):
 
         position MUST be in global coordinates.
         """
+        # 裁切框选流程：画好的矩形只用来定裁切区域，
+        # 不留标注、不弹标签框，等用户在框内双击才开小画布
+        if getattr(self, "_crop_pick_active", False) or getattr(
+            self, "_crop_pending_shape", None
+        ) is not None:
+            self._finish_crop_pick()
+            return
+
         items = self.unique_label_list.selectedItems()
         text = None
         if items:
@@ -16203,6 +16459,18 @@ class LabelingWidget(QtWidgets.QWidget):
                     show_order=bool(getattr(self.canvas, "show_order", True)),
                 )
 
+        # 同步到裁切检测小画布：窗口开着时，菜单里的显示/隐藏开关要立刻生效
+        _qie_hua = getattr(
+            getattr(self, "auto_labeling_widget", None),
+            "crop_detect_dialog",
+            None,
+        )
+        _qie_canvas = getattr(_qie_hua, "canvas", None)
+        if _qie_canvas is not None:
+            for _ming in _TONG_BU_DAO_XIAOHUABU:
+                setattr(_qie_canvas, _ming, getattr(self.canvas, _ming))
+            _qie_canvas.update()
+
     def on_new_brightness_contrast(self, qimage):
         self.canvas.load_pixmap(
             QtGui.QPixmap.fromImage(qimage), clear_shapes=False
@@ -16863,7 +17131,18 @@ class LabelingWidget(QtWidgets.QWidget):
 
     # QT Overload
     def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            # 裁切框选：回车 = 确认裁切
+            if self.is_crop_pick_pending():
+                self.confirm_crop_pick()
+                event.accept()
+                return
         if event.key() == Qt.Key_Escape:
+            # 裁切框选模式：Esc 放弃框选
+            if getattr(self, "_crop_pick_active", False) or self.is_crop_pick_pending():
+                self.cancel_crop_pick()
+                event.accept()
+                return
             # 魔术棒：先清预览，无预览时退出魔术棒模式
             if getattr(self.canvas, "_magic_wand_active", False):
                 self.canvas._clear_magic_wand_preview()
@@ -17046,6 +17325,12 @@ class LabelingWidget(QtWidgets.QWidget):
                 self._dock_state_loaded = True
                 self.save_dock_state(force=True)
                 return
+            # 这些面板被锁成"最小高度 = 上次保存的高度"，加起来可能超过屏幕可用
+            # 高度，主窗口的最小尺寸就会被顶到比屏幕还高 —— 启动最大化时 Windows
+            # 装不下，就报 QWindowsWindow::setGeometry 警告。
+            # 锁期间把主窗口的最小尺寸临时放开，_unlock 时恢复。
+            _zhuchuangkou = self.window()
+            _zhuchuangkou.setMinimumSize(1, 1)
             # Release the height lock after layout has fully settled.
             # At this point the splitter has accepted the forced positions
             # and subsequent layout passes will respect them.
@@ -17058,6 +17343,7 @@ class LabelingWidget(QtWidgets.QWidget):
                 except Exception:
                     pass
                 finally:
+                    _zhuchuangkou.setMinimumSize(0, 0)
                     self._dock_state_loaded = True
                     self.save_dock_state(force=True)
             QtCore.QTimer.singleShot(800, _unlock)

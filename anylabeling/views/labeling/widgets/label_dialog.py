@@ -1332,6 +1332,60 @@ class LabelDialog(QtWidgets.QDialog):
         self.edit_description.setFixedHeight(50)
         layout.addWidget(self.edit_description)
 
+        # 文字色 / 背景色（存进 shape.attributes 的 fg / bg）
+        self.edit_fg = QtWidgets.QLineEdit()
+        self.edit_fg.setPlaceholderText(self.tr("文字颜色"))
+        self.edit_bg = QtWidgets.QLineEdit()
+        self.edit_bg.setPlaceholderText(self.tr("背景颜色"))
+        self.yanse_kuai_fg = QtWidgets.QPushButton()
+        self.yanse_kuai_bg = QtWidgets.QPushButton()
+        for _kuai in (self.yanse_kuai_fg, self.yanse_kuai_bg):
+            _kuai.setFixedSize(28, 22)
+            _kuai.setFocusPolicy(QtCore.Qt.NoFocus)
+            _kuai.setCursor(QtCore.Qt.PointingHandCursor)
+            _kuai.setToolTip(
+                self.tr("点一下弹调色盘（调色盘里可到屏幕上取色）")
+            )
+
+        def _zuo_yanse_hang(biaoti, shuru, kuai):
+            hang = QtWidgets.QHBoxLayout()
+            hang.setContentsMargins(0, 0, 0, 0)
+            biao = QtWidgets.QLabel(biaoti)
+            biao.setFixedWidth(48)
+            hang.addWidget(biao)
+            hang.addWidget(shuru, 1)
+            hang.addWidget(kuai)
+            return hang
+
+        layout.addLayout(
+            _zuo_yanse_hang(self.tr("文字色"), self.edit_fg, self.yanse_kuai_fg)
+        )
+        layout.addLayout(
+            _zuo_yanse_hang(self.tr("背景色"), self.edit_bg, self.yanse_kuai_bg)
+        )
+
+        for _mubiao, _shuru, _kuai in (
+            ("fg", self.edit_fg, self.yanse_kuai_fg),
+            ("bg", self.edit_bg, self.yanse_kuai_bg),
+        ):
+            _shuru.textChanged.connect(
+                lambda _t=None, m=_mubiao: self._shuaxin_yanse_kuai(m)
+            )
+            _shuru.editingFinished.connect(
+                lambda m=_mubiao: self._guifan_yanse(m)
+            )
+            _kuai.clicked.connect(
+                lambda _c=False, m=_mubiao: self._kai_tiaosepan(m)
+            )
+        self._shuaxin_yanse_kuai("fg")
+        self._shuaxin_yanse_kuai("bg")
+        # 颜色框里按回车只做格式化，不要冒泡去触发 OK 把窗口关掉
+        self.edit_fg.installEventFilter(self)
+        self.edit_bg.installEventFilter(self)
+        # 颜色实时生效：窗口里颜色一改就回调一次（回调由调用方临时设置）
+        self._yanse_shishi = None
+        self._shishi_kai = False
+
         # difficult & confirm button
         layout_button = QtWidgets.QHBoxLayout()
         layout_button.addWidget(self.edit_difficult)
@@ -1385,6 +1439,196 @@ class LabelDialog(QtWidgets.QDialog):
         self.edit.setCompleter(completer)
         # Save last label
         self._last_label = ""
+
+    # ==================================================================
+    #  文字色 / 背景色
+    # ==================================================================
+    def eventFilter(self, obj, event):
+        # 颜色输入框里按回车：只做格式转换，不让事件冒泡去触发 OK 关窗口
+        if obj is getattr(self, "edit_fg", None) or obj is getattr(
+            self, "edit_bg", None
+        ):
+            if event.type() == QtCore.QEvent.KeyPress and event.key() in (
+                QtCore.Qt.Key_Return,
+                QtCore.Qt.Key_Enter,
+            ):
+                self._guifan_yanse("fg" if obj is self.edit_fg else "bg")
+                return True
+        return super().eventFilter(obj, event)
+
+    def _shuru_kuang(self, mubiao):
+        return self.edit_fg if mubiao == "fg" else self.edit_bg
+
+    def _kuai(self, mubiao):
+        return self.yanse_kuai_fg if mubiao == "fg" else self.yanse_kuai_bg
+
+    @staticmethod
+    def jiexi_yanse(wenzi):
+        """'247, 77, 93' 或 '#F07427' -> (r, g, b)；解析不了返回 None"""
+        if not wenzi:
+            return None
+        wenzi = str(wenzi).strip()
+        if wenzi.startswith("#"):
+            liu = wenzi[1:]
+            if len(liu) == 3:
+                liu = "".join(c * 2 for c in liu)
+            if len(liu) != 6:
+                return None
+            try:
+                return (
+                    int(liu[0:2], 16),
+                    int(liu[2:4], 16),
+                    int(liu[4:6], 16),
+                )
+            except ValueError:
+                return None
+        shuzi = re.findall(r"\d+", wenzi)
+        if len(shuzi) < 3:
+            return None
+        san = []
+        for zhi in shuzi[:3]:
+            n = int(zhi)
+            if n < 0 or n > 255:
+                return None
+            san.append(n)
+        return tuple(san)
+
+    @staticmethod
+    def geshi_rgb(rgb):
+        """(247, 77, 93) -> '247, 77, 93'"""
+        if not rgb or len(rgb) < 3:
+            return ""
+        return "{}, {}, {}".format(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+    def _shuaxin_yanse_kuai(self, mubiao):
+        """输入框内容变了，旁边的色块跟着变"""
+        kuai = self._kuai(mubiao)
+        rgb = self.jiexi_yanse(self._shuru_kuang(mubiao).text())
+        if rgb is None:
+            kuai.setStyleSheet(
+                "background-color: #ffffff; border: 1px solid #999999;"
+            )
+        else:
+            kuai.setStyleSheet(
+                "background-color: rgb({}, {}, {});"
+                " border: 1px solid #999999;".format(rgb[0], rgb[1], rgb[2])
+            )
+        self._shishi_yanse()
+
+    def set_yanse_shishi(self, huidiao):
+        """设置「颜色实时生效」的接收函数；huidiao(fg, bg) 由调用方实现
+
+        窗口里颜色一改（手输或调色盘）就立刻回调一次，
+        调用方负责写回形状并重绘画布。传 None 表示不再回调。
+        """
+        self._yanse_shishi = huidiao
+
+    def _shishi_yanse(self):
+        """颜色变了就通知调用方（只在窗口弹出后才生效，初始化回填不触发）"""
+        if not getattr(self, "_shishi_kai", False):
+            return
+        huidiao = getattr(self, "_yanse_shishi", None)
+        if callable(huidiao):
+            huidiao(self.get_fg(), self.get_bg())
+
+    def _guifan_yanse(self, mubiao):
+        """失焦/回车时把手输的 #F07427 统一转成 '247, 116, 39'"""
+        shuru = self._shuru_kuang(mubiao)
+        wenzi = shuru.text().strip()
+        rgb = self.jiexi_yanse(wenzi) if wenzi else None
+        if rgb is not None:
+            gui = self.geshi_rgb(rgb)
+            if gui != wenzi:
+                shuru.setText(gui)
+        self._shuaxin_yanse_kuai(mubiao)
+
+    def set_yanse(self, mubiao, rgb):
+        """外部回填颜色；rgb 为 (r, g, b) 或 None（清空）"""
+        if rgb is None:
+            self._shuru_kuang(mubiao).clear()
+        else:
+            self._shuru_kuang(mubiao).setText(self.geshi_rgb(rgb))
+        self._shuaxin_yanse_kuai(mubiao)
+
+    def get_fg(self):
+        return self.jiexi_yanse(self.edit_fg.text())
+
+    def get_bg(self):
+        return self.jiexi_yanse(self.edit_bg.text())
+
+    def _kai_tiaosepan(self, mubiao):
+        """点色块弹调色盘
+
+        用 Qt 自带的那个（不是 Windows 自带的）：只有它右下角带
+        「Pick Screen Color」取色器，可以直接到画布上吸色。
+
+        取色器是靠抢鼠标实现的，而这个标签窗口是 application-modal，
+        被模态挡住的窗口收不到鼠标事件 —— 取色的那一次"松开"送不进来，
+        取色器退不出去、OK/Cancel 一直灰着，看着就像卡死。
+        所以挂一个看门狗：取色期间一旦检测到鼠标按下过又松开，就替它
+        按一下回车，走 Qt 自己的收尾（取光标处颜色 + 结束取色）。
+        """
+        jiuyou = self.jiexi_yanse(self._shuru_kuang(mubiao).text())
+        chushi = (
+            QtGui.QColor(*jiuyou) if jiuyou else QtGui.QColor(255, 255, 255)
+        )
+
+        tiaosepan = QColorDialog(chushi, self)
+        tiaosepan.setOption(QColorDialog.DontUseNativeDialog, True)
+        tiaosepan.setWindowTitle(self.tr("选择颜色"))
+
+        zhuangtai = {"an_niu_kuang": None, "an_guo": False}
+
+        def _jian_tao():
+            if zhuangtai["an_niu_kuang"] is None:
+                for kuang in tiaosepan.findChildren(
+                    QtWidgets.QDialogButtonBox
+                ):
+                    if kuang.button(QtWidgets.QDialogButtonBox.Ok) is not None:
+                        zhuangtai["an_niu_kuang"] = kuang
+                        break
+            an_niu_kuang = zhuangtai["an_niu_kuang"]
+            if an_niu_kuang is None:
+                return
+            an_niu = an_niu_kuang.button(QtWidgets.QDialogButtonBox.Ok)
+            if an_niu.isEnabled():
+                # 没在取色
+                zhuangtai["an_guo"] = False
+                return
+            if QtWidgets.QApplication.mouseButtons() != QtCore.Qt.NoButton:
+                # 鼠标还按着，等松开
+                zhuangtai["an_guo"] = True
+                return
+            if not zhuangtai["an_guo"]:
+                return
+            zhuangtai["an_guo"] = False
+            if an_niu.isEnabled():
+                # 这一个瞬间取色已经正常收尾了，别多事
+                return
+            QtWidgets.QApplication.sendEvent(
+                tiaosepan,
+                QtGui.QKeyEvent(
+                    QtCore.QEvent.KeyPress,
+                    QtCore.Qt.Key_Return,
+                    QtCore.Qt.NoModifier,
+                ),
+            )
+
+        jian_tao = QtCore.QTimer(self)
+        jian_tao.setInterval(20)
+        jian_tao.timeout.connect(_jian_tao)
+        jian_tao.start()
+
+        xuan = QtGui.QColor()
+        if tiaosepan.exec_():
+            xuan = tiaosepan.currentColor()
+        jian_tao.stop()
+
+        if xuan.isValid():
+            self._shuru_kuang(mubiao).setText(
+                self.geshi_rgb((xuan.red(), xuan.green(), xuan.blue()))
+            )
+            self._shuaxin_yanse_kuai(mubiao)
 
     def add_linking_pair(self):
         linking_text = self.linking_input.text()
@@ -1595,7 +1839,11 @@ class LabelDialog(QtWidgets.QDialog):
         order=None,
         direction=None,
         shape_type=None,
+        fg=None,
+        bg=None,
     ):
+        # 回填颜色期间不触发实时回调，等窗口弹出去了才算用户改的
+        self._shishi_kai = False
         if self._fit_to_content["row"]:
             self.label_list.setMinimumHeight(
                 self.label_list.sizeHintForRow(0) * self.label_list.count() + 2
@@ -1611,6 +1859,9 @@ class LabelDialog(QtWidgets.QDialog):
         if description is None:
             description = ""
         self.edit_description.setPlainText(description)
+        # 文字色 / 背景色：不传就清空，避免残留上一次的
+        self.set_yanse("fg", fg)
+        self.set_yanse("bg", bg)
         # Set initial values for kie_linking
         self.reset_linking(kie_linking)
         if flags:
@@ -1684,7 +1935,11 @@ class LabelDialog(QtWidgets.QDialog):
                 qr.moveCenter(centerPoint)
                 self.move(qr.topLeft())
 
-        if self.exec_():
+        # 窗口弹出来了，用户改颜色就立刻生效
+        self._shishi_kai = True
+        jieguo_ok = self.exec_()
+        self._shishi_kai = False
+        if jieguo_ok:
             return (
                 self.edit.text(),
                 self.get_flags(),

@@ -1,10 +1,11 @@
 import os
 import sys
+import math
 import yaml
 import collections
 
 from PyQt5 import uic
-from PyQt5.QtCore import pyqtSignal, pyqtSlot, QPoint, QTimer, Qt
+from PyQt5.QtCore import pyqtSignal, pyqtSlot, QPoint, QTimer, Qt, QThread
 from PyQt5.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -22,7 +23,10 @@ from PyQt5.QtWidgets import (
     QMessageBox,
 )
 
-from anylabeling.services.auto_labeling.model_manager import ModelManager
+from anylabeling.services.auto_labeling.model_manager import (
+    GenericWorker,
+    ModelManager,
+)
 from anylabeling.services.auto_labeling.types import AutoLabelingMode
 from anylabeling.services.auto_labeling import (
     _AUTO_LABELING_IOU_MODELS,
@@ -39,6 +43,7 @@ from anylabeling.views.labeling.utils.style import (
 )
 from anylabeling.views.labeling.widgets.api_token_dialog import ApiTokenDialog
 from anylabeling.views.labeling.widgets.filter_classes_dialog import FilterClassesDialog
+from anylabeling.views.labeling.widgets.crop_detect_dialog import CropDetectDialog
 from anylabeling.views.labeling.widgets.searchable_model_dropdown import (
     load_json,
     save_json,
@@ -66,6 +71,7 @@ class AutoLabelingWidget(QWidget):
     cache_auto_label_changed = pyqtSignal()
     auto_decode_mode_changed = pyqtSignal(bool)
     clear_auto_decode_requested = pyqtSignal()
+    crop_result_ready = pyqtSignal(object)  # 裁切检测结果，跨线程回主线程用
 
     def __init__(self, parent):
         super().__init__()
@@ -174,6 +180,21 @@ class AutoLabelingWidget(QWidget):
         self.button_recog_all.clicked.connect(
             self.run_recognition_on_all_with_mode
         )
+
+        # --- Configuration for: button_crop_detect ---
+        # 裁切检测：点一下进入框选，在画布上画个矩形当裁切区，结果按原图坐标写回
+        self.crop_detect_dialog = None
+        self._crop_context = None       # 当前裁切块信息，None 表示不在裁切模式
+        self._crop_thread = None
+        self._crop_worker = None
+        self.crop_result_ready.connect(self._on_crop_result_ready)
+        self.button_crop_detect.setStyleSheet(
+            self._get_replace_button_style("#8a2be2", "#6b1fa8")
+        )
+        self.button_crop_detect.setToolTip(
+            self.tr("点一下进入框选模式，在画布上画一个矩形区域当裁切区")
+        )
+        self.button_crop_detect.clicked.connect(self.open_crop_detect_dialog)
 
         # --- Configuration for: toggle_use_existing_boxes (按钮样式下拉菜单) ---
         self.toggle_use_existing_boxes.setStyleSheet(
@@ -797,6 +818,313 @@ class AutoLabelingWidget(QWidget):
 
         self.model_manager.predict_shapes_threading(
             self.parent.image, self.parent.filename
+        )
+
+    # ==================================================================
+    #  裁切检测：把画布上选中的区域裁出来单独推理，结果写回原图坐标
+    # ==================================================================
+    def open_crop_detect_dialog(self):
+        """裁切检测按钮
+
+        画布上已经选中了框 -> 直接按这个框裁切，开裁切窗口；
+        没有选中 -> 进入截图式的框选模式，画好双击完成。
+        """
+        if self.parent.filename is None:
+            self.model_manager.new_model_status.emit(
+                self.tr("请先打开一张图片")
+            )
+            return
+
+        # 选中了标注框：直接用它的外接矩形裁切
+        mubiao = None
+        for shape in self.parent.canvas.selected_shapes:
+            if getattr(shape, "points", None):
+                mubiao = shape
+                break
+        if mubiao is not None:
+            xs = [point.x() for point in mubiao.points]
+            ys = [point.y() for point in mubiao.points]
+            self.open_crop_dialog_for_rect(
+                int(math.floor(min(xs))),
+                int(math.floor(min(ys))),
+                int(math.ceil(max(xs))),
+                int(math.ceil(max(ys))),
+            )
+            return
+
+        if not self.parent.start_crop_pick():
+            return
+        self.model_manager.new_model_status.emit(
+            self.tr(
+                "裁切检测：在画布上点两下画一个矩形，"
+                "位置不对可以拖动微调，双击框内完成裁切"
+            )
+        )
+
+    def open_crop_dialog_for_rect(self, x0, y0, x1, y1):
+        """用画布上框出来的矩形开裁切窗口（传入的是原图坐标）"""
+        image = self.parent.image
+        if image is None or image.isNull():
+            return
+
+        x0 = max(0, min(int(x0), image.width()))
+        y0 = max(0, min(int(y0), image.height()))
+        x1 = max(0, min(int(x1), image.width()))
+        y1 = max(0, min(int(y1), image.height()))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            self.model_manager.new_model_status.emit(
+                self.tr("框选的区域太小，请重新框选")
+            )
+            return
+
+        crop_image = image.copy(x0, y0, x1 - x0, y1 - y0)
+
+        self._crop_context = {
+            "filename": self.parent.filename,
+            "x0": x0,
+            "y0": y0,
+            "w": x1 - x0,
+            "h": y1 - y0,
+            "polygon": None,
+        }
+
+        if self.crop_detect_dialog is None:
+            self.crop_detect_dialog = CropDetectDialog(self.parent, self.parent)
+            self.crop_detect_dialog.detect_requested.connect(
+                self.run_crop_detection
+            )
+            self.crop_detect_dialog.write_back_requested.connect(
+                self.write_back_crop_results
+            )
+            self.crop_detect_dialog.closed.connect(self._on_crop_dialog_closed)
+
+        source_name = os.path.basename(self.parent.filename)
+        self.crop_detect_dialog.set_crop_image(
+            crop_image, x0, y0, source_name
+        )
+        self.crop_detect_dialog.show()
+        self.crop_detect_dialog.raise_()
+        self.crop_detect_dialog.activateWindow()
+
+        self.model_manager.new_model_status.emit(
+            self.tr("裁切窗口已打开：点窗口里的“执行检测”只对这一块检测")
+        )
+
+    def _crop_mode_active(self):
+        """裁切窗口是否生效（开着，且当前图片没换过）"""
+        if self._crop_context is None or self.crop_detect_dialog is None:
+            return False
+        if not self.crop_detect_dialog.isVisible():
+            return False
+        if self._crop_context.get("filename") != self.parent.filename:
+            # 换图了，裁切块已失效，自动收起
+            self.close_crop_detect_dialog()
+            return False
+        return True
+
+    def close_crop_detect_dialog(self):
+        """关闭裁切窗口，退出裁切模式"""
+        self._crop_context = None
+        if self.crop_detect_dialog is not None:
+            self.crop_detect_dialog.hide()
+
+    def _on_crop_dialog_closed(self):
+        self._crop_context = None
+
+    def run_crop_detection(self):
+        """裁切窗口的“执行检测”：只对裁切块推理，不动整图"""
+        if not self._crop_mode_active():
+            self.model_manager.new_model_status.emit(
+                self.tr(
+                    "裁切窗口已失效（图片已切换或窗口已关闭），请重新框选区域"
+                )
+            )
+            return
+        self._run_crop_prediction("predict_shapes")
+
+    def _run_crop_prediction(self, method_name="predict_shapes"):
+        """只对裁切块推理。模型、参数、后处理全部沿用主画布那一套"""
+        config = self.model_manager.loaded_model_config or {}
+        model = config.get("model")
+        if model is None:
+            self.model_manager.new_model_status.emit(
+                self.tr("Model is not loaded. Choose a mode to continue.")
+            )
+            return
+        if not hasattr(model, method_name):
+            self.model_manager.new_model_status.emit(
+                self.tr(f"当前模型不支持 {method_name}")
+            )
+            return
+
+        context = self._crop_context
+        crop_image = self.parent.image.copy(
+            context["x0"], context["y0"], context["w"], context["h"]
+        )
+
+        if self.crop_detect_dialog is not None:
+            self.crop_detect_dialog.set_busy(True)
+
+        self.model_manager.new_model_status.emit(
+            self.tr("正在对裁切区推理，请稍候...")
+        )
+
+        def _do():
+            try:
+                result = self._call_model_on_crop(
+                    model, method_name, crop_image
+                )
+            except Exception as error:  # noqa
+                logger.error(f"裁切检测失败: {error}")
+                result = None
+            self.crop_result_ready.emit(result)
+
+        with self.model_manager.model_execution_thread_lock:
+            if self._crop_thread is not None and self._crop_thread.isRunning():
+                self.model_manager.new_model_status.emit(
+                    self.tr("另一个模型正在执行，请稍候")
+                )
+                if self.crop_detect_dialog is not None:
+                    self.crop_detect_dialog.set_busy(False)
+                return
+            self._crop_thread = QThread()
+            self._crop_worker = GenericWorker(_do)
+            self._crop_worker.finished.connect(self._crop_thread.quit)
+            self._crop_worker.moveToThread(self._crop_thread)
+            self._crop_thread.started.connect(self._crop_worker.run)
+            self._crop_thread.start()
+
+    # 这些模型的 predict_shapes 无视第一个参数，内部靠 Image.open(image_path)
+    # 读文件，所以裁切推理必须先给它们落一份临时文件（按模块名匹配）
+    _LINSHI_WENJIAN_MOXING = (
+        "rfdetr",
+        "dfine",
+        "rio_detr",
+        "yoloe",
+        "rmbg",
+    )
+
+    def _call_model_on_crop(self, model, method_name, crop_image):
+        """把裁切块喂给当前模型
+
+        标准接口第一个参数吃 QImage；comic_text_detector 只认数组；
+        RFDETR / DFINE / YOLOE 这类模型只用第二个参数（文件路径）读图，
+        这里先把裁切块写成一张临时 PNG 再喂。
+        """
+        method = getattr(model, method_name)
+        mokuaiming = f"{type(model).__module__}".lower()
+
+        if any(k in mokuaiming for k in self._LINSHI_WENJIAN_MOXING):
+            import tempfile
+            import uuid
+            from PyQt5.QtGui import QImage
+
+            linshi_lujing = os.path.join(
+                tempfile.gettempdir(),
+                f"ysg_caijie_{uuid.uuid4().hex}.png",
+            )
+            try:
+                tupian = crop_image.convertToFormat(QImage.Format_RGB888)
+                if not tupian.save(linshi_lujing, "PNG"):
+                    logger.warning("裁切块写入临时文件失败")
+                    return None
+                return method(crop_image, linshi_lujing)
+            finally:
+                try:
+                    os.remove(linshi_lujing)
+                except OSError:
+                    pass
+
+        model_sig = f"{type(model).__module__}.{type(model).__name__}".lower()
+        if "comic_text_detector" in model_sig:
+            import cv2
+            from anylabeling.views.labeling.utils.opencv import (
+                qt_img_to_rgb_cv_img,
+            )
+
+            rgb = qt_img_to_rgb_cv_img(crop_image, None)
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).copy()
+            return method(bgr, None)
+        return method(crop_image, None)
+
+    def _on_crop_result_ready(self, result):
+        """裁切推理结果回到主线程：过滤后送窗口预览"""
+        if self.crop_detect_dialog is None or self._crop_context is None:
+            if self.crop_detect_dialog is not None:
+                self.crop_detect_dialog.set_busy(False)
+            return
+
+        shapes = []
+        if result is not None:
+            shapes = list(getattr(result, "shapes", None) or [])
+
+        # 多边形区域：只保留中心点落在多边形内的框
+        polygon = self._crop_context.get("polygon")
+        if polygon:
+            shapes = [
+                s for s in shapes if self._shape_center_in_polygon(s, polygon)
+            ]
+
+        self.crop_detect_dialog.set_results(shapes)
+        self.model_manager.new_model_status.emit(
+            self.tr(f"裁切区检出 {len(shapes)} 个框，确认后点“写回原图”")
+        )
+
+    @staticmethod
+    def _shape_center_in_polygon(shape, polygon):
+        """判断 shape 的中心点是否落在多边形内（射线法）"""
+        if not shape.points:
+            return False
+        cx = sum(p.x() for p in shape.points) / len(shape.points)
+        cy = sum(p.y() for p in shape.points) / len(shape.points)
+        inside = False
+        count = len(polygon)
+        for i in range(count):
+            x1, y1 = polygon[i]
+            x2, y2 = polygon[(i + 1) % count]
+            if (y1 > cy) != (y2 > cy):
+                x_cross = (x2 - x1) * (cy - y1) / (y2 - y1) + x1
+                if cx < x_cross:
+                    inside = not inside
+        return inside
+
+    def write_back_crop_results(self):
+        """把裁切窗口里的结果按原图坐标落到主画布"""
+        if not self._crop_mode_active():
+            self.model_manager.new_model_status.emit(
+                self.tr("裁切窗口已关闭，无法写回")
+            )
+            return
+
+        shapes = self.crop_detect_dialog.collect_shapes()
+        if not shapes:
+            self.model_manager.new_model_status.emit(
+                self.tr("裁切窗口里没有结果可写回")
+            )
+            return
+
+        canvas = self.parent.canvas
+        added = 0
+        for shape in shapes:
+            desc = shape.description
+            if desc:
+                new_desc = self.parent.ocr_replace_dialog.apply(
+                    shape.label, str(desc)
+                )
+                if new_desc != desc:
+                    shape.description = new_desc
+            canvas.shapes.append(shape)
+            added += 1
+
+        canvas.update()
+        self.parent.load_shapes(canvas.shapes, replace=True)
+        self.parent.save_file()
+        self.parent.set_dirty(mark_as_manually_edited=False)
+        self._notify_current_shapes_changed()
+
+        self.crop_detect_dialog.clear_results()
+        self.model_manager.new_model_status.emit(
+            self.tr(f"已写回 {added} 个框")
         )
 
     def run_vl_prediction(self):
@@ -1467,11 +1795,14 @@ class AutoLabelingWidget(QWidget):
                 logger.warning(
                     f"Warning: Widget '{widget_name}' not found in AutoLabelingWidget."
                 )
+        # 裁切检测只在模型加载后可用；没模型时不显示（见 hide_labeling_widgets）
+        self.button_crop_detect.show()
 
     def hide_labeling_widgets(self):
         """Hide labeling widgets by default"""
         widgets = [
             "button_run",
+            "button_crop_detect",
             "button_recog_selected",
             "button_recog_all",
             "button_add_point",
@@ -1620,7 +1951,7 @@ class AutoLabelingWidget(QWidget):
         return {}
 
     def run_detect_only(self):
-        """仅检测按钮：只跑检测器画框，不做 OCR"""
+        """仅检测按钮：只跑检测器画框，不做 OCR（只作用于整图）"""
         if self.parent.filename is None:
             return
 
