@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 from PIL import Image
@@ -195,7 +196,14 @@ class KoharuRFDETRSeg(RFDETR):
 
     def predict_shapes(self, image, image_path=None):
         if image is None: return AutoLabelingResult([], replace=self.replace)
-        try: source = Image.open(image_path).convert('RGB')
+        try:
+            if image_path is not None and os.path.isfile(image_path):
+                source = Image.open(image_path).convert('RGB')
+            elif isinstance(image, Image.Image):
+                # 实时推理：内存图像直接用，不落盘
+                source = image.convert('RGB')
+            else:
+                raise ValueError('image source is unavailable')
         except Exception as exc:
             logger.warning('Could not inference Koharu model: %s', exc)
             return AutoLabelingResult([], replace=self.replace)

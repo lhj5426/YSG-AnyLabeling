@@ -138,7 +138,13 @@ class RiODETR(Model):
             return []
 
         try:
-            image = Image.open(image_path).convert("RGB")
+            if image_path is not None and os.path.isfile(image_path):
+                image = Image.open(image_path).convert("RGB")
+            elif isinstance(image, Image.Image):
+                # 实时推理：内存图像直接用，不落盘
+                image = image.convert("RGB")
+            else:
+                raise ValueError("image source is unavailable")
         except Exception as e:  # noqa
             logger.warning("Could not inference model")
             logger.warning(e)

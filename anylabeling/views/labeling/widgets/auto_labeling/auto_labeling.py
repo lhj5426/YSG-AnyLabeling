@@ -44,6 +44,9 @@ from anylabeling.views.labeling.utils.style import (
 from anylabeling.views.labeling.widgets.api_token_dialog import ApiTokenDialog
 from anylabeling.views.labeling.widgets.filter_classes_dialog import FilterClassesDialog
 from anylabeling.views.labeling.widgets.crop_detect_dialog import CropDetectDialog
+from anylabeling.views.labeling.widgets.realtime_infer_dialog import (
+    RealtimeInferDialog,
+)
 from anylabeling.views.labeling.widgets.searchable_model_dropdown import (
     load_json,
     save_json,
@@ -195,6 +198,19 @@ class AutoLabelingWidget(QWidget):
             self.tr("点一下进入框选模式，在画布上画一个矩形区域当裁切区")
         )
         self.button_crop_detect.clicked.connect(self.open_crop_detect_dialog)
+
+        # --- Configuration for: button_realtime_infer ---
+        # 实时推理：视频播放 / 桌面区域，边推边把结果按帧存成 YOLO 标注
+        self.realtime_dialog = None
+        self.button_realtime_infer.setStyleSheet(
+            self._get_replace_button_style("#0f766e", "#0b5c56")
+        )
+        self.button_realtime_infer.setToolTip(
+            self.tr("对视频或桌面区域实时推理，结果按帧存成 YOLO 标注")
+        )
+        self.button_realtime_infer.clicked.connect(
+            self.open_realtime_infer_dialog
+        )
 
         # --- Configuration for: toggle_use_existing_boxes (按钮样式下拉菜单) ---
         self.toggle_use_existing_boxes.setStyleSheet(
@@ -937,6 +953,34 @@ class AutoLabelingWidget(QWidget):
 
     def _on_crop_dialog_closed(self):
         self._crop_context = None
+
+    def open_realtime_infer_dialog(self):
+        """打开实时推理窗口（视频播放 / 桌面区域）"""
+        if (self.model_manager.loaded_model_config or {}).get("model") is None:
+            self.model_manager.new_model_status.emit(
+                self.tr("请先加载模型，再用实时推理")
+            )
+            return
+        if self.realtime_dialog is None:
+            self.realtime_dialog = RealtimeInferDialog(self, self.parent)
+            self.realtime_dialog.zhuangtai_gaibian.connect(
+                self._on_realtime_state_changed
+            )
+        self.realtime_dialog.show()
+        self.realtime_dialog.raise_()
+        self.realtime_dialog.activateWindow()
+
+    def _on_realtime_state_changed(self, zhengzai):
+        """实时推理期间禁用同面板的检测按钮：同一个模型不能并发跑"""
+        for mingcheng in (
+            "button_run",
+            "button_recog_selected",
+            "button_recog_all",
+            "button_crop_detect",
+        ):
+            anniu = getattr(self, mingcheng, None)
+            if anniu is not None:
+                anniu.setEnabled(not zhengzai)
 
     def run_crop_detection(self):
         """裁切窗口的“执行检测”：只对裁切块推理，不动整图"""
@@ -1804,12 +1848,14 @@ class AutoLabelingWidget(QWidget):
                 )
         # 裁切检测只在模型加载后可用；没模型时不显示（见 hide_labeling_widgets）
         self.button_crop_detect.show()
+        self.button_realtime_infer.show()
 
     def hide_labeling_widgets(self):
         """Hide labeling widgets by default"""
         widgets = [
             "button_run",
             "button_crop_detect",
+            "button_realtime_infer",
             "button_recog_selected",
             "button_recog_all",
             "button_add_point",

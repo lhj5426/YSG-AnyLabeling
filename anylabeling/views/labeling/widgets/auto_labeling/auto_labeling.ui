@@ -236,6 +236,13 @@
       </widget>
      </item>
      <item>
+      <widget class="QPushButton" name="button_realtime_infer">
+       <property name="text">
+        <string>实时推理</string>
+       </property>
+      </widget>
+     </item>
+     <item>
       <widget class="QLineEdit" name="edit_text">
         <property name="placeholderText">
             <string>Enter text prompt here, e.g., person.car.bicycle</string>
