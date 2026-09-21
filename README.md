@@ -65,10 +65,20 @@ https://github.com/lhj5426/YSG
 
 本工具打通了看漫画的第一步文字检测  和看漫画的最后一步看的阅读体验
 
-是一款围绕看漫画这个核心魔改并开发的工具
 
 
-因为使用AI编写代码 故 无法与主分支合并
+同时支持硬字幕提取
+
+<img width="1920" height="1050" alt="image" src="https://github.com/user-attachments/assets/5224268c-2728-4c01-a9df-8267998fdfd7" />
+
+和ASS字幕编辑
+
+<img width="1920" height="1050" alt="image" src="https://github.com/user-attachments/assets/8d485499-f91f-4c2b-a354-e5706a5aee2b" />
+
+
+提升了字幕的提取和编辑体验
+
+
 ![1759753741939](https://github.com/user-attachments/assets/611b27eb-1796-4b04-8e94-d17c081b3f69)
 
 
