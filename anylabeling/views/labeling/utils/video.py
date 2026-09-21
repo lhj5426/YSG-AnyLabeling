@@ -2664,102 +2664,12 @@ def extract_frames_from_video(self, input_file, out_dir):
 
 
 def open_video_file(self, video_path=None):
+    """打开视频 -> 视频工作台窗口（画面逐帧 / 时间轴 / 参数区）"""
     if not self.may_continue():
         return
 
-    if video_path and osp.exists(video_path):
-        input_file = video_path
-    else:
-        filter = "Video Files (*.asf *.avi *.m4v *.mkv *.mov *.mp4 *.mpeg *.mpg *.ts *.wmv);;All Files (*)"
-        input_file, _ = QFileDialog.getOpenFileName(
-            self,
-            self.tr("Open Video file"),
-            "",
-            filter,
-        )
-
-    if not input_file or not osp.exists(input_file):
-        logger.warning(
-            f"No valid video file selected or file does not exist: {input_file}"
-        )
-        return
-
-    out_dir = osp.join(
-        osp.dirname(input_file), osp.splitext(osp.basename(input_file))[0]
+    from anylabeling.views.labeling.widgets.video_work_dialog import (
+        dakai_video_gongzuotai,
     )
 
-    if osp.exists(out_dir):
-        response = QMessageBox()
-        response.setIcon(QMessageBox.Warning)
-        response.setWindowTitle("警告")
-        response.setText("文件夹已存在")
-
-        final_text = f"文件夹 '{osp.basename(out_dir)}' 已存在，是否覆盖？"
-        response.setInformativeText(final_text)
-        response.setStandardButtons(QMessageBox.Cancel | QMessageBox.Ok)
-        response.setDefaultButton(QMessageBox.Ok)
-        response.setStyleSheet(get_msg_box_style())
-        
-        # 设置按钮文字为中文
-        response.button(QMessageBox.Ok).setText("确定")
-        response.button(QMessageBox.Cancel).setText("取消")
-
-        if response.exec_() != QMessageBox.Ok:
-            logger.info(
-                f"User chose not to overwrite existing directory: {out_dir}"
-            )
-            return
-
-        logger.info(f"Removing existing directory: {out_dir}")
-        try:
-            shutil.rmtree(out_dir)
-            # 同时删除可能存在的调试文件夹
-            debug_yolo_dir = out_dir + "_debug_yolo"
-            debug_scene_dir = out_dir + "_debug_scene"
-            if osp.exists(debug_yolo_dir):
-                shutil.rmtree(debug_yolo_dir)
-                logger.info(f"Removed debug YOLO directory: {debug_yolo_dir}")
-            if osp.exists(debug_scene_dir):
-                shutil.rmtree(debug_scene_dir)
-                logger.info(f"Removed debug scene directory: {debug_scene_dir}")
-        except OSError as e:
-            logger.error(f"Failed to remove directory {out_dir}: {e}")
-            popup = Popup(
-                f"删除文件夹失败: {e}",
-                self,
-                icon=new_icon_path("error", "svg"),
-            )
-            popup.show_popup(self, position="center")
-            return  # Don't proceed if removal fails
-
-    # Extract frames from video
-    logger.info(f"Starting frame extraction for: {input_file} -> {out_dir}")
-    result_dir = extract_frames_from_video(self, input_file, out_dir)
-
-    # Check if extraction process indicated success (returned the directory path)
-    if result_dir:
-        # 规范化路径分隔符
-        result_dir = result_dir.replace('\\', '/')
-        logger.info(
-            f"✅ Frame extraction process finished for directory: {result_dir}"
-        )
-        # Update the canvas only if successful (or partially successful)
-        # 明确设置 recursive=False，避免加载调试文件夹
-        self.import_image_folder(result_dir, recursive=False)
-    else:
-        logger.warning(
-            f"Frame extraction failed or was cancelled for: {input_file}"
-        )
-        # Optional: Clean up empty output directory if extraction failed completely before starting
-        if osp.exists(out_dir) and not os.listdir(out_dir):
-            try:
-                os.rmdir(out_dir)
-                logger.info(f"Removed empty output directory: {out_dir}")
-            except OSError as e:
-                logger.error(
-                    f"Failed to remove empty output directory {out_dir}: {e}"
-                )
-        elif osp.exists(out_dir):
-            logger.info(
-                f"Output directory {out_dir} may contain partial results from cancellation or failure."
-            )
+    dakai_video_gongzuotai(self, video_path)

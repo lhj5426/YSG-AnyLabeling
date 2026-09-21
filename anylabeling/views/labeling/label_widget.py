@@ -3633,6 +3633,7 @@ class LabelingWidget(QtWidgets.QWidget):
             tool=self.menu(self.tr("&Tool")),
             train=self.menu(self.tr("&Train")),
             help=self.menu(self.tr("&Help")),
+            recent_videos=QtWidgets.QMenu(self.tr("最近打开的视频")),
             recent_files=QtWidgets.QMenu(self.tr("Open &Recent")),
             label_list=label_menu,
         )
@@ -3649,6 +3650,7 @@ class LabelingWidget(QtWidgets.QWidget):
                 load_subfolders_action,
                 auto_import_labels_action,
                 openvideo,
+                self.menus.recent_videos,
                 self.menus.recent_files,
                 save,
                 save_as,
@@ -3815,6 +3817,7 @@ class LabelingWidget(QtWidgets.QWidget):
         # Connect aboutToShow to update menu RIGHT BEFORE showing
         # This ensures menu is always fresh when displayed
         self.menus.recent_files.aboutToShow.connect(self.update_file_menu)
+        self.menus.recent_videos.aboutToShow.connect(self.update_video_menu)
 
         # Custom context menu for the canvas widget:
         utils.add_actions(self.canvas.menus[0], self.actions.menu)
@@ -4345,6 +4348,8 @@ class LabelingWidget(QtWidgets.QWidget):
         self.max_recent = 7
         self.recent_folders = []  # Store recently opened folder paths
         self.max_recent_folders = 50  # Maximum 50 recent folders
+        self.recent_videos = []  # 最近打开的视频（路径，最新在最前）
+        self.max_recent_videos = 50
         self.other_data = {}
         self.zoom_level = 100
         self.fit_window = False
@@ -4369,6 +4374,10 @@ class LabelingWidget(QtWidgets.QWidget):
         self.settings = QtCore.QSettings("anylabeling", "anylabeling")
         self.recent_files = self.settings.value("recent_files", []) or []
         self.recent_folders = self.settings.value("recent_folders", []) or []
+        self.recent_videos = self.settings.value("recent_videos", []) or []
+        # QSettings 只有一条记录时可能当成单个字符串还回来
+        if isinstance(self.recent_videos, str):
+            self.recent_videos = [self.recent_videos] if self.recent_videos else []
 
         # 窗口位置/大小的恢复由 app.py 统一处理
         # （避免 __init__ 阶段 self.window() 返回的对象不准确）
@@ -11475,6 +11484,48 @@ class LabelingWidget(QtWidgets.QWidget):
         self.settings.setValue("recent_folders", self.recent_folders)
         self.update_file_menu()
 
+    def add_recent_video(self, lujing):
+        """把打开过的视频记进"最近打开的视频"（最新排最前，最多 50 条）"""
+        lujing = str(lujing or "")
+        if not lujing:
+            return
+        if lujing in self.recent_videos:
+            self.recent_videos.remove(lujing)
+        elif len(self.recent_videos) >= self.max_recent_videos:
+            self.recent_videos.pop()
+        self.recent_videos.insert(0, lujing)
+        self.settings.setValue("recent_videos", self.recent_videos)
+
+    def update_video_menu(self):
+        """刷新"最近打开的视频"菜单（每次弹出前重建，已经不在的路径不再显示）"""
+        menu = self.menus.recent_videos
+        menu.clear()
+
+        videos = [v for v in self.recent_videos if osp.exists(str(v))]
+        for i, shipin in enumerate(videos):
+            dongzuo = QtWidgets.QAction(
+                utils.new_icon("video"), "&%d %s" % (i + 1, shipin), self
+            )
+            dongzuo.triggered.connect(
+                lambda _=False, lujing=shipin: utils.open_video_file(self, lujing)
+            )
+            menu.addAction(dongzuo)
+
+        if videos:
+            menu.addSeparator()
+
+        qingchu = QtWidgets.QAction(
+            utils.new_icon("cancel"), self.tr("清除最近打开的视频记录"), self
+        )
+        qingchu.triggered.connect(self._clear_recent_videos)
+        menu.addAction(qingchu)
+
+    def _clear_recent_videos(self):
+        """清空最近打开的视频记录"""
+        self.recent_videos = []
+        self.settings.setValue("recent_videos", [])
+        self.update_video_menu()
+
     def pop_label_list_menu(self, point):
         self.menus.label_list.exec_(self.label_list.mapToGlobal(point))
 
@@ -17618,6 +17669,7 @@ class LabelingWidget(QtWidgets.QWidget):
         self.save_dock_state(force=True)
         self.settings.setValue("recent_files", self.recent_files)
         self.settings.setValue("recent_folders", self.recent_folders)
+        self.settings.setValue("recent_videos", self.recent_videos)
         
         # 通知导航器应用正在关闭，避免导航器closeEvent覆盖visible状态
         if hasattr(self, 'navigator_dialog'):
