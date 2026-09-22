@@ -2663,8 +2663,11 @@ def extract_frames_from_video(self, input_file, out_dir):
                 )
 
 
-def open_video_file(self, video_path=None):
-    """打开视频 -> 视频工作台窗口（画面逐帧 / 时间轴 / 参数区）"""
+def open_video_file(self, video_path=None, zimu_lujing=None):
+    """打开视频 -> 视频工作台窗口（画面逐帧 / 时间轴 / 参数区）
+
+    zimu_lujing 给了就顺手把这份字幕也载进来（同时拖视频 + 字幕时用）。
+    """
     if not self.may_continue():
         return
 
@@ -2672,4 +2675,4 @@ def open_video_file(self, video_path=None):
         dakai_video_gongzuotai,
     )
 
-    dakai_video_gongzuotai(self, video_path)
+    dakai_video_gongzuotai(self, video_path, zimu_lujing)

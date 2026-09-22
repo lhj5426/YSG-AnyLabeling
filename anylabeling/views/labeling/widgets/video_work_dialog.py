@@ -29,6 +29,7 @@ import os
 import os.path as osp
 import re
 import shutil
+import struct
 import subprocess
 import time
 
@@ -39,6 +40,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 
 from anylabeling.views.labeling.logger import logger
 from anylabeling.views.labeling.widgets.video_infer_panel import (
+    CAOWEI_SHU,
     YANSE_KUANG,
     YANSE_KUANG_ZI,
     YANSE_ZIMU,
@@ -46,6 +48,7 @@ from anylabeling.views.labeling.widgets.video_infer_panel import (
     YANSE_ZIMU_BIAN_B,
     YANSE_ZIMU_QIU,
     YANSE_ZIMU_XUAN,
+    YANSE_ZIMU_ZAI,
     YANSE_ZIMU_ZI,
     ZIMU_GAO_MOREN,
     ZIMU_GAO_ZUI_XIAO,
@@ -54,9 +57,13 @@ from anylabeling.views.labeling.widgets.video_infer_panel import (
     SaomiaoXiancheng,
     ShezhiMianban,
     TuiliXiancheng,
+    YangshiBianjiDialog,
     ZhenChuli,
     ZimuMianban,
     ZimuBianjiMianban,
+    buju_qsettings,
+    du_zidonghua_peizhi,
+    zimu_charu_weizhi,
 )
 
 try:
@@ -72,13 +79,17 @@ except Exception:  # noqa
 # =====================================================================
 ZHUTI = "light"                   # 界面主题：dark 深色 / light 浅色
 SHIJIANZHOU_GAO = 130             # 时间轴（波形）初始高度，之后可以拖着改
-SUOFANG_ZUIDA = 200.0             # 时间轴最大放大倍数（1 = 整条铺满）
+SUOFANG_ZUIDA = 500.0             # 时间轴最大放大倍数（1 = 整条铺满）
+SUOFANG_ZUI_XIAO = 1.0            # 时间轴最小放大倍数（1 = 整条铺满）
 SUOFANG_MOREN = 15.0              # 打开视频时时间轴的默认放大倍数（1 = 整条铺满，字幕块会缩成一小条看不清）
 BO_CAN_YANG_LV = 8000             # 波形解码采样率（单声道）
 BO_HAO_MIAO = 1                   # 波形每格 = 多少毫秒（越细越清晰、越费内存）
 JIE_LIU_HAO_MIAO = 12             # 解析音频时每块之间歇多少毫秒（0 = 不歇）
-BEISU_LIEBIAO = [0.5, 1.0, 1.5, 2.0]   # 倍速下拉里可选的倍速
+BEISU_LIEBIAO = [                     # 倍速下拉里可选的倍速（跟 Arctime 一样，从快到慢排）
+    4.0, 2.5, 2.0, 1.75, 1.5, 1.25, 1.0, 0.75, 0.5, 0.25,
+]
 MO_REN_BEISU = 1.0                # 打开视频时的默认倍速
+BEISU_KUANG_KUAN = 56             # 倍速框宽度：嫌框大就往小改（比如 48），字被裁就往大改（比如 62）
 MO_REN_YINLIANG = 70              # 默认音量 0-100
 JINGYIN = False                   # 是否静音启动
 FANGXIANG_JIAN_GE_MIAO = 0.5      # 方向键：隔这么久没按就当新的一串，重新从当前位置起步
@@ -91,10 +102,23 @@ YANSE_QUYU = "#00E5FF"            # 检测区域框颜色（在视频画面上�
 YANSE_CHONGDIE = "#FFC107"        # 字幕块摞在一起时，时间轴顶端那个 L 形标记的颜色
 CHONGDIE_L_GAO = 26               # 那个 L 形标记的竖线往上竖多高（竖到时间轴的刻度条里）
 CHONGDIE_SHEN_ALPHA = 75          # 摞在一起的那一段压深多少（0-255，越大越深）
+ZIMU_LIEBIAO_GAO = 280            # 「字幕列表」被换到下方时，那一栏的初始高度
+WEIZHI_PEIZHI_JIAN = "jiemian/liebiao_zai_xia"   # 记住"谁在下面"用的配置项名
+JIEMIAN_ZHENGGE_JIAN = "jiemian/chuangkou_weizhi"    # 记住窗口位置 + 大小
+JIEMIAN_TAB_JIAN = "jiemian/tab_ye"                  # 记住右侧停在哪个标签页
+JIEMIAN_BILI_JIAN = "jiemian/fenlan_bili"            # 记住各处拖的分栏位置
+JIEMIAN_SHANGXIA_DUO = "jiemian/shangxia_tuoguo"     # 上下大分栏你自己拖过没有
+JIEMIAN_SUOFANG_JIAN = "jiemian/shijianzhou_suofang"  # 记住时间轴的放大倍数
+JIEMIAN_MEIHANG_GAO = "jiemian/meihang_gao"          # 记住字幕块每行多高
+JIEMIAN_BO_FANGDA = "jiemian/bo_fangda"              # 记住波形振幅放大倍数
+JIEMIAN_ZIMU_TIAO_JIAN = "jiemian/zimu_tiao"         # 记住画面下方那条独立字幕条开不开
+ZIMU_HOUZHUI = (".srt", ".ass", ".ssa")   # 认得的字幕文件后缀（拖进窗口就载入）
 ZIMU_TIAO_GAO = 34                # 画面下方那条字幕对照条的高度
 ZIMU_TIAO_ZIHAO = 15              # 字幕对照条的字号
 XINJIAN_ZIMU_MS = 1000            # 没选中字幕块时按回车：以播放头为起点新建的字幕块多长（毫秒）
-HUA_ZIMU_MOREN = True             # 打开视频时，画面里默认显不显示字幕（右上角那个勾也能随时改）
+ZIDONG_BAOCUN_MIAO = 60           # 自动保存间隔（秒）：隔这么久、字幕又变过，就存一份带时间戳的进「自动保存」
+ZIDONG_BAOCUN_JIA = "自动保存"     # 自动保存文件夹名（跟字幕文件建在同一层）
+ZIDONG_BEIFEN_JIA = "自动备份"     # 自动备份文件夹名（跟字幕文件建在同一层）
 HUA_ZIMU_JIZHUN = (1280, 720)     # 没打开 ASS（比如 SRT）时的基准分辨率：字号、位置都按它的比例缩放
 HUA_ZIMU_ZIHAO = 46.0             # 没打开 ASS 时画面里字幕的字号（按上面的基准分辨率算）
 HUA_ZIMU_BEI_JIAO = 30.0          # 没打开 ASS 时字幕离画面底部 / 左右的距离（按基准分辨率算）
@@ -161,20 +185,6 @@ def _ys():
     return _YANSE_AN if ZHUTI == "dark" else _YANSE_LIANG
 
 
-def _weizhi_to_beishu(weizhi):
-    """缩放滑块位置 0~1000 -> 放大倍数 1~SUOFANG_ZUIDA（对数，低倍好调）"""
-    weizhi = max(0, min(1000, int(weizhi)))
-    if weizhi <= 0:
-        return 1.0
-    return SUOFANG_ZUIDA ** (weizhi / 1000.0)
-
-
-def _beishu_to_weizhi(bei):
-    """放大倍数 -> 滑块位置"""
-    bei = max(1.0, min(SUOFANG_ZUIDA, float(bei or 1.0)))
-    return int(round(1000.0 * math.log(bei) / math.log(SUOFANG_ZUIDA)))
-
-
 def _shijian_wenben(ms, fps=0.0):
     """毫秒 -> 时:分:秒:帧"""
     ms = max(0, int(ms or 0))
@@ -185,6 +195,20 @@ def _shijian_wenben(ms, fps=0.0):
     h, r = divmod(zong_miao, 3600)
     m, s = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{s:02d}:{zhen:02d}"
+
+
+def _shijian_zhen_wenben(ms, zhen):
+    """底栏那个时间显示，照 Aegisub 的视频窗时间框：
+
+        `0:40:08.666 - 72260`
+
+    前面是 时:分:秒.毫秒，后面跟当前帧号，中间空格 - 空格。
+    时间码和帧号都是 Aegisub 原样的写法。
+    """
+    ms = max(0, int(ms or 0))
+    h, r = divmod(ms // 1000, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}.{ms % 1000:03d} - {max(0, int(zhen or 0))}"
 
 
 def _zhen_tu_huan(zhen_rgb):
@@ -223,6 +247,11 @@ class _JunfenTabBar(QtWidgets.QTabBar):
         return QtCore.QSize(max(da.width(), jun), da.height())
 
 
+# 编辑区里所有输入框（单行框 / 下拉框 / 数字框）统一的内容高度：照 AEG 那样
+# 一排框高低对齐。改这一个数，整片界面的输入框一起变。
+SHURU_GAO = 22
+
+
 def _yangshi_quanju():
     c = _ys()
     return f"""
@@ -238,15 +267,9 @@ def _yangshi_quanju():
         border: 1px solid {c['biankuang']};
         border-radius: 8px;
     }}
-    QFrame#YsgPreviewHeader, QFrame#YsgPreviewFooter,
-    QFrame#YsgTimelineBar {{
+    QFrame#YsgPreviewFooter, QFrame#YsgTimelineBar {{
         background-color: {c['beijing2']};
         border: none;
-    }}
-    QLabel#YsgFileTitle {{
-        color: {c['wenzi']};
-        font-size: 14px;
-        font-weight: 600;
     }}
     QLabel#YsgMeta {{
         color: {c['wenzi_ci']};
@@ -265,13 +288,8 @@ def _yangshi_quanju():
     QLabel#YsgTimeNow {{
         color: {c['zhuse']};
         font-family: Consolas, monospace;
-        font-size: 13px;
+        font-size: 11px;
         font-weight: 700;
-    }}
-    QLabel#YsgTimeAll {{
-        color: {c['wenzi']};
-        font-family: Consolas, monospace;
-        font-size: 13px;
     }}
     QLabel#YsgHint {{
         color: {c['wenzi_ci']};
@@ -292,11 +310,47 @@ def _yangshi_quanju():
         border-radius: 6px;
         padding: 3px 22px 3px 8px;
         font-size: 12px;
-        min-height: 26px;
+        min-height: {SHURU_GAO}px;
+        max-height: {SHURU_GAO}px;
+    }}
+    QLineEdit {{
+        background-color: {c['beijing2']};
+        color: {c['wenzi']};
+        border: 1px solid {c['biankuang_liang']};
+        border-radius: 6px;
+        padding: 3px 8px;
+        font-size: 12px;
+        min-height: {SHURU_GAO}px;
+        max-height: {SHURU_GAO}px;
+    }}
+    QLineEdit:disabled {{ color: {c['wenzi_ci']}; }}
+    QSpinBox, QDoubleSpinBox {{
+        background-color: {c['beijing2']};
+        color: {c['wenzi']};
+        border: 1px solid {c['biankuang_liang']};
+        border-radius: 6px;
+        padding: 3px 4px;
+        font-size: 12px;
+        min-height: {SHURU_GAO}px;
+        max-height: {SHURU_GAO}px;
+    }}
+    QSpinBox:disabled, QDoubleSpinBox:disabled {{ color: {c['wenzi_ci']}; }}
+    QComboBox QLineEdit {{
+        background: transparent;
+        border: none;
+        border-radius: 0;
+        padding: 0;
+        min-height: 0px;
+        max-height: 16777215px;
     }}
     QComboBox::drop-down {{
         border: none;
         width: 18px;
+    }}
+    QComboBox::down-arrow {{
+        image: url(:/images/images/caret-down.svg);
+        width: 9px;
+        height: 14px;
     }}
     QComboBox QAbstractItemView {{
         background-color: {c['beijing2']};
@@ -378,17 +432,21 @@ def _ys_tubiao():
         background-color: #ffffff;
         color: {c['wenzi']};
         border: 1px solid {c['biankuang_liang']};
-        border-radius: 6px;
-        font-size: 15px;
-        min-width: 30px;
-        max-width: 30px;
-        min-height: 30px;
-        max-height: 30px;
+        border-radius: 4px;
+        font-size: 12px;
+        min-width: 22px;
+        max-width: 22px;
+        min-height: 22px;
+        max-height: 22px;
         padding: 0px;
     }}
     QPushButton:hover {{
         background-color: {c['mian_hover']};
         border-color: {c['zhuse']};
+    }}
+    QPushButton:checked {{
+        background-color: #ffffff;
+        border: 2px solid {c['zhuse']};
     }}
     QPushButton:pressed {{ background-color: {c['mian_anxia']}; }}
     QPushButton:disabled {{
@@ -466,13 +524,56 @@ def _ys_huadong_tiao():
     """
 
 
+def _ys_xiao_xiang():
+    """小号下拉框 / 数值框：倍速、时间轴缩放这种只装两三个字的框
+
+    通用那套的内边距是照普通输入框定的，套在这种小框上会白占一片宽度，
+    这里单独来一套，箭头也收窄。
+    """
+    c = _ys()
+    return f"""
+    QComboBox, QSpinBox {{
+        background-color: {c['beijing2']};
+        color: {c['wenzi']};
+        border: 1px solid {c['biankuang_liang']};
+        border-radius: 4px;
+        font-size: 12px;
+        min-height: {SHURU_GAO}px;
+        max-height: {SHURU_GAO}px;
+    }}
+    QComboBox {{ padding: 3px 12px 3px 4px; }}
+    QSpinBox {{ padding: 3px 0px 3px 6px; }}
+    QComboBox::drop-down {{ width: 12px; }}
+    QComboBox QAbstractItemView {{
+        background-color: {c['beijing2']};
+        color: {c['wenzi']};
+        border: 1px solid {c['biankuang']};
+        selection-background-color: {c['zhuse']};
+        selection-color: #ffffff;
+        outline: none;
+    }}
+    """
+
+
+def _tupian_lu(ming):
+    """软件自带的按钮图片（放 anylabeling/resources/images 下）的完整路径"""
+    gen = osp.dirname(
+        osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__))))
+    )
+    return osp.join(gen, "resources", "images", ming)
+
+
 def _shezhi_tubiao(anniu, tubiao):
-    """给按钮换系统标准图标"""
+    """给按钮换图标：Qt 系统标准图标（传枚举）或自带的 png（传文件名 / 路径）"""
     if tubiao is None:
         anniu.setIcon(QtGui.QIcon())
         return
+    if isinstance(tubiao, str):
+        anniu.setIcon(QtGui.QIcon(_tupian_lu(tubiao)))
+        anniu.setIconSize(QtCore.QSize(16, 16))
+        return
     anniu.setIcon(QtWidgets.QApplication.style().standardIcon(tubiao))
-    anniu.setIconSize(QtCore.QSize(16, 16))
+    anniu.setIconSize(QtCore.QSize(12, 12))
 
 
 def _tubiao_anniu(tubiao, tishi, cao, wenben=""):
@@ -783,6 +884,122 @@ class _BofangXiancheng(QtCore.QThread):
             self.jieshu.emit("这段视频没有音轨")
             return
         self.jieshu.emit("")
+
+
+# ---------------------------------------------------------------------
+# 视频下方那条刻度进度条
+#   刻度：照 Aegisub 的音频刻度尺（src/audio_display.cpp 的
+#         AudioDisplayTimeline::Paint）—— 按"每秒占多少像素"决定一格代表
+#         多少毫秒、每几格算一个主刻度；刻度贴着底边往上画，长的 6px、
+#         短的 3px；只有主刻度写时间，写不下（要压到上一个了）就跳过。
+#   指针：照 Aegisub 视频窗口的滑块（src/video_slider.cpp 的
+#         VideoSlider::OnPaint）—— 一个朝上的小三角加一条竖线。
+#   点 / 拖 = 定位。
+# ---------------------------------------------------------------------
+JINDU_TIAO_GAO = 14                      # 进度条高度（只有刻度 + 指针，不写时间）
+
+
+class ShipinJinduTiao(QtWidgets.QWidget):
+    """视频下方的刻度进度条：整条片子的进度（不跟时间轴缩放走）"""
+
+    dingwei = pyqtSignal(int)     # 点 / 拖 -> 要定位到的毫秒
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(JINDU_TIAO_GAO)
+        self.setMinimumWidth(120)
+        self.setCursor(Qt.PointingHandCursor)
+        self._shichang = 0        # 整条多长（毫秒）
+        self._dangqian = 0        # 播放头在哪（毫秒）
+        self._tuozhe = False
+
+    # ---- 外面喂数据 ----
+    def shezhi_shichang(self, ms):
+        self._shichang = max(0, int(ms))
+        self.update()
+
+    def shezhi_bofangtou(self, ms):
+        ms = max(0, int(ms))
+        if ms == self._dangqian:
+            return
+        self._dangqian = ms
+        self.update()
+
+    # ---- 鼠标：点 / 拖定位 ----
+    def _x_dui_hao_miao(self, x):
+        kuan = self.width() - 10
+        if kuan <= 0 or self._shichang <= 0:
+            return 0
+        bi = (x - 5) / float(kuan)
+        return int(round(max(0.0, min(1.0, bi)) * self._shichang))
+
+    def mousePressEvent(self, shi_jian):
+        if shi_jian.button() == Qt.LeftButton:
+            self._tuozhe = True
+            self.dingwei.emit(self._x_dui_hao_miao(shi_jian.x()))
+
+    def mouseMoveEvent(self, shi_jian):
+        if self._tuozhe:
+            self.dingwei.emit(self._x_dui_hao_miao(shi_jian.x()))
+
+    def mouseReleaseEvent(self, shi_jian):
+        if shi_jian.button() == Qt.LeftButton:
+            self._tuozhe = False
+
+    # ---- 一格代表多少毫秒（照 AEG 按每秒像素数选）----
+    def _dan_wei(self):
+        kuan = max(1, self.width() - 10)
+        miao = self._shichang / 1000.0
+        if miao <= 0:
+            return 1000, 10
+        px_sec = kuan / miao
+        for yu, dan, mo in (
+            (3000.0, 1, 10),           # 毫秒
+            (300.0, 10, 10),           # 厘秒
+            (30.0, 100, 10),           # 分秒
+            (3.0, 1000, 10),           # 秒
+            (1.0 / 3.0, 10000, 6),     # 十秒
+            (1.0 / 9.0, 60000, 10),    # 分钟
+            (1.0 / 90.0, 600000, 6),   # 十分钟
+        ):
+            if px_sec > yu:
+                return dan, mo
+        return 3600000, 10             # 小时
+
+    def paintEvent(self, _shi_jian):
+        c = _ys()
+        hua = QtGui.QPainter(self)
+        kuan, gao = self.width(), self.height()
+        di = gao - 1
+        # 底边线
+        hua.setPen(QtGui.QPen(QtGui.QColor(c["biankuang_liang"])))
+        hua.drawLine(0, di, kuan, di)
+        if self._shichang <= 0 or kuan <= 12:
+            return
+
+        dan, mo = self._dan_wei()
+        zong = float(self._shichang)
+        kuai = float(kuan - 10)
+
+        # 刻度线：跟 Aegisub 的刻度条一样只有长短刻度，不写时间
+        hao = 0
+        hua.setPen(QtGui.QPen(QtGui.QColor(c["wenzi_ci"])))
+        while True:
+            x = 5 + int(round(hao / zong * kuai))
+            if x > kuan - 5:
+                break
+            if int(round(hao / float(dan))) % mo == 0:
+                hua.drawLine(x, di - 6, x, di - 1)
+            else:
+                hua.drawLine(x, di - 4, x, di - 1)
+            hao += dan
+
+        # 指针：一条蓝柱子，压着刻度（不要箭头）
+        x = 5 + int(round(self._dangqian / zong * kuai))
+        yan = QtGui.QColor(c["zhuse"])
+        hua.setPen(QtGui.QPen(yan))
+        hua.setBrush(QtGui.QBrush(yan))
+        hua.drawRect(x - 1, 1, 3, di - 1)
 
 
 # ---------------------------------------------------------------------
@@ -1124,11 +1341,11 @@ def _jiexi_srt(wenben):
 
 
 def _jiexi_ass(wenben):
-    """ASS / SSA 文本 -> [(起ms, 止ms, 文字), ...]"""
+    """ASS / SSA 文本 -> [(起ms, 止ms, 文字), ...]（注释行也算进来）"""
     zimu = []
     for hang in (wenben or "").splitlines():
         hang = hang.strip()
-        if not hang.lower().startswith("dialogue:"):
+        if not hang.lower().startswith(("dialogue:", "comment:")):
             continue
         # Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         bu = hang.split(":", 1)[1].split(",", 9)
@@ -1149,33 +1366,39 @@ def _jiexi_ass(wenben):
     return zimu
 
 
-ZIMU_GAO_JILU = osp.join(osp.expanduser("~"), ".ysg_video_zimu_gao.json")
-
-
 def _du_gao_ji():
-    """读那份"高度记录"（字幕块每行高、波形放大倍数都存在这里）"""
+    """读「字幕块每行高 / 波形放大倍数」（跟界面记忆一起存在 gongzuotai.ini 里）"""
     try:
-        with open(ZIMU_GAO_JILU, "r", encoding="utf-8") as f:
-            ji = json.load(f)
-        return ji if isinstance(ji, dict) else {}
+        pei = buju_qsettings()
+        ji = {}
+        for ming, jian_ming in (
+            ("meihang_gao", JIEMIAN_MEIHANG_GAO),
+            ("bo_fangda", JIEMIAN_BO_FANGDA),
+        ):
+            zhi = pei.value(jian_ming, None)
+            if zhi is not None:
+                ji[ming] = zhi
+        return ji
     except Exception:  # noqa
         return {}
 
 
 def _cun_gao_ji(**xiang):
-    """往"高度记录"里存值（某项传 None = 恢复默认，直接把那项抹掉）"""
+    """存「字幕块每行高 / 波形放大倍数」（某项传 None = 恢复默认，直接抹掉）"""
     try:
-        ji = _du_gao_ji()
+        pei = buju_qsettings()
         for ming, zhi in xiang.items():
+            jian_ming = {
+                "meihang_gao": JIEMIAN_MEIHANG_GAO,
+                "bo_fangda": JIEMIAN_BO_FANGDA,
+            }.get(ming)
+            if jian_ming is None:
+                continue
             if zhi is None:
-                ji.pop(ming, None)
+                pei.remove(jian_ming)
             else:
-                ji[ming] = zhi
-        if ji:
-            with open(ZIMU_GAO_JILU, "w", encoding="utf-8") as f:
-                json.dump(ji, f)
-        elif osp.exists(ZIMU_GAO_JILU):
-            os.remove(ZIMU_GAO_JILU)
+                pei.setValue(jian_ming, zhi)
+        pei.sync()
     except Exception as cuowu:  # noqa
         logger.error(f"视频工作台：记录高度失败 {cuowu}")
 
@@ -1268,6 +1491,81 @@ def _ass_chun_wen(wenben):
     return re.sub(r"\{[^}]*\}", "", wen).strip()
 
 
+def _ass_hang_fu(hang):
+    """一行 Dialogue / Comment 的字段 -> 编辑区上方那排要显示的东西
+
+    层 / 左边距 / 右边距 / 垂直边距 / 特效 / 注释（True = 这行是 Comment，
+    存回 ASS 还是 Comment，也不画在画面上）。
+    """
+    def _zheng(jian):
+        pi = re.search(r"(-?\d+)", str((hang or {}).get(jian) or ""))
+        return int(pi.group(1)) if pi else 0
+
+    return {
+        "ceng": _zheng("Layer"),
+        "zuo": _zheng("MarginL"),
+        "you": _zheng("MarginR"),
+        "shu": _zheng("MarginV"),
+        "texiao": str((hang or {}).get("Effect") or "").strip(),
+        "zhushi": str((hang or {}).get("_lei") or "") == "Comment",
+    }
+
+
+# 行内标签的"抠掉"用正则在开头那对花括号里找：
+#   b / i / u / s：后面不能跟字母，免得把 \bord \shad \fsp 这些认成 B / S
+_BIAOQIAN_ZHENG = {
+    "b": r"\\b(?![a-zA-Z])[^\\]*",
+    "i": r"\\i(?![a-zA-Z])[^\\]*",
+    "u": r"\\u(?![a-zA-Z])[^\\]*",
+    "s": r"\\s(?![a-zA-Z])[^\\]*",
+    "fn": r"\\fn[^\\]*",
+    "c1": r"\\1?c(?![a-zA-Z0-9])[^\\]*",
+    "c2": r"\\2c[^\\]*",
+    "c3": r"\\3c[^\\]*",
+    "c4": r"\\4c[^\\]*",
+}
+
+
+def _jia_biaoqian(wen, biao):
+    """往开头那对花括号里加一个行内标签（没有就新建一对）"""
+    wen = str(wen or "")
+    pi = re.match(r"^\{([^{}]*)\}", wen)
+    if pi:
+        return "{" + pi.group(1) + biao + "}" + wen[pi.end():]
+    return "{" + biao + "}" + wen
+
+
+def _wei_yiduan(wen, xuan, qian, hou):
+    """在选中的那一段两头插标签：头上插 qian，尾巴插 hou
+
+    AEG 就是这么干的：编辑框里选中「到底是哪一步」，点一下颜色，就只在那几个
+    字前后加标签，不动整条。
+    """
+    wen = str(wen or "")
+    n = len(wen)
+    qi = max(0, min(n, int(xuan[0])))
+    zhi = max(0, min(n, int(xuan[1])))
+    if zhi < qi:
+        qi, zhi = zhi, qi
+    return wen[:qi] + str(qian) + wen[qi:zhi] + str(hou) + wen[zhi:]
+
+
+def _qu_biaoqian(wen, jian):
+    """把开头那对花括号里的某一类标签抠掉（\\b1、\\3c&H..& 这些）"""
+    wen = str(wen or "")
+    pi = re.match(r"^\{([^{}]*)\}", wen)
+    if not pi:
+        return wen
+    zheng = _BIAOQIAN_ZHENG.get(str(jian or "").lower())
+    if not zheng:
+        return wen
+    nei = re.sub(zheng, "", pi.group(1))
+    hou = wen[pi.end():]
+    if not nei.strip():
+        return hou
+    return "{" + nei + "}" + hou
+
+
 def _ass_yuan_wen(wenben):
     """ASS 的 Text 归一，但 {\\pos(75,705)} 这些标签原样留着（比"改没改过"用）"""
     return str(wenben or "").replace("\\N", "\n").replace("\\n", "\n").strip()
@@ -1283,8 +1581,8 @@ _ASS_HUA_KUO = re.compile(r"\{[^}]*\}")
 _ASS_MOREN_YANGSHI = {
     "font": "",                                     # 空 = 用界面默认字体
     "fs": HUA_ZIMU_ZIHAO,
-    "c1": "#FFFFFF", "c3": "#000000", "c4": "#000000",
-    "a1": 255, "a3": 255, "a4": 140,
+    "c1": "#FFFFFF", "c2": "#FF0000", "c3": "#000000", "c4": "#000000",
+    "a1": 255, "a2": 255, "a3": 255, "a4": 140,
     "b": False, "i": False, "u": False, "s": False,
     "fscx": 100.0, "fscy": 100.0, "fsp": 0.0, "frz": 0.0,
     "bord": 2.0, "shad": 1.0, "bs": 1, "an": 2,
@@ -1343,8 +1641,8 @@ def _ass_geshi(hang):
     if zi:
         g["font"] = zi
     g["fs"] = max(1.0, _ass_shuzi(hang.get("Fontsize"), g["fs"]))
-    for jian, lie in (("c1", "PrimaryColour"), ("c3", "OutlineColour"),
-                      ("c4", "BackColour")):
+    for jian, lie in (("c1", "PrimaryColour"), ("c2", "SecondaryColour"),
+                      ("c3", "OutlineColour"), ("c4", "BackColour")):
         y = _ass_yanse(hang.get(lie))
         if y:
             g[jian], g["a" + jian[1]] = y
@@ -1406,6 +1704,135 @@ def _du_ass_yangshi(tou_hang):
     return play, biao
 
 
+# 样式表那一行的列名 -> 格式字典里的名字（样式编辑器写回时按这个对）
+_YANGSHI_LIE_MING = {
+    "Fontname": "font",
+    "Fontsize": "fs",
+    "Bold": "b",
+    "Italic": "i",
+    "Underline": "u",
+    "StrikeOut": "s",
+    "ScaleX": "fscx",
+    "ScaleY": "fscy",
+    "Spacing": "fsp",
+    "Angle": "frz",
+    "BorderStyle": "bs",
+    "Outline": "bord",
+    "Shadow": "shad",
+    "Alignment": "an",
+    "MarginL": "ml",
+    "MarginR": "mr",
+    "MarginV": "mv",
+}
+
+# 四个颜色列 -> (格式字典里的颜色名, 不透明度名)
+_YANGSHI_LIE_YANSE = {
+    "PrimaryColour": ("c1", "a1"),
+    "SecondaryColour": ("c2", "a2"),
+    "OutlineColour": ("c3", "a3"),
+    "BackColour": ("c4", "a4"),
+}
+
+
+def _shu_wen(v):
+    """数字写回 ASS 什么样：整数就不带小数点（40.0 -> 40，40.5 -> 40.5）"""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "0"
+    if abs(v - round(v)) < 0.001:
+        return str(int(round(v)))
+    return f"{v:.2f}".rstrip("0").rstrip(".")
+
+
+def _hui_yangshi_tou(tou, yang_ming, zi):
+    """把样式编辑器改出来的字段写回骨架里 [V4+ Styles] 那一行
+
+    只动这一个样式那一行：按 Format 那行的列名一个个对，其余列原样留着。
+    找不到这一段 / 没这个样式就返回 False（一个字都不改）。
+    """
+    yang_ming = str(yang_ming or "").strip()
+    if not yang_ming:
+        return False
+    zai = False
+    ming = None
+    zhao = -1
+    for i, yuan in enumerate(tou):
+        tiao = str(yuan).strip()
+        if tiao.startswith("[") and tiao.endswith("]"):
+            zai = tiao.lower() in ("[v4+ styles]", "[v4 styles]")
+            ming = None
+            continue
+        if not zai:
+            continue
+        if tiao.lower().startswith("format:"):
+            ming = [x.strip() for x in tiao.split(":", 1)[1].split(",")]
+            continue
+        if tiao.lower().startswith("style:") and ming:
+            bu = tiao.split(":", 1)[1].split(",", len(ming) - 1)
+            if str(bu[0] if bu else "").strip().lower() == yang_ming.lower():
+                zhao = i
+                break
+    if zhao < 0 or not ming:
+        return False
+
+    bu = str(tou[zhao]).split(":", 1)[1].split(",", len(ming) - 1)
+    bu += [""] * (len(ming) - len(bu))
+    for k, lie in enumerate(ming):
+        if lie in _YANGSHI_LIE_YANSE:
+            wei, tou_jian = _YANGSHI_LIE_YANSE[lie]
+            se = str(zi.get(wei) or "").strip().lstrip("#")
+            if len(se) != 6:
+                continue
+            try:
+                r = int(se[0:2], 16)
+                g = int(se[2:4], 16)
+                b = int(se[4:6], 16)
+            except ValueError:
+                continue
+            try:
+                a = max(0, min(255, int(zi.get(tou_jian) or 255)))
+            except (TypeError, ValueError):
+                a = 255
+            bu[k] = f"&H{255 - a:02X}{b:02X}{g:02X}{r:02X}"
+            continue
+        jian = _YANGSHI_LIE_MING.get(lie)
+        if not jian or jian not in zi:
+            continue
+        if jian == "font":
+            bu[k] = str(zi.get("font") or "").strip() or "Arial"
+        elif jian in ("b", "i", "u", "s"):
+            bu[k] = "-1" if zi.get(jian) else "0"
+        elif jian in ("ml", "mr", "mv"):
+            bu[k] = f"{max(0, int(_ass_shuzi(zi.get(jian), 0))):04d}"
+        elif jian in ("bs", "an"):
+            bu[k] = str(int(_ass_shuzi(zi.get(jian), 1)))
+        else:
+            bu[k] = _shu_wen(zi.get(jian))
+    if bu:
+        bu[0] = str(bu[0]).strip()      # 样式名两边的空格不带出去
+    tou[zhao] = "Style: " + ",".join(str(x) for x in bu)
+    return True
+
+
+def _ass_yangshi_ming(tou_hang):
+    """骨架里 [V4+ Styles] 那些样式名，按原样（大小写别动，要写回去的）"""
+    ming = []
+    zai_yangshi = False
+    for yuan in tou_hang or []:
+        tiao = str(yuan).strip()
+        if tiao.startswith("[") and tiao.endswith("]"):
+            zai_yangshi = tiao.lower() in ("[v4+ styles]", "[v4 styles]")
+            continue
+        if not zai_yangshi or not tiao.lower().startswith("style:"):
+            continue
+        ge = tiao.split(":", 1)[1].split(",", 1)
+        name = str(ge[0]).strip() if ge else ""
+        if name and name not in ming:
+            ming.append(name)
+    return ming
+
+
 def _ass_zheng(tiao):
     """从 "PlayResX: 1280" 里抠出那个整数；抠不出来给 None"""
     pi = re.search(r"(-?\d+)", str(tiao))
@@ -1436,14 +1863,22 @@ def _qie_biaoqian(biao):
     return jieguo
 
 
-def _jia_wenben(hang, wen):
-    """普通文字接到当前行上；\\N \\n 换行，\\h 当空格"""
+def _jia_wenben(hang, wen, geshi):
+    """普通文字接到当前行上；\\N \\n 换行，\\h 当空格
+
+    每段文字都记下"这一刻的格式"（复制一份），这样 {\n1c&H..&}某几个字{\n r}
+    这种只改一段的写法，那几个字和后面的字各画各的颜色（照 libass）。
+    """
     if not wen:
         return
+    gs = dict(geshi or {})
     bu = re.split(r"\\[Nn]", wen)
-    hang[-1] += bu[0].replace("\\h", " ")
+    zhi = bu[0].replace("\\h", " ")
+    if zhi:
+        hang[-1].append((zhi, gs))
     for x in bu[1:]:
-        hang.append(x.replace("\\h", " "))
+        x = x.replace("\\h", " ")
+        hang.append([(x, dict(gs))] if x else [])
 
 
 # 老 SSA 的 \a 对齐写法 -> 现在的 \an
@@ -1458,6 +1893,12 @@ def _yi_ge_biaoqian(pian, g, jichu, yangshi_biao):
         zhao = (yangshi_biao or {}).get(pian[1:].strip().lower())
         if zhao:
             jiu = dict(zhao)
+        # \pos \an \fad 管的是"这一行摆哪儿 / 什么时候出现"，\r 只该把字体颜色
+        # 这些还原成样式，不该把定位也一起抹了（libass 就是这么处理的）。不然
+        # 在行中间写 {\r} 截断颜色，后面的字会跑到默认位置上去。
+        for k in ("pos", "an", "fad"):
+            if g.get(k) is not None:
+                jiu[k] = g[k]
         g.clear()
         g.update(jiu)
         return
@@ -1504,6 +1945,10 @@ def _yi_ge_biaoqian(pian, g, jichu, yangshi_biao):
         y = _ass_yanse(zhi)
         if y:
             g["c1"], g["a1"] = y
+    elif m == "2c":
+        y = _ass_yanse(zhi)
+        if y:
+            g["c2"], g["a2"] = y
     elif m == "3c":
         y = _ass_yanse(zhi)
         if y:
@@ -1555,26 +2000,27 @@ def _yi_ge_biaoqian(pian, g, jichu, yangshi_biao):
 def _jie_ass_tiao(yuan_wen, yangshi, yangshi_biao=None):
     """一行的 ASS 原文 -> (文字行列表, 格式字典)
 
-    格式是在样式上叠了行内标签（\\pos \\an \\fs \\c \\b …）之后的结果。
+    文字行列表里每一行是若干段：[(文字, 格式), ...]——一段一段各带各的格式，
+    {\n1c&H..&}某几个字{\n r}后面的字 这种只改一段的写法才能画出来。
+    返回的格式字典是这一行最后生效的那份（\\an \\pos \\fs 这些行级的用它）。
     """
     g = dict(yangshi)
     jichu = dict(yangshi)
-    hang = [""]
+    hang = [[]]
     wen = str(yuan_wen or "")
     wei = 0
     for pi in _ASS_HUA_KUO.finditer(wen):
-        _jia_wenben(hang, wen[wei:pi.start()])
+        _jia_wenben(hang, wen[wei:pi.start()], g)
         gs_kuo = pi.group(0)[1:-1]
         for pian in _qie_biaoqian(gs_kuo):
             _yi_ge_biaoqian(pian, g, jichu, yangshi_biao)
         wei = pi.end()
-    _jia_wenben(hang, wen[wei:])
-    return [x for x in hang], g
+    _jia_wenben(hang, wen[wei:], g)
+    return [x for x in hang if x], g
 
 
 _ZITI_CHIDU = {}        # (字体名, 走不走粗档) -> 字身倍率（算一次存着，见 _ziti_chidu）
 _ZITI_ZI_ZHONG = {}     # 字体名 -> 系统里的字重（问一次存着，见 _ziti_xi_tong_zi_zhong）
-_ZITI_JILU = set()      # 打过日志的字体名（每帧都画，只打第一次）
 
 
 class _ZITI_LOGFONTW(ctypes.Structure):
@@ -1674,6 +2120,229 @@ def _ziti_ming_cu(ming):
     return _ziti_xi_tong_zi_zhong(ming) >= 600
 
 
+_ZITI_MING_MEN = None   # 系统字体名清单（枚举一次存着，见 _ziti_ming_men）
+
+
+def _ziti_ming_men():
+    """系统里所有的字体名（AEG 那个字体下拉列的就是这些）
+
+    Aegisub 走 Windows 的字体枚举，拿到的是"字体名"——整支字体算一个名字
+    （新兰圆-B / 新兰圆-M / 新兰圆-R 各算一个），名字前面带 @ 的是竖排那一支。
+    Qt 走 DirectWrite，会把它们按内部家族名并成一个，也看不到 @ 的竖排支，
+    所以这里直接问 Windows 要；问不出来（不是 Windows）才退回 Qt 的家族表。
+
+    排序：不带 @ 的排前面，各自按名字排（@ 的那些要是排前面就一大堆，不好挑）。
+    """
+    global _ZITI_MING_MEN
+    if _ZITI_MING_MEN is not None:
+        return _ZITI_MING_MEN
+    ming_men = []
+    try:
+        gdi32 = ctypes.windll.gdi32
+        user32 = ctypes.windll.user32
+        huifu = ctypes.WINFUNCTYPE(
+            ctypes.c_int,
+            ctypes.POINTER(_ZITI_MEIJU),
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_long,
+        )
+        gdi32.EnumFontFamiliesExW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_ZITI_LOGFONTW),
+            huifu,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        gdi32.EnumFontFamiliesExW.restype = ctypes.c_int
+        user32.GetDC.argtypes = [ctypes.c_void_p]
+        user32.GetDC.restype = ctypes.c_void_p
+        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+        def _kan(zhizhen, zi_mei, lei, can):
+            ming = str(zhizhen.contents.elfLogFont.lfFaceName or "").strip()
+            if ming and ming not in ming_men:
+                ming_men.append(ming)
+            return 1
+
+        huiti = user32.GetDC(None)
+        try:
+            wen = _ZITI_LOGFONTW()
+            wen.lfCharSet = 1                      # DEFAULT_CHARSET
+            wen.lfFaceName = ""                    # 空 = 全家都列出来
+            gdi32.EnumFontFamiliesExW(
+                huiti, ctypes.byref(wen), huifu(_kan), None, 0
+            )
+        finally:
+            user32.ReleaseDC(None, huiti)
+    except Exception as cuowu:  # noqa
+        logger.error(f"视频工作台：枚举系统字体失败 {cuowu}")
+    if not ming_men:
+        try:
+            ming_men = [str(x) for x in QtGui.QFontDatabase().families()]
+        except Exception as cuowu:  # noqa
+            logger.error(f"视频工作台：读 Qt 字体家族失败 {cuowu}")
+            ming_men = []
+    ming_men.sort(key=lambda m: (m.startswith("@"), m.casefold()))
+    _ZITI_MING_MEN = ming_men
+    return ming_men
+
+
+# ---- 竖排字体（字体名带 @ 的那一支，如 @新兰圆-B） --------------------------
+#
+# Windows 的规矩：字体名前面加 @ 就是那一支"躺倒"的字体（Aegisub 的下拉里
+# 列的和 ASS 里存的就是这个名字）。Qt 走 DirectWrite，压根没有 @ 这支（@新宋体
+# 会被它当成宋体），所以字体照不带 @ 的名字去要、躺倒我们自己转 —— 转法是抄
+# libass 的（ass_font.c 里 ass_get_glyph_outline，它就是照 GDI / VSFilter 抄的）：
+#
+#     横坐标 = 竖排前进量 + 字身下伸 + 字形原来的纵坐标
+#     纵坐标 = -字身下伸 - 字形原来的横坐标
+#
+# 也就是把字形原地转 90°；排的时候一个字往前推"竖排前进量"（汉字就是 1 个 em），
+# 所以看着还是横着排、但每个字都躺倒了 —— 跟 Aegisub 画面里一模一样。
+_SHENG_SHU = 0x02f1     # 码点 >= 这个才躺倒（拉丁字母不躺）—— libass 的 VERTICAL_LOWER_BOUND
+
+_SHU_DULIANG = {}       # 字体名 -> (em 方框, 字身下伸, vmtx 表, 竖排度量条数, QRawFont)
+_SHU_ADV = {}           # (字体名, 字) -> 竖排前进量（字体单位）
+
+
+def _shi_shu(ming):
+    """字体名是不是竖排那一支（@ 开头）"""
+    return str(ming or "").strip().startswith("@")
+
+
+def _qu_shu(ming):
+    """竖排名字去掉 @ 才是系统里那支字体（Qt 只认不带 @ 的）"""
+    return str(ming or "").strip().lstrip("@")
+
+
+def _ziti_xiangsu(ziti):
+    """字体实际画出来多少像素高（点数值的字体也能问出来）"""
+    try:
+        px = float(QtGui.QFontInfo(ziti).pixelSize())
+    except Exception:  # noqa
+        px = float(ziti.pixelSize())
+    return max(1.0, px)
+
+
+def _shu_duliang(ming):
+    """竖排那一支的度量：em 方框大小、字身下伸、每个字的竖排前进量
+
+    都是字体单位（跟字号无关），读一次存着。读不出来（不是 Windows、字体没这
+    几张表）就按"一个字一个 em"算 —— 汉字字体本来就是这么设计的。
+    """
+    ming = _qu_shu(ming)
+    if ming in _SHU_DULIANG:
+        return _SHU_DULIANG[ming]
+    em, xia, vmtx, tiao, yuan = 1000, 0, b"", 0, None
+    try:
+        ziti = QtGui.QFont()
+        ziti.setFamily(ming)
+        yuan = QtGui.QRawFont.fromFont(ziti)
+        if yuan.isValid():
+            tou = bytes(yuan.fontTable("head"))
+            if len(tou) >= 20:
+                em = struct.unpack_from(">H", tou, 18)[0]
+            o2 = bytes(yuan.fontTable("OS/2"))
+            if len(o2) >= 72:
+                xia = struct.unpack_from(">h", o2, 70)[0]
+            vh = bytes(yuan.fontTable("vhea"))
+            vmtx = bytes(yuan.fontTable("vmtx"))
+            if len(vh) >= 36:
+                tiao = struct.unpack_from(">H", vh, 34)[0]
+        else:
+            yuan = None
+    except Exception as cuowu:      # noqa
+        logger.error(f"视频工作台：读竖排字体度量失败 {cuowu}")
+    if em <= 0:
+        em = 1000
+    jieguo = (em, xia, vmtx, tiao, yuan)
+    _SHU_DULIANG[ming] = jieguo
+    return jieguo
+
+
+def _shu_adv(ming, zi):
+    """一个字躺倒后往前推多少（字体单位）；表里没有就按一个 em"""
+    jian = (_qu_shu(ming), zi)
+    if jian in _SHU_ADV:
+        return _SHU_ADV[jian]
+    em, _xia, vmtx, tiao, yuan = _shu_duliang(ming)
+    adv = em
+    try:
+        if yuan is not None and tiao > 0:
+            zong = yuan.glyphIndexesForString(zi)
+            if zong:
+                hao = min(int(zong[0]), tiao - 1)
+                if (hao + 1) * 4 <= len(vmtx):
+                    adv = struct.unpack_from(">H", vmtx, hao * 4)[0]
+    except Exception as cuowu:      # noqa
+        logger.error(f"视频工作台：读竖排前进量失败 {cuowu}")
+    if adv <= 0:
+        adv = em
+    _SHU_ADV[jian] = adv
+    return adv
+
+
+def _shu_kuan(ziti, ming, wen):
+    """竖排文字排出来总共多宽（当前坐标像素）"""
+    em = float(_shu_duliang(ming)[0])
+    bi = _ziti_xiangsu(ziti) / em
+    fm = QtGui.QFontMetricsF(ziti)
+    kuan = 0.0
+    for zi in str(wen):
+        if ord(zi) >= _SHENG_SHU:
+            kuan += _shu_adv(ming, zi) * bi
+        else:
+            kuan += fm.horizontalAdvance(zi)     # 拉丁字母不躺倒，照旧
+    return kuan
+
+
+def _shu_lu(ziti, ming, wen, x, di):
+    """竖排文字 -> 路径：每个字躺倒、横向一个个排（算法跟 libass 一样）
+
+    x / di 是这一段的起笔位置和基线（当前坐标）；返回拼好的路径。
+    """
+    em, xia_zi, _v, _t, _r = _shu_duliang(ming)
+    bi = _ziti_xiangsu(ziti) / float(em)
+    xia = xia_zi * bi                     # 字身下伸（像素，负的）
+    fm = QtGui.QFontMetricsF(ziti)
+    lu = QtGui.QPainterPath()
+    x_dang = float(x)
+    for zi in str(wen):
+        if ord(zi) >= _SHENG_SHU:
+            adv = _shu_adv(ming, zi) * bi
+            yi = QtGui.QPainterPath()
+            yi.addText(0.0, 0.0, ziti, zi)
+            # 横坐标 = 前进量 + 下伸 + 字形纵坐标；纵坐标 = -下伸 - 字形横坐标
+            yi = QtGui.QTransform(
+                0.0, -1.0, 1.0, 0.0, adv + xia, -xia
+            ).map(yi)
+            yi.translate(x_dang, di)
+            lu.addPath(yi)
+            x_dang += adv
+        else:
+            lu.addText(x_dang, di, ziti, zi)
+            x_dang += fm.horizontalAdvance(zi)
+    return lu
+
+
+def _ziti_kuan_biao(fangda, yi_hang):
+    """一段文字 -> [(字, 格式, 宽度), ...]（宽度是当前坐标的像素，竖排按竖排算）"""
+    jieguo = []
+    for wen, gs in yi_hang:
+        ziti = _hua_ziti(gs, fangda)
+        fm = QtGui.QFontMetricsF(ziti)
+        ming = str(gs.get("font") or "").strip()
+        shu = _shi_shu(ming)
+        bi = (_ziti_xiangsu(ziti) / float(_shu_duliang(ming)[0])) if shu else 1.0
+        for ch in str(wen):
+            if shu and ord(ch) >= _SHENG_SHU:
+                jieguo.append((ch, gs, float(_shu_adv(ming, ch)) * bi))
+            else:
+                jieguo.append((ch, gs, float(fm.width(ch))))
+    return jieguo
+
+
 def _ziti_chidu(ming, cu=False):
     """(字体名, 走不走粗档) -> 字身倍率：ASS 里的 Fontsize 要乘这个才是真正的字身大小
 
@@ -1682,7 +2351,7 @@ def _ziti_chidu(ming, cu=False):
     一次上伸下伸，把倍率除出来，跟 Aegisub 一模一样。
     粗档和细档的上伸下伸不一样，所以 cu 也得算进键里。
     """
-    jian = (str(ming or "").strip(), bool(cu))
+    jian = (_qu_shu(ming), bool(cu))    # 竖排那一支（@xxx）跟 xxx 是同一份字体
     if jian in _ZITI_CHIDU:
         return _ZITI_CHIDU[jian]
     bili = 1.0
@@ -1707,8 +2376,9 @@ def _hua_ziti(gs, bi):
     ziti = QtGui.QFont()
     ming = str(gs.get("font") or "").strip()
     if ming:
-        # 直接用 ASS 里写的名字，让 Qt 去系统字体库里找（不写死任何路径）
-        ziti.setFamily(ming)
+        # 直接用 ASS 里写的名字，让 Qt 去系统字体库里找（不写死任何路径）。
+        # 竖排那一支（@xxx）Qt 没有，得去掉 @ 去要字体，躺倒由 _shu_lu 自己转。
+        ziti.setFamily(_qu_shu(ming))
     # 走不走粗档：ASS 里写了 Bold，或者这个名字在系统里本身是粗体（新兰圆-B）
     cu = bool(gs.get("b")) or _ziti_ming_cu(ming)
     px = max(1.0, _ass_shuzi(gs.get("fs"), 1.0) * bi
@@ -1723,20 +2393,6 @@ def _hua_ziti(gs, bi):
         ziti.setLetterSpacing(
             QtGui.QFont.AbsoluteSpacing, _ass_shuzi(gs["fsp"], 0.0) * bi
         )
-    # 只打第一次：这一帧的字到底落在哪个字体家族上（排查"字体没生效"用）
-    if ming not in _ZITI_JILU:
-        _ZITI_JILU.add(ming)
-        try:
-            shi = QtGui.QFontInfo(ziti)
-            logger.info(
-                f"| INFO | 视频工作台字幕字体 ASS='{gs.get('font')}' "
-                f"系统字重={_ziti_xi_tong_zi_zhong(ming)} 用名='{ming}' "
-                f"实际家族='{shi.family()}' 精确={shi.exactMatch()} "
-                f"粗档={cu} 字号={ziti.pixelSize()} 实际粗={shi.bold()} "
-                f"倍率={_ziti_chidu(ming, cu):.4f}"
-            )
-        except Exception as cuowu:  # noqa
-            logger.error(f"视频工作台：打字体日志失败 {cuowu}")
     return ziti
 
 
@@ -1755,6 +2411,34 @@ def _zhe_hang(fm, wen, kuan):
     if dangqian:
         jieguo.append(dangqian)
     return jieguo or [wen]
+
+
+def _zhe_duan(fangda, yi_hang, kuan):
+    """分段折行：[(文字, 格式), ...] -> [[(文字, 格式), ...], ...]
+
+    一行里的字可能一段一个格式（{\\1c&H..&}某几个字{\\r}后面的字），所以宽度
+    得一段一段量、折行只能折在字与字之间；折完把挨着同格式的字并回一段。
+    """
+    zifu = _ziti_kuan_biao(fangda, yi_hang)
+    xing = [[]]
+    kuan_hang = 0.0
+    for ch, gs, w in zifu:
+        if xing[-1] and kuan_hang + w > kuan:
+            xing.append([])
+            kuan_hang = 0.0
+        xing[-1].append((ch, gs))
+        kuan_hang += w
+    jieguo = []
+    for hang_zf in xing:
+        duan = []
+        for ch, gs in hang_zf:
+            if duan and duan[-1][1] == gs:
+                duan[-1][0] += ch
+            else:
+                duan.append([ch, gs])
+        if duan:
+            jieguo.append([(a, b) for a, b in duan])
+    return jieguo or [[]]
 
 
 def _gs_yanse(gs, jian, a_jian, bei=1.0):
@@ -1822,7 +2506,7 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
     if qu.width() <= 8 or qu.height() <= 8:
         return
     gs = tiao.get("gs") or dict(_ASS_MOREN_YANGSHI)
-    hang = [x for x in (tiao.get("hang") or []) if str(x).strip()]
+    hang = [x for x in (tiao.get("hang") or []) if x]
     if not hang:
         return
     bei = _fad_bei(tiao)
@@ -1852,7 +2536,7 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
         kuan = max(10.0, (kuan_jz - ml - mr) / fscx)
     xing = []
     for x in hang:
-        xing.extend(_zhe_hang(fm, x, kuan * fangda))
+        xing.extend(_zhe_duan(fangda, x, kuan * fangda))
     # 行高 = 上伸 + 下伸（不算 Qt 的 leading），跟 ASS 的行距一致
     lh = max(1.0, (fm.ascent() + fm.descent()) / fangda)
     zong_gao = lh * len(xing)
@@ -1868,7 +2552,9 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
         if lie == 0:
             ax = ml
         elif lie == 1:
-            ax = kuan_jz / 2.0
+            # 居中：在左右边距之间居中，左/右边距各推一半 —— libass / VSFilter
+            # 就是这么算的（Aegisub 画面一模一样），不是死钉在画面正中。
+            ax = (kuan_jz + ml - mr) / 2.0
         else:
             ax = kuan_jz - mr
         if pai == 0:
@@ -1895,8 +2581,16 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
             ml, ding, max(1.0, kuan_jz - ml - mr), zong_gao,
         )
         huabi.fillRect(kuang, _gs_yanse(gs, "c3", "a3"))
-    for i, x in enumerate(xing):
-        kuan_x = fm.width(x) / fangda * fscx
+    for i, duan in enumerate(xing):
+        # 行宽 = 各段宽度之和；对齐照这一行的总宽算
+        kuan_duan = []
+        kuan_x = 0.0
+        for wen_d, gs_d in duan:
+            kuan_duan.append(
+                sum(w for _c, _g, w in _ziti_kuan_biao(fangda, [(wen_d, gs_d)]))
+                / fangda * fscx
+            )
+            kuan_x += kuan_duan[-1]
         if lie == 0:
             x0 = ax
         elif lie == 1:
@@ -1904,11 +2598,23 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
         else:
             x0 = ax - kuan_x
         di = ding + i * lh + fm.ascent() / fangda
-        # 放大版画一遍，再整条缩回基准坐标（宽度/位置就都是精确值了）
-        lu_da = QtGui.QPainterPath()
-        lu_da.addText(x0 * fangda, di * fangda, ziti, x)
-        lu = QtGui.QTransform().scale(1.0 / fangda, 1.0 / fangda).map(lu_da)
-        _hua_yi_hang(huabi, lu, gs, 1.0, fscx, x0 + kuan_x / 2.0, di, bei)
+        # 一段一段画：每段用自己那份格式（颜色 / 粗斜体 / 字号都能只有几个字不一样）
+        x_dang = x0
+        zhong_x = x0 + kuan_x / 2.0
+        for (wen_d, gs_d), kuan_d in zip(duan, kuan_duan):
+            ziti_d = _hua_ziti(gs_d, fangda)
+            ming_d = str(gs_d.get("font") or "").strip()
+            if _shi_shu(ming_d):
+                # 竖排那一支：字一个躺倒横着排（照 libass 的算法）
+                lu_da = _shu_lu(
+                    ziti_d, ming_d, wen_d, x_dang * fangda, di * fangda
+                )
+            else:
+                lu_da = QtGui.QPainterPath()
+                lu_da.addText(x_dang * fangda, di * fangda, ziti_d, wen_d)
+            lu = QtGui.QTransform().scale(1.0 / fangda, 1.0 / fangda).map(lu_da)
+            _hua_yi_hang(huabi, lu, gs_d, 1.0, fscx, zhong_x, di, bei)
+            x_dang += kuan_d
     huabi.restore()
 
 
@@ -1942,11 +2648,20 @@ def _chai_ass(wenben):
             if lie:
                 ming = lie
             continue
-        if tiao.lower().startswith("dialogue:"):
+        if tiao.lower().startswith(("dialogue:", "comment:")):
             # Text 是最后一个字段、里面可以有逗号：只切前面那几个
             bu = tiao.split(":", 1)[1].strip().split(",", len(ming) - 1)
             bu += [""] * (len(ming) - len(bu))
-            hang.append(dict(zip(ming, bu)))
+            hang.append(
+                dict(
+                    zip(ming, bu),
+                    _lei=(
+                        "Comment"
+                        if tiao.lower().startswith("comment:")
+                        else "Dialogue"
+                    ),
+                )
+            )
             continue
         zai.append(yuan_hang)
     if not you_events:
@@ -1961,12 +2676,15 @@ def _chai_ass(wenben):
     }
 
 
-def _xie_ass_baoliu(lu, jiegou, zimu):
+def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None):
     """按原 ASS 的结构写出去：骨架 / 样式表 / 每行的字段原样带过去
 
     只有时间、条数、文字会变：每条字幕优先认原来的那一行（先认文字、再认原来
     的时间），认到就把那行的 Style / Name / 边距 / Effect 一起带上；认不到
     （新加的行）就照原来第一条 Dialogue 的样子复制一份。
+
+    fu_liebiao = 每条的字段表（样式 / 说话人 / 层 / 边距 / 特效 / 注释），给了就
+    盖在认出来的那一行上。
     """
     from anylabeling.views.labeling.utils.video import (
         ASS_TEMPLATE,
@@ -1975,12 +2693,13 @@ def _xie_ass_baoliu(lu, jiegou, zimu):
 
     ming = jiegou.get("ming") or list(_ASS_ZIDUAN)
     lao = [dict(x) for x in (jiegou.get("hang") or [])]
+    fu_men = list(fu_liebiao or [])
     yong = [False] * len(lao)
     muban = dict(lao[0]) if lao else {k: "" for k in ming}
     muban.setdefault("Style", "Default")
 
     hang_xin = []
-    for qi, zhi, wenben in zimu:
+    for xu, (qi, zhi, wenben) in enumerate(zimu):
         wen = str(wenben or "")
         chun = _ass_chun_wen(wen)
         zhao = -1
@@ -2009,8 +2728,26 @@ def _xie_ass_baoliu(lu, jiegou, zimu):
             bu["Text"] = wen.replace("\n", "\\N")
         bu["Start"] = format_ass_time(int(qi))
         bu["End"] = format_ass_time(int(zhi))
+        # 编辑区上方那排改过的字段：盖在原行上（没给就照原样）
+        fu = fu_men[xu] if xu < len(fu_men) else {}
+        if fu:
+            if fu.get("yang"):
+                bu["Style"] = str(fu["yang"])
+            if fu.get("shuo") is not None and "shuo" in fu:
+                bu["Name"] = str(fu["shuo"] or "")
+            if fu.get("ceng") is not None and "ceng" in fu:
+                bu["Layer"] = str(int(fu.get("ceng") or 0))
+            for jian, lie in (("zuo", "MarginL"), ("you", "MarginR"),
+                              ("shu", "MarginV")):
+                if jian in fu:
+                    bu[lie] = f"{max(0, int(fu.get(jian) or 0)):04d}"
+            if "texiao" in fu:
+                bu["Effect"] = str(fu.get("texiao") or "")
+            if "zhushi" in fu:
+                bu["_lei"] = "Comment" if fu.get("zhushi") else "Dialogue"
         hang_xin.append(bu)
 
+    lei_zhi = str(hang_xin[0].get("_lei") or "Dialogue") if hang_xin else ""
     with open(lu, "w", encoding="utf-8-sig") as f:
         tou = jiegou.get("tou") or []
         if tou:
@@ -2025,16 +2762,17 @@ def _xie_ass_baoliu(lu, jiegou, zimu):
             f.write(tiao + "\n")
         for bu in hang_xin:
             f.write(
-                "Dialogue: "
+                str(bu.get("_lei") or lei_zhi or "Dialogue")
+                + ": "
                 + ",".join(str(bu.get(k, "")) for k in ming)
                 + "\n"
             )
 
 
-def _xie_zimu_dao_wenjian(lu, zimu, ass_yuan=None):
+def _xie_zimu_dao_wenjian(lu, zimu, ass_yuan=None, fu_liebiao=None):
     """按扩展名挑写法：.ass / .ssa 有原结构就按原结构写，否则用模板"""
     if ass_yuan and osp.splitext(lu)[1].lower() in (".ass", ".ssa"):
-        _xie_ass_baoliu(lu, ass_yuan, zimu)
+        _xie_ass_baoliu(lu, ass_yuan, zimu, fu_liebiao)
     else:
         _xie_zimu_wenjian(lu, zimu)
 
@@ -2103,6 +2841,9 @@ class ShijianZhou(QtWidgets.QWidget):
         self._zimu_tao = []             # 每块字幕摆在第几行（0 起，自己挪的）
         self._xuan_zhong = -1           # 主选是第几段（跟右侧字幕列表对齐）
         self._xuan_duo = []             # 多选里都是第几段（有序；单选时只有一个）
+        # 播放头现在压在哪几块上（只用来判断"要不要整条重画"：进 / 出块时那块
+        # 的描边要换色，窄带擦不干净。画的时候还是实时看 _bofangtou）
+        self._zai_kuai = None
         self._miao_dian = None          # Shift 连选的锚点（上一次主选那条）
         self._tuo_zimu = None           # 正在拖的那块（拖动中只改本地，松手才提交）
         self._xifu_ms = None            # 拖动中吸到了哪个时间点上（画那根吸附提示线）
@@ -2135,12 +2876,23 @@ class ShijianZhou(QtWidgets.QWidget):
             self._xuan_zhong = -1
         if self._xuan_zhong >= 0 and self._xuan_zhong not in self._xuan_duo:
             self._xuan_duo = [self._xuan_zhong]
+        self._zai_kuai = None       # 块变了，播放头压着哪几块重新认
         self.update()
 
     def tianjia_zimu(self, qi_ms, zhi_ms, wenben):
-        self._zimu.append((int(qi_ms), int(zhi_ms), str(wenben or "")))
-        self._zimu_tao.append(0)        # 新块默认摆第一行
+        """新建一块：按时间插到该在的位置，行号表跟着插一格；返回插在第几块
+
+        原来选中的那块跟着往后挪一格，插在前面也不会选中别的块。
+        """
+        wei = zimu_charu_weizhi(self._zimu, qi_ms, zhi_ms)
+        self._zimu.insert(wei, (int(qi_ms), int(zhi_ms), str(wenben or "")))
+        self._zimu_tao.insert(wei, 0)   # 新块默认摆第一行
+        if wei <= self._xuan_zhong:
+            self._xuan_zhong += 1
+        self._xuan_duo = [x + 1 if x >= wei else x for x in self._xuan_duo]
+        self._zai_kuai = None       # 块变了，播放头压着哪几块重新认
         self.update()
+        return wei
 
     def gai_zimu_wenben(self, xu, wenben):
         """只改这一块的文字，别的都不动
@@ -2165,6 +2917,7 @@ class ShijianZhou(QtWidgets.QWidget):
             self._xuan_zhong = -1
             self._xuan_duo = []
             self._miao_dian = None
+            self._zai_kuai = None
             self.update()
 
     def zimu_shu(self):
@@ -2295,6 +3048,21 @@ class ShijianZhou(QtWidgets.QWidget):
             self._xuan_ze_dan(xu)
             self.update()
 
+    def shezhi_xuan_zhong_duo(self, xu_liebiao):
+        """外部（字幕列表多选 / 全选）选中了这一批，这边整批跟着高亮"""
+        xu = sorted(
+            {int(x) for x in (xu_liebiao or [])
+             if 0 <= int(x) < len(self._zimu)}
+        )
+        if not xu:
+            self._xuan_ze_dan(-1)
+            self.update()
+            return
+        self._xuan_duo = list(xu)
+        self._xuan_zhong = xu[-1]
+        self._miao_dian = xu[-1]        # Shift 连选的锚点落在这批的最后一条
+        self.update()
+
     def _xuan_ze_dan(self, xu):
         """只留某一条（-1 = 一条都不选）；不改外观（调用方自己刷）"""
         xu = int(xu)
@@ -2363,6 +3131,19 @@ class ShijianZhou(QtWidgets.QWidget):
         self.shitu_bian.emit()
         self.update()
 
+    def _bofangtou_zai_kuai(self):
+        """播放头现在压在哪几块上（只给"要不要整条重画"用）
+
+        画的时候不靠它 —— 那边直接看 _bofangtou 实时判断；这个只用来发现
+        "进 / 出块"这个时刻。半开区间，跟画的时候一个口径。
+        """
+        t = self._bofangtou
+        return tuple(
+            xu
+            for xu, (qi, zhi, _wen) in enumerate(self._zimu)
+            if min(int(qi), int(zhi)) <= t < max(int(qi), int(zhi))
+        )
+
     def shezhi_bofangtou(self, ms, gensui=True):
         if self._tuodong:
             # 正在用鼠标拖播放头：这时候只认鼠标位置。
@@ -2375,7 +3156,12 @@ class ShijianZhou(QtWidgets.QWidget):
         if gensui and self._beishu > 1.0:
             self._gensui_bofangtou()
         xin_x = self._ms_to_x(self._bofangtou)
-        if self._shi_ms != jiu_shi:
+        xin_zai = self._bofangtou_zai_kuai()
+        if xin_zai != self._zai_kuai:
+            # 播放头进 / 出了哪块：那块的描边要换色，窄带擦不干净 —— 整条重画
+            self._zai_kuai = xin_zai
+            self.update()
+        elif self._shi_ms != jiu_shi:
             self.update()               # 视图跟着滚了，整条重画
         elif xin_x != jiu_x:
             # 播放头只挪了一点点：只重画它扫过的那一条窄带，别整条时间轴重绘。
@@ -2857,6 +3643,13 @@ class ShijianZhou(QtWidgets.QWidget):
                 zhu = xu == self._xuan_zhong
                 bian = QtGui.QColor(YANSE_ZIMU_XUAN)
                 kuan_bi = 3 if zhu else self.ZIMU_BIAN_KUAN_DU
+            elif min(qi, zhi) <= self._bofangtou < max(qi, zhi):
+                # 播放头正压着这块：描边换成播放头那档红，给个"正播到这块"的
+                # 反馈 —— 只是提示，不算选中（选中优先，所以这块要是选中的，
+                # 上面那个分支先接走，还是绿框）。半开区间：正好卡在块尾时
+                # 算下一块的开头，不会两块一起亮。
+                bian = QtGui.QColor(YANSE_ZIMU_ZAI)
+                kuan_bi = self.ZIMU_BIAN_KUAN_DU
             else:
                 # 紧挨着的块靠描边分个数：奇数块、偶数块交替用两种深色描边，
                 # 交界处永远是"这块的深蓝边 | 那块的深棕边"，一眼数得清几块。
@@ -3185,8 +3978,11 @@ class ShijianZhou(QtWidgets.QWidget):
             self._huatu_huancun = (key, tupian)
             return tupian
 
-        kuai = int(round(BO_CAN_YANG_LV * BO_HAO_MIAO / 1000.0))
-        kuai = max(1, kuai)
+        # 「毫秒 -> 格号」的除数：一格 = BO_HAO_MIAO 毫秒（解码线程就是按这个
+        # 格长把采样点分组的）。以前这里误用了「每格的采样点数」，等于把时间轴
+        # 压缩了 BO_CAN_YANG_LV/1000 倍：屏幕上每一列只取到零点几毫秒的一个瞬间，
+        # 语音那种忽高忽低的波形大半被跳过去，只剩持续大音量才画得出来。
+        mei_ge_haomiao = float(max(1, BO_HAO_MIAO))
         kuan = qu.width()
         gao = qu.height()
         ban = gao / 2.0 - 2.0
@@ -3196,7 +3992,7 @@ class ShijianZhou(QtWidgets.QWidget):
             self._shi_ms, self._shi_ms + ke, kuan + 1, dtype=np.float64
         )
         qi = np.clip(
-            np.floor(bian / kuai).astype(np.int64), 0, self._bo_you
+            np.floor(bian / mei_ge_haomiao).astype(np.int64), 0, self._bo_you
         )
         shang = np.zeros(kuan, dtype=np.float32)
         xia = np.zeros(kuan, dtype=np.float32)
@@ -3714,7 +4510,14 @@ class VideoWorkDialog(QtWidgets.QDialog):
             | Qt.WindowMaximizeButtonHint
             | Qt.WindowCloseButtonHint
         )
-        self.resize(1280, 800)
+        # 界面记忆（窗口位置 / 分栏 / 标签页 / 时间轴缩放）跟「谁在下面」存同一个地方：
+        # 软件根目录的 gongzuotai.ini
+        self._weizhi_peizhi = buju_qsettings()
+        # 上次关窗时的窗口位置 + 大小：存过就还原，头一回给 1280x800
+        if self._weizhi_peizhi.value(JIEMIAN_ZHENGGE_JIAN):
+            self.restoreGeometry(self._weizhi_peizhi.value(JIEMIAN_ZHENGGE_JIAN))
+        else:
+            self.resize(1280, 800)
         self.setStyleSheet(_yangshi_quanju())
 
         self.lujing = ""
@@ -3753,13 +4556,23 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._zimu_tiao_wen = None   # 字幕条现在显示的是哪句话（避免每帧重设）
         self.zimu_wenjian = ""       # 当前字幕文件（打开 / 另存过就是它）
         self.zimu_geshi = ""         # "srt" / "ass"，决定存回去用哪种格式
+        # 自动保存 / 自动备份（照 AEG 那套）：
+        #   备份 = 动一份字幕之前，先把磁盘上的原件抄一份，同名覆盖、只留一份
+        #   自动保存 = 定时存一份带时间戳的，一次一份、从不覆盖，攒成历史版本
+        self._zidong_beifen_guo = set()   # 这一趟已经备份过的文件（同一个只备份一次）
+        self._zidong_gai_dong = False     # 字幕改过、还没自动存过
+        self._zidong_shange = None        # 上次自动保存时字幕长什么样
+        self._zidong_jishi = QtCore.QTimer(self)
+        self._zidong_jishi.setInterval(ZIDONG_BAOCUN_MIAO * 1000)
+        self._zidong_jishi.timeout.connect(self._zidong_baocun)
+        self._zidong_jishi.start()
         # 打开的是 ASS 时留一份原结构（骨架 / 样式表 / 每行字段）：保存按它写，
         # 只有时间和条数会变，样式之类原样保留
         self._ass_yuan = None
-        # 画面里叠字幕：开关 + 样式表缓存 + 每条字幕配的（样式名, 原文）缓存
-        self._zimu_hua = bool(HUA_ZIMU_MOREN)
+        # 画面里叠字幕：样式表缓存 + 每条字幕配的字段表 / ASS 原文缓存
         self._zimu_hua_ji = None      # (原结构, 基准分辨率, 样式表) 读一次存着
-        self._zimu_hang_ji = None     # (原结构, [(样式名, ASS 原文)])；列表变了才重算
+        self._zimu_pei_ji = []        # 每条配的（样式, 说话人, ASS 原文, 字段）
+        self._zimu_fu_ji = []         # 每条的字段表（原 ASS 的 + 编辑区上方改过的）
         # 画面区高度：上半栏按画面比例贴着来，上下不留黑边（省出来的给时间轴）。
         # _shang_ci_he 存上次算过的（画面区宽, 画面原始尺寸），变了才主动重调；
         # 改分栏这个动作一律延到下一轮事件循环，不在 resize 里直接动（会打架）。
@@ -3783,7 +4596,29 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 0 if JINGYIN else int(MO_REN_YINLIANG)
             )
 
+        # 「时间轴」和「字幕列表」谁在下面（右键点这两块能切）。
+        # 上次切过就按上次的来，头一回默认时间轴在下（打轴的摆法）。
+        self._liebiao_zai_xia = (
+            str(self._weizhi_peizhi.value(WEIZHI_PEIZHI_JIAN, "shijianzhou"))
+            == "liebiao"
+        )
+        # 上下大分栏你亲手拖过没有：拖过就听你的，不再自动贴合画面比例
+        self._shangxia_duoguo = str(
+            self._weizhi_peizhi.value(JIEMIAN_SHANGXIA_DUO, "0")
+        ) in ("1", "true", "True")
+        # 标签页里面的分栏：那一页藏着的时候摆不准，先记着，等它露出来再摆
+        self._ye_bili = {}
+
         self._jian_ui()
+
+        # 你亲手拖过上下大分栏 -> 记下来，以后不再自动贴合画面比例（听你的）
+        self.shang_xia.splitterMoved.connect(self._shangxia_dong_le)
+
+        # 拖 .srt / .ass 进这个窗口就直接载入（见 dragEnterEvent / dropEvent）
+        self.setAcceptDrops(True)
+        # 编辑框自己默认吃文件拖放（会把路径当文字插进去），关掉，
+        # 这样拖到它身上也照样能落到窗口上载入字幕
+        self.bianji_mianban.kuang.setAcceptDrops(False)
 
         # 按钮 / 勾选框 / 单选框 / 下拉框一律不吃键盘焦点。
         # 焦点一旦停在它们身上，空格就被它们自己吃掉了（按钮被当成"点一下"），
@@ -3887,6 +4722,37 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.hebing_zimu_jian.setContext(Qt.WindowShortcut)
         self.hebing_zimu_jian.activated.connect(self._hebing_xuan_zhong_zimu)
 
+        # S = 切分字幕块：游标（播放头）停着的那条，从游标位置一分为二，
+        # 两条文字一模一样，只是时间被切开（硬字幕提取把两句连成一条时用）。
+        # 同样是整窗口快捷键，焦点在输入框里时不抢（那儿 S 就该是字母 s）。
+        self.qiefen_zimu_jian = QtWidgets.QShortcut(
+            QtGui.QKeySequence(Qt.Key_S), self
+        )
+        self.qiefen_zimu_jian.setContext(Qt.WindowShortcut)
+        self.qiefen_zimu_jian.activated.connect(self._qiefen_zimu_kuai)
+
+        # Alt+S = 开关注释：把当前这条（列表里多选就这一批）在"注释 / 普通"
+        # 之间翻一下，跟用鼠标勾那个「注释」勾选框一个效果。同样是整窗口
+        # 快捷键，只在本窗口生效；输入框里 Alt+S 本来也没别的用处，不抢。
+        self.zhushi_zimu_jian = QtWidgets.QShortcut(
+            QtGui.QKeySequence("Alt+S"), self
+        )
+        self.zhushi_zimu_jian.setContext(Qt.WindowShortcut)
+        self.zhushi_zimu_jian.activated.connect(self._qiehuan_zhushi)
+
+        # F1~F12 = 套槽位（说话人 + 样式）：选中字幕按 F1 就是套「槽位01」，
+        # 跟 AEG 那个 Lua 脚本一个手感。槽位在样式编辑器下方「自动化脚本」
+        # 里配（存在软件根目录的配置文件里）。同样只在本窗口生效，
+        # 主界面没占 F1~F12，不冲突。
+        self.caowei_jian = []
+        for hao in range(CAOWEI_SHU):
+            jian = QtWidgets.QShortcut(
+                QtGui.QKeySequence(getattr(Qt, f"Key_F{hao + 1}")), self
+            )
+            jian.setContext(Qt.WindowShortcut)
+            jian.activated.connect(lambda h=hao: self._tao_caowei(h))
+            self.caowei_jian.append(jian)
+
     # --------------------------------------------------------------
     # 界面
     # --------------------------------------------------------------
@@ -3895,7 +4761,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         gen.setContentsMargins(12, 12, 12, 12)
         gen.setSpacing(0)
 
-        # 上下分栏：上半（画面+参数） / 下半（时间轴），中间可拖着改高度
+        # 上下分栏：上半（画面+参数） / 下半（时间轴 或 字幕列表），中间可拖着改高度
         self.shang_xia = QtWidgets.QSplitter(Qt.Vertical)
         self.shang_xia.setHandleWidth(9)
         self.shang_xia.setChildrenCollapsible(False)
@@ -3914,6 +4780,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shang_xia.setStretchFactor(0, 1)
         self.shang_xia.setStretchFactor(1, 0)
 
+        # 「时间轴」和「字幕列表」按上次记住的位置摆好（默认时间轴在下），
+        # 再给这两块挂上右键菜单，随时能对调
+        self._bai_weizhi(chi_cun=False)
+        self._gua_youjian_caidan()
+
         gen.addWidget(self.shang_xia, 1)
 
         # 分栏比例等窗口真正显示出来再定，不然尺寸还没算好
@@ -3922,14 +4793,246 @@ class VideoWorkDialog(QtWidgets.QDialog):
 
     def _shezhi_chushi_bili(self):
         try:
-            self.shang_xia.setSizes([560, SHIJIANZHOU_GAO + 44])
+            # 下面那一栏装的是谁，就按谁给高度：时间轴矮，字幕列表要高些
+            self.shang_xia.setSizes(
+                [
+                    560,
+                    ZIMU_LIEBIAO_GAO
+                    if self._liebiao_zai_xia
+                    else SHIJIANZHOU_GAO + 44,
+                ]
+            )
             self.zuo_you.setSizes([900, 340])
+            if self._liebiao_zai_xia:
+                # 列表在下面时，时间轴缩进右栏上方，给它够用的高度
+                self.bianji_mianban.setSizes([SHIJIANZHOU_GAO + 44, 220])
         except Exception:  # noqa
             pass
+        self._huan_jiemian_bili()       # 上次拖过的分栏位置盖回来
         # 上面刚把比例定死，画面区可能还是矮的（或者一开始就开了视频）：
         # 等这一步的尺寸落到控件上，再按画面比例把上半栏调一遍
         self._shang_ci_he = None
         QtCore.QTimer.singleShot(0, self._he_huamian_gao)
+
+    # --------------------------------------------------------------
+    # 「时间轴」和「字幕列表」对调位置
+    # --------------------------------------------------------------
+    def _bai_weizhi(self, chi_cun=True):
+        """按当前模式把「时间轴块」和「字幕列表块」摆到各自该在的位置
+
+        两块都是整块搬（各自带的工具栏 / 标题一起走）。Qt 搬控件只换父级，
+        对象本身不动，所以信号连接、选中状态、字体缓存这些全都还在。
+        chi_cun=True 时先把两处的尺寸记下来、搬完原样放回去 —— 就是换个位置，
+        大小一点都不跟着变。
+        """
+        ce = self.bianji_mianban             # 右栏那个上下分栏
+        lie = ce.lie_biao_kuang              # 字幕列表整块（标题 + 那张表）
+        zhou = self.shijianzhou_kuang        # 时间轴整块（含打开/保存/缩放那排）
+        shang_chi = self.shang_xia.sizes() if chi_cun else None
+        ce_chi = ce.sizes() if chi_cun else None
+        if self._liebiao_zai_xia:
+            # 做字幕的摆法（照 AEG）：列表铺在窗口下方，时间轴收进右栏上方
+            self.shang_xia.insertWidget(1, lie)
+            ce.insertWidget(0, zhou)
+        else:
+            # 打轴 / 调轴的摆法（照 ACRtime）：时间轴在窗口下方，列表回右栏
+            self.shang_xia.insertWidget(1, zhou)
+            ce.insertWidget(0, lie)
+        if chi_cun:
+            self.shang_xia.setSizes(shang_chi)
+            ce.setSizes(ce_chi)
+
+    def _qiehuan_weizhi(self):
+        """把「时间轴」和「字幕列表」换个位置，并把这次的选择记下来"""
+        self._liebiao_zai_xia = not self._liebiao_zai_xia
+        self._weizhi_peizhi.setValue(
+            WEIZHI_PEIZHI_JIAN,
+            "liebiao" if self._liebiao_zai_xia else "shijianzhou",
+        )
+        self._bai_weizhi()
+        self.shezhi_mianban.zhuangtai_shezhi(
+            "字幕列表挪到窗口下方（时间轴收进右栏）"
+            if self._liebiao_zai_xia
+            else "时间轴挪到窗口下方（字幕列表回到右栏）"
+        )
+
+    # --------------------------------------------------------------
+    # 界面记忆：窗口位置 / 标签页 / 各处分栏 / 时间轴缩放
+    # --------------------------------------------------------------
+    @staticmethod
+    def _bili_wenben(daxiao):
+        """分栏尺寸 -> 存进配置的一小段文本（不记的写「-」）"""
+        if not daxiao:
+            return "-"
+        return ",".join(str(int(x)) for x in daxiao)
+
+    @staticmethod
+    def _wenben_bili(wenben):
+        """配置里那段文本 -> 分栏尺寸（读不出来返回 None，那处就按默认）"""
+        wenben = str(wenben or "").strip()
+        if not wenben or wenben == "-":
+            return None
+        try:
+            da = [int(x) for x in wenben.split(",")]
+        except ValueError:
+            return None
+        return da if len(da) >= 2 else None
+
+    def _huan_jiemian_bili(self):
+        """按上次关窗时记下的分栏位置还原（没存过 / 摆法换过了就什么都不做）
+
+        「画面 ↔ 右栏」「上半 ↔ 下半」在窗口上，直接摆就行；标签页里面那两处
+        分栏（列表 ↔ 编辑框、推理设置 ↔ 字幕列表）得等那一页露出来才量得出高度，
+        藏着的时候摆不准，所以先记着，等那页第一次显出来再摆。
+        """
+        duan = str(
+            self._weizhi_peizhi.value(JIEMIAN_BILI_JIAN, "") or ""
+        ).split(";")
+        if len(duan) != 5:
+            return
+        bai = "liebiao" if self._liebiao_zai_xia else "shijianzhou"
+        if duan[0] != bai:
+            return              # 摆法跟上次不一样，那套尺寸对不上，按默认来
+        for kuang, zhi in ((self.zuo_you, duan[1]), (self.shang_xia, duan[2])):
+            da = self._wenben_bili(zhi)
+            if da:
+                kuang.setSizes(da)
+        dang_qian = self.you_tabs.currentIndex()
+        for ye, kuang, zhi in (
+            (0, self.tiqu_ce, duan[4]),
+            (1, self.bianji_mianban, duan[3]),
+        ):
+            da = self._wenben_bili(zhi)
+            if not da:
+                continue
+            if ye == dang_qian:
+                # 等这一轮布局落定再摆，不然页面尺寸还是 0，摆不准
+                QtCore.QTimer.singleShot(0, lambda k=kuang, d=da: k.setSizes(d))
+            else:
+                self._ye_bili[ye] = (kuang, da)
+
+    def _tab_huan_le(self, ye):
+        """切到某个标签页：把上次记下的、这页里面的分栏位置放回去"""
+        zai = self._ye_bili.pop(int(ye), None)
+        if zai:
+            QtCore.QTimer.singleShot(0, lambda: zai[0].setSizes(zai[1]))
+
+    def _shangxia_dong_le(self, _wei=0, _hao=0):
+        """你亲手拖过上下大分栏：记一笔，以后不再自动贴合画面比例"""
+        self._shangxia_duoguo = True
+
+    def _cun_jiemian_buju(self):
+        """关窗时把窗口位置、标签页、各处分栏位置、时间轴缩放记下来，下次原样还原"""
+        try:
+            pei = self._weizhi_peizhi
+            pei.setValue(JIEMIAN_ZHENGGE_JIAN, self.saveGeometry())
+            pei.setValue(JIEMIAN_TAB_JIAN, int(self.you_tabs.currentIndex()))
+            pei.setValue(JIEMIAN_SHANGXIA_DUO, "1" if self._shangxia_duoguo else "0")
+            # 记数值框上的倍数：没打开过视频时时间轴内部倍数还是 1，
+            # 直接记它会把默认的 ×15 弄丢
+            pei.setValue(
+                JIEMIAN_SUOFANG_JIAN,
+                float(self.shijianzhou_suofang.value()),
+            )
+            bai = "liebiao" if self._liebiao_zai_xia else "shijianzhou"
+            pei.setValue(
+                JIEMIAN_BILI_JIAN,
+                ";".join((
+                    bai,
+                    self._bili_wenben(self.zuo_you.sizes()),
+                    # 上下大分栏只在你亲手拖过时才记：没拖过的话那个高度是
+                    # 按画面比例算出来的，下次开视频它自己会重算
+                    self._bili_wenben(self.shang_xia.sizes())
+                    if self._shangxia_duoguo
+                    else "-",
+                    self._bili_wenben(self.bianji_mianban.sizes()),
+                    self._bili_wenben(self.tiqu_ce.sizes()),
+                )),
+            )
+            pei.sync()
+        except Exception as cuowu:  # noqa
+            logger.warning(f"视频工作台：记界面摆放失败 {cuowu}")
+
+    def _gua_youjian_caidan(self):
+        """给这两块挂右键菜单
+
+        字幕列表：批量加「」+ 位置切换
+        时间轴：只有位置切换
+        里层那块（列表的表、时间轴的画布）也要挂：点在它们身上时，
+        事件不会冒到外框来，只挂外框的话点在表上没反应。
+        """
+        for w in (self.bianji_mianban.lie_biao_kuang,
+                  self.bianji_mianban.biao):
+            w.setContextMenuPolicy(Qt.CustomContextMenu)
+            w.customContextMenuRequested.connect(
+                lambda pos, x=w: self._tan_liebiao_caidan(x, pos)
+            )
+        for w in (self.shijianzhou_kuang, self.shijianzhou):
+            w.setContextMenuPolicy(Qt.CustomContextMenu)
+            w.customContextMenuRequested.connect(self._tan_weizhi_caidan)
+
+    def _tan_liebiao_caidan(self, kuang, pos):
+        """字幕列表右键：批量加「」+ 位置切换
+
+        在行上点的时候：这一行要是已经在选中里，就对整批选中的下手（Ctrl+A
+        全选后右键 = 一次全处理）；要是点在没选中过的行上，就只对点到的这一
+        行下手，界面上已经选好的那几行不动。
+
+        「说话人+样式」不放这儿：F1~F12 直接套，配置在样式编辑器里，
+        右键再挂一份是多余的。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        mu = [int(x) for x in self.bianji_mianban.xuan_zhong_hang()]
+        if kuang is self.bianji_mianban.biao and zimu:
+            hang = self.bianji_mianban.biao.indexAt(pos).row()
+            if 0 <= hang < len(zimu) and hang not in mu:
+                mu = [hang]
+        mu = [i for i in mu if 0 <= i < len(zimu)]
+
+        caidan = QtWidgets.QMenu(self)
+        if mu:
+            kuo = caidan.addAction("【-批量添加方括号】")
+            kuo.triggered.connect(
+                lambda _=False, h=list(mu): self._zhixing_kuohao(h)
+            )
+        else:
+            wu = caidan.addAction("先选中要处理的字幕")
+            wu.setEnabled(False)
+        caidan.addSeparator()
+        zhou, lie = self._tian_weizhi_caidan(caidan)
+        dian = caidan.exec_(QtGui.QCursor.pos())
+        self._caidan_dian_weizhi(dian, zhou, lie)
+
+    def _caidan_dian_weizhi(self, dian, zhou, lie):
+        """点了菜单里的「谁放在下方」才翻位置
+
+        必须确认点中的是这两项中的一项：菜单里还有别的项（批量加「」那些），
+        不排除的话，点它们也会走到这儿来，位置就跟着乱翻。
+        """
+        if dian is None or (dian is not zhou and dian is not lie):
+            return
+        if bool(dian is lie) != self._liebiao_zai_xia:
+            self._qiehuan_weizhi()
+
+    def _tian_weizhi_caidan(self, caidan):
+        """往菜单末尾加「谁放在下方」那两项，返回这两个 action"""
+        zhou = caidan.addAction("时间轴放在下方")
+        lie = caidan.addAction("字幕列表放在下方")
+        for a in (zhou, lie):
+            a.setCheckable(True)
+        zhou.setChecked(not self._liebiao_zai_xia)
+        lie.setChecked(self._liebiao_zai_xia)
+        zu = QtWidgets.QActionGroup(caidan)
+        zu.addAction(zhou)
+        zu.addAction(lie)
+        return zhou, lie
+
+    def _tan_weizhi_caidan(self, _dian=None):
+        """时间轴右键弹出的那个小菜单：选谁放到下方"""
+        caidan = QtWidgets.QMenu(self)
+        zhou, lie = self._tian_weizhi_caidan(caidan)
+        dian = caidan.exec_(QtGui.QCursor.pos())
+        self._caidan_dian_weizhi(dian, zhou, lie)
 
     def _jian_yulan_mianban(self):
         mianban = QtWidgets.QFrame()
@@ -3939,73 +5042,38 @@ class VideoWorkDialog(QtWidgets.QDialog):
         bu.setContentsMargins(0, 0, 0, 0)
         bu.setSpacing(0)
 
-        # ---- 顶栏 ----
-        ding = QtWidgets.QFrame()
-        ding.setObjectName("YsgPreviewHeader")
-        ding.setMinimumHeight(38)
-        ding_bu = QtWidgets.QHBoxLayout(ding)
-        ding_bu.setContentsMargins(10, 6, 8, 6)
-        ding_bu.setSpacing(8)
-
-        self.biaoti = QtWidgets.QLabel("(未打开视频)")
-        self.biaoti.setObjectName("YsgFileTitle")
-        self.biaoti.setSizePolicy(
-            QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred
-        )
-        self.xinxi = QtWidgets.QLabel("")
-        self.xinxi.setObjectName("YsgMeta")
-        self.xinxi.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-
-        ding_bu.addWidget(self.biaoti, 0)
-        ding_bu.addWidget(self.xinxi, 1)
-
-        # 右上角功能按钮区
-        self.gongneng_qu = QtWidgets.QWidget()
-        gongneng_bu = QtWidgets.QHBoxLayout(self.gongneng_qu)
-        gongneng_bu.setContentsMargins(0, 0, 0, 0)
-        gongneng_bu.setSpacing(2)
-
-        # 画面里叠字幕的开关（样式照打开的那份 ASS 画）
-        self.a_hua_zimu = QtWidgets.QCheckBox("画面里显示字幕")
-        self.a_hua_zimu.setToolTip("把字幕按 ASS 的样式叠在画面上")
-        self.a_hua_zimu.setChecked(self._zimu_hua)
-        self.a_hua_zimu.toggled.connect(self._qiehuan_hua_zimu)
-        gongneng_bu.addWidget(self.a_hua_zimu)
-
-        ding_bu.addWidget(self.gongneng_qu, 0)
-
-        bu.addWidget(ding, 0)
-
-        # ---- 画面 ----
+        # ---- 画面（顶上不留标题栏，直接顶格） ----
         self.huamian = HuamianQu()
         self.huamian.chicun_bian.connect(self._tongbu_suo_dao)
         self.huamian.chicun_bian.connect(self._he_huamian_gao)
         bu.addWidget(self.huamian, 1)
 
-        # ---- 画面下方：当前这一段的字幕（跟画面对照用） ----
+        # ---- 画面下方：当前这一段的字幕（跟画面对照用）；底栏有个开关能收起来 ----
         self.zimu_tiao = QtWidgets.QLabel("")
         self.zimu_tiao.setObjectName("YsgZimuTiao")
         self.zimu_tiao.setAlignment(Qt.AlignCenter)
         self.zimu_tiao.setFixedHeight(ZIMU_TIAO_GAO)
         self.zimu_tiao.setTextFormat(Qt.PlainText)
+        self.zimu_tiao.setVisible(self._du_zimu_tiao_kai())
         bu.addWidget(self.zimu_tiao, 0)
 
-        # ---- 底栏（时间 + 播放控制） ----
+        # ---- 底栏（进度条 + 播放控制） ----
         di = QtWidgets.QFrame()
         di.setObjectName("YsgPreviewFooter")
-        di.setMinimumHeight(46)
-        di_bu = QtWidgets.QHBoxLayout(di)
-        di_bu.setContentsMargins(10, 6, 10, 6)
-        di_bu.setSpacing(2)
+        di_zhong = QtWidgets.QVBoxLayout(di)
+        di_zhong.setContentsMargins(8, 2, 8, 2)
+        di_zhong.setSpacing(0)
 
-        self.shijian_dangqian = QtWidgets.QLabel("00:00:00:00")
-        self.shijian_dangqian.setObjectName("YsgTimeNow")
-        self.shijian_zong = QtWidgets.QLabel("00:00:00:00")
-        self.shijian_zong.setObjectName("YsgTimeAll")
-        di_bu.addWidget(self.shijian_dangqian)
-        di_bu.addSpacing(8)
-        di_bu.addWidget(self.shijian_zong)
-        di_bu.addStretch(1)
+        # 上排：整条片子的进度（刻度 + 指针），点 / 拖定位
+        self.jindu_tiao = ShipinJinduTiao()
+        self.jindu_tiao.dingwei.connect(self._shoudao_tiaozheng)
+        di_zhong.addWidget(self.jindu_tiao)
+
+        # 下排：小按钮 + 当前时间 - 帧号（照 Aegisub：按钮在最左，时间紧跟其后）
+        xia_pai = QtWidgets.QWidget()
+        di_bu = QtWidgets.QHBoxLayout(xia_pai)
+        di_bu.setContentsMargins(0, 0, 0, 0)
+        di_bu.setSpacing(2)
 
         self.a_tui1miao = _tubiao_anniu(
             B.SP_MediaSeekBackward, "后退 1 秒", lambda: self._tiaobu(-1000)
@@ -4022,24 +5090,61 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.a_jin1miao = _tubiao_anniu(
             B.SP_MediaSeekForward, "前进 1 秒", lambda: self._tiaobu(1000)
         )
+        self.a_bofang_dangqian = _tubiao_anniu(
+            "button_playline_16.png",     # Aegisub 自带的「播放当前行」图标
+            "播放当前行（快捷键 ~）：从这条字幕的头上播到末尾就停",
+            self._bofang_dangqian_kuai,
+        )
         for a in (
             self.a_tui1miao,
             self.a_shang_yizhen,
             self.a_bofang,
             self.a_xia_yizhen,
             self.a_jin1miao,
+            self.a_bofang_dangqian,
         ):
             di_bu.addWidget(a)
 
+        di_bu.addSpacing(8)
+        self.shijian_dangqian = QtWidgets.QLabel("0:00:00.000 - 0")
+        self.shijian_dangqian.setObjectName("YsgTimeNow")
+        self.shijian_dangqian.setToolTip("当前时间 - 当前帧号")
+        di_bu.addWidget(self.shijian_dangqian)
         di_bu.addStretch(1)
+
+        self.a_zimu_tiao = QtWidgets.QCheckBox("字幕条")
+        self.a_zimu_tiao.setToolTip("显示 / 隐藏画面下方那条独立字幕")
+        self.a_zimu_tiao.setChecked(self._du_zimu_tiao_kai())
+        self.a_zimu_tiao.toggled.connect(self._qiehuan_zimu_tiao)
+        di_bu.addWidget(self.a_zimu_tiao)
+        di_bu.addSpacing(6)
+
+        di_bu.addWidget(QtWidgets.QLabel("时间轴缩放"))
+        self.shijianzhou_suofang = QtWidgets.QSpinBox()
+        self.shijianzhou_suofang.setRange(
+            int(SUOFANG_ZUI_XIAO), int(SUOFANG_ZUIDA)
+        )
+        self.shijianzhou_suofang.blockSignals(True)
+        self.shijianzhou_suofang.setValue(int(round(self._suofang_qishi())))
+        self.shijianzhou_suofang.blockSignals(False)
+        self.shijianzhou_suofang.setStyleSheet(_ys_xiao_xiang())
+        self.shijianzhou_suofang.setFixedWidth(52)
+        self.shijianzhou_suofang.setToolTip(
+            f"时间轴放大倍数（{int(SUOFANG_ZUI_XIAO)} ~ {int(SUOFANG_ZUIDA)}）：\n"
+            "直接敲数字，或者点上下箭头 / 把鼠标放框上滚轮调"
+        )
+        self.shijianzhou_suofang.valueChanged.connect(self._shijianzhou_suofang)
+        di_bu.addWidget(self.shijianzhou_suofang)
+        di_bu.addSpacing(6)
 
         self.beisu_kuang = QtWidgets.QComboBox()
         for b in BEISU_LIEBIAO:
-            self.beisu_kuang.addItem(f"{b:g}x", b)
+            self.beisu_kuang.addItem(f"{b:g}", b)
         # 默认必须停在 MO_REN_BEISU，否则会按列表第一项（0.5x）慢速播放
         if MO_REN_BEISU in BEISU_LIEBIAO:
             self.beisu_kuang.setCurrentIndex(BEISU_LIEBIAO.index(MO_REN_BEISU))
-        self.beisu_kuang.setFixedWidth(74)
+        self.beisu_kuang.setStyleSheet(_ys_xiao_xiang())
+        self.beisu_kuang.setFixedWidth(BEISU_KUANG_KUAN)
         self.beisu_kuang.currentIndexChanged.connect(self._qiehuan_beisu)
         di_bu.addWidget(self.beisu_kuang)
 
@@ -4060,6 +5165,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         )
         di_bu.addWidget(self.a_dakai)
 
+        di_zhong.addWidget(xia_pai)
         bu.addWidget(di, 0)
         return mianban
 
@@ -4075,6 +5181,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
         bianji = self._jian_zimubianji_tab()
         tabs.addTab(self._jian_yingzimu_tab(), "硬字幕提取")
         tabs.addTab(bianji, "字幕编辑")
+        # 上次关窗时停在哪个标签页，这次打开就停哪个（头一回 = 硬字幕提取）
+        try:
+            ye = int(self._weizhi_peizhi.value(JIEMIAN_TAB_JIAN, 0) or 0)
+        except (TypeError, ValueError):
+            ye = 0
+        if 0 <= ye < tabs.count():
+            tabs.setCurrentIndex(ye)
+        # 切页时，把上次记下的、属于那一页的分栏位置摆回去
+        tabs.currentChanged.connect(self._tab_huan_le)
         self.you_tabs = tabs
         return tabs
 
@@ -4084,6 +5199,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         ce = QtWidgets.QSplitter(Qt.Vertical)
         ce.setHandleWidth(9)
         ce.setChildrenCollapsible(False)
+        self.tiqu_ce = ce         # 留着引用：关窗时要记它的分栏位置
 
         # 上块：实时推理 / 硬字幕提取的所有设置
         shang = QtWidgets.QFrame()
@@ -4126,6 +5242,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
         """
         self.bianji_mianban = ZimuBianjiMianban()
         self.bianji_mianban.xuan_zhong.connect(self._shoudao_xuan_zhong_zimu)
+        self.bianji_mianban.xuan_zhong_duo.connect(
+            self._shoudao_xuan_zhong_duo
+        )
         self.bianji_mianban.tiaozheng.connect(self._shoudao_tiaozheng)
         self.bianji_mianban.wenben_gaile.connect(
             self._shoudao_zimu_zhengzai_gai
@@ -4133,6 +5252,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.bianji_mianban.bianji_wancheng.connect(
             self._shoudao_zimu_bianji_wancheng
         )
+        self.bianji_mianban.gongju_gaile.connect(self._shoudao_gongju)
         return self.bianji_mianban
 
     # --------------------------------------------------------------
@@ -4186,21 +5306,6 @@ class VideoWorkDialog(QtWidgets.QDialog):
         tiao_bu.addWidget(self.a_cun_zimu)
         tiao_bu.addStretch(1)
 
-        tiao_bu.addWidget(QtWidgets.QLabel("时间轴缩放"))
-        self.shijianzhou_suofang = QtWidgets.QSlider(Qt.Horizontal)
-        self.shijianzhou_suofang.setRange(0, 1000)
-        self.shijianzhou_suofang.setValue(_beishu_to_weizhi(SUOFANG_MOREN))
-        self.shijianzhou_suofang.setFixedWidth(170)
-        self.shijianzhou_suofang.setStyleSheet(_ys_huadong_tiao())
-        self.shijianzhou_suofang.valueChanged.connect(self._shijianzhou_suofang)
-        tiao_bu.addWidget(self.shijianzhou_suofang)
-        self.suofang_wenben = QtWidgets.QLabel(
-            f"×{SUOFANG_MOREN:.0f}" if SUOFANG_MOREN >= 10 else f"×{SUOFANG_MOREN:.2f}"
-        )
-        self.suofang_wenben.setObjectName("YsgHint")
-        self.suofang_wenben.setMinimumWidth(52)
-        tiao_bu.addWidget(self.suofang_wenben)
-
         bu.addWidget(tiao, 0)
 
         self.shijianzhou = ShijianZhou()
@@ -4224,6 +5329,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shijianzhou_tiao.setEnabled(False)
         self.shijianzhou_tiao.valueChanged.connect(self._shijianzhou_pingyi)
         bu.addWidget(self.shijianzhou_tiao, 0)
+        # 整块留着给外面搬：默认在窗口最下方，也能跟「字幕列表」换位置
+        self.shijianzhou_kuang = kuang
         return kuang
 
     # --------------------------------------------------------------
@@ -4264,26 +5371,17 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self.zong_zhen = int(round(self.fps * 1))
         self.shichang_ms = int(round(self.zong_zhen / self.fps * 1000))
 
-        _zm = osp.basename(lujing)
-        self.biaoti.setText(
-            QtGui.QFontMetrics(self.biaoti.font()).elidedText(
-                _zm, Qt.ElideMiddle, 380
-            )
-        )
-        self.biaoti.setToolTip(_zm)
-        self.xinxi.setText(
-            f"{self.zhen_kuan}x{self.zhen_gao}    "
-            f"{self.fps:.3f} fps    {self.zong_zhen} 帧    "
-            f"{self._shijian_wenben(self.shichang_ms)}"
-        )
-        self.shijian_zong.setText(self._shijian_wenben(self.shichang_ms))
+        self.jindu_tiao.shezhi_shichang(self.shichang_ms)
+        self.jindu_tiao.shezhi_bofangtou(0)
         self.shijianzhou.shezhi_shichang(self.shichang_ms)
         self.shijianzhou.shezhi_fps(self.fps)
+        self.bianji_mianban.shezhi_fps(self.fps)
         self.shijianzhou.shezhi_bofangtou(0)
         self.shijianzhou.qingkong_bofang()
         self.shijianzhou.shezhi_bo_tishi("正在解析音频…")
-        # 默认放大到 ×15：×1 会把整条视频塞进屏里，字幕块缩成指甲盖大小看不清
-        self.shijianzhou.shezhi_beishu(SUOFANG_MOREN, 0)
+        # 放大倍数：上次拖到多少就用多少（头一回 ×15，×1 会把整条视频塞进屏里，
+        # 字幕块缩成指甲盖大小看不清）
+        self.shijianzhou.shezhi_beishu(self._suofang_qishi(), 0)
         self._shuaxin_shitu_tiao()
 
         if self.yinpin is not None:
@@ -4323,6 +5421,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.zimu_wenjian = ""
         self.zimu_geshi = ""
         self._ass_yuan = None
+        self._zidong_gai_dong = False
+        self._zidong_shange = None
         logger.info(
             f"视频工作台：已打开 {lujing}  "
             f"{self.zhen_kuan}x{self.zhen_gao} {self.fps:.3f}fps "
@@ -4363,8 +5463,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.zimu_wenjian = ""
         self.zimu_geshi = ""
         self._ass_yuan = None
+        self._zidong_gai_dong = False
+        self._zidong_shange = None
         self._zimu_hua_ji = None
-        self._zimu_hang_ji = None
+        self._zimu_pei_ji = []
+        self._zimu_fu_ji = []
         self.huamian.shezhi_zimu([])
         self._bofang_ms = 0
         self._mubiao_zhen = None
@@ -4411,6 +5514,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         只有画面变宽 / 换了别的片子（宽高比变了）时才主动把上半栏调到刚好；
         纯上下拖分栏不主动调，免得跟人抢。这里只算，动手统一交给定时器。
         """
+        if self._shangxia_duoguo:
+            return              # 上下大分栏你自己拖过：听你的，不自动贴合
         if getattr(self, "shang_xia", None) is None:
             return
         yuan = self.huamian.yuan_chicun()
@@ -4490,6 +5595,24 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self._zanting()
         else:
             self._bofang()
+
+    # --------------------------------------------------------------
+    # 独立字幕条的开关
+    # --------------------------------------------------------------
+    def _du_zimu_tiao_kai(self):
+        """上次把画面下方那条独立字幕条开着没（头一回 = 开着）"""
+        zhi = self._weizhi_peizhi.value(JIEMIAN_ZIMU_TIAO_JIAN, None)
+        if zhi is None:
+            return True
+        return str(zhi).strip().lower() in ("1", "true", "yes", "on")
+
+    def _qiehuan_zimu_tiao(self, kai):
+        """显示 / 隐藏画面下方那条独立字幕；关了就收掉那块地方，视频直接贴着底栏"""
+        self.zimu_tiao.setVisible(bool(kai))
+        try:
+            self._weizhi_peizhi.setValue(JIEMIAN_ZIMU_TIAO_JIAN, bool(kai))
+        except Exception:  # noqa
+            pass
 
     def _tab_an_xia(self):
         """按了 Tab：播放 / 暂停
@@ -4660,7 +5783,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         ms = int(round(zhen_hao / max(1e-6, self.fps) * 1000))
         self._bofang_ms = ms
         self.shijianzhou.shezhi_bofangtou(ms)
-        self.shijian_dangqian.setText(self._shijian_wenben(ms))
+        self.jindu_tiao.shezhi_bofangtou(ms)
+        self.shijian_dangqian.setText(_shijian_zhen_wenben(ms, zhen_hao))
         self._shuaxin_zimu_tiao()
         if self.yinpin is not None:
             self.yinpin.setPosition(ms)
@@ -4705,20 +5829,27 @@ class VideoWorkDialog(QtWidgets.QDialog):
             else QtWidgets.QStyle.SP_MediaVolume,
         )
 
-    def _shijianzhou_suofang(self, weizhi):
-        """拖缩放滑块 -> 改时间轴放大倍数"""
-        self.shijianzhou.shezhi_beishu(_weizhi_to_beishu(weizhi))
+    def _suofang_qishi(self):
+        """时间轴的初始放大倍数：上次关窗时多少就多少，头一回 SUOFANG_MOREN"""
+        try:
+            bei = float(
+                self._weizhi_peizhi.value(JIEMIAN_SUOFANG_JIAN, SUOFANG_MOREN)
+            )
+        except (TypeError, ValueError):
+            bei = SUOFANG_MOREN
+        return max(1.0, min(float(SUOFANG_ZUIDA), bei))
+
+    def _shijianzhou_suofang(self, beishu):
+        """改缩放数值框（敲数字 / 上下箭头 / 滚轮）-> 改时间轴放大倍数"""
+        self.shijianzhou.shezhi_beishu(float(beishu))
 
     def _shuaxin_shitu_tiao(self):
-        """时间轴视图变了 -> 刷新滑块、倍数文字、底下滚动条"""
-        bei = self.shijianzhou.beishu()
-        if self.shijianzhou_suofang.value() != _beishu_to_weizhi(bei):
+        """时间轴视图变了 -> 刷新缩放数值框（时间轴内部自己缩放时用）"""
+        bei = int(round(self.shijianzhou.beishu()))
+        if self.shijianzhou_suofang.value() != bei:
             self.shijianzhou_suofang.blockSignals(True)
-            self.shijianzhou_suofang.setValue(_beishu_to_weizhi(bei))
+            self.shijianzhou_suofang.setValue(bei)
             self.shijianzhou_suofang.blockSignals(False)
-        self.suofang_wenben.setText(
-            f"×{bei:.2f}" if bei < 10 else f"×{bei:.0f}"
-        )
 
         you = bei > 1.001
         self.shijianzhou_tiao.setEnabled(you)
@@ -4754,7 +5885,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         ms = int(round(zhen_hao / max(1e-6, self.fps) * 1000))
         self._bofang_ms = ms
         self.shijianzhou.shezhi_bofangtou(ms)
-        self.shijian_dangqian.setText(self._shijian_wenben(ms))
+        self.jindu_tiao.shezhi_bofangtou(ms)
+        self.shijian_dangqian.setText(_shijian_zhen_wenben(ms, zhen_hao))
         self.zimu_mianban.shezhi_bofangtou(ms)
         self._shuaxin_zimu_tiao()
         # 「只播当前字幕块」：播到块尾就停在这儿（不在播放中就只是清掉残留）
@@ -4848,6 +5980,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.zimu_wenjian = ""
         self.zimu_geshi = ""
         self._ass_yuan = None
+        self._zidong_gai_dong = False
+        self._zidong_shange = None
         self.chuliqi = ZhenChuli(canyu)
         self.yunsuan_moshi = paofa
 
@@ -4967,10 +6101,12 @@ class VideoWorkDialog(QtWidgets.QDialog):
 
     # ---- 字幕编辑页的列表：样式 / 说话人从打开时那份 ASS 里认 ----
     def _ass_qing_hang(self):
-        """打开的那份 ASS 每行拆好留着：[（去标签的文字, 起ms, 止ms, 样式, 说话人, 原文）]
+        """打开的那份 ASS 每行拆好留着：
+        [（去标签的文字, 起ms, 止ms, 样式, 说话人, 原文, 字段表）]
 
         整份列表刷一次要认几百行，每行都重新去标签太费，拆一次存着用。
-        最后那个"原文"是带行内标签（\\pos \\an \\fs …）的原样文字，画画面上的字幕要用。
+        "原文"是带行内标签（\\pos \\an \\fs …）的原样文字，画画面上的字幕要用；
+        "字段表"是那一行的层 / 边距 / 特效 / 注释，编辑区上方那排要显示和改。
         """
         jiegou = self._ass_yuan
         if jiegou is None:
@@ -4986,6 +6122,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 str(h.get("Style") or ""),
                 str(h.get("Name") or ""),
                 str(h.get("Text") or ""),
+                _ass_hang_fu(h),
             )
             for h in (jiegou.get("hang") or [])
         ]
@@ -4993,25 +6130,69 @@ class VideoWorkDialog(QtWidgets.QDialog):
         return hang
 
     def _zimu_pipei(self, zimu):
-        """每条字幕配上原来那份 ASS 里的（样式, 说话人, 原文）
+        """每条字幕配上原来那份 ASS 里的（样式, 说话人, 原文, 字段表）
 
         认法跟写 ASS 时一模一样：先按文字认原来那一行，文字改过就按原时间认；
-        认不到（新加的行，或者根本没打开过 ASS）就是 Default / 空 / 空。
+        认不到（新加的行，或者根本没打开过 ASS）就是 Default / 空 / 空 / 空。
         """
         an_wen, an_shi = {}, {}
-        for chun, qi, zhi, yang, shuo, yuan in self._ass_qing_hang():
-            an_wen.setdefault(chun, []).append((yang, shuo, yuan))
-            an_shi.setdefault((qi, zhi), []).append((yang, shuo, yuan))
+        for chun, qi, zhi, yang, shuo, yuan, fu in self._ass_qing_hang():
+            an_wen.setdefault(chun, []).append((yang, shuo, yuan, fu))
+            an_shi.setdefault((qi, zhi), []).append((yang, shuo, yuan, fu))
         jieguo = []
         for qi, zhi, wenben in zimu:
             chun = _ass_chun_wen(wenben)
             dai = an_wen.get(chun) or an_shi.get((int(qi), int(zhi)))
-            jieguo.append(dai.pop(0) if dai else ("Default", "", ""))
+            jieguo.append(dai.pop(0) if dai else ("Default", "", "", {}))
         return jieguo
 
     def _zimu_fujia(self, zimu):
-        """字幕编辑页列表的「样式 / 说话人」两列"""
-        return [(x[0], x[1]) for x in self._zimu_pipei(zimu)]
+        """字幕编辑页列表的「样式 / 说话人」两列 + 编辑区上方那排要的字段
+
+        原 ASS 里那一行是什么就带什么，编辑区上方改过的（存在 zimu_mianban 里）
+        盖在上面。算出来的这份顺手缓存成 _zimu_pei_ji / _zimu_fu_ji，画画面和
+        填那排工具都直接拿去用。
+        """
+        pei = self._zimu_pipei(zimu)
+        self._zimu_pei_ji = pei
+        fu_men = []
+        for i, (yang, shuo, _yuan, fu) in enumerate(pei):
+            ge = dict(fu or {})
+            ge["yang"] = str(yang or "Default")
+            ge["shuo"] = str(shuo or "")
+            ge.update(self.zimu_mianban.hang_fu(i))
+            fu_men.append(ge)
+        self._zimu_fu_ji = fu_men
+        return fu_men
+
+    def _zimu_yangshi_ming(self):
+        """打开的那份 ASS 里所有样式名（原大小写，给样式下拉当候选）"""
+        jiegou = self._ass_yuan
+        if jiegou is None:
+            return []
+        return _ass_yangshi_ming(jiegou.get("tou") or [])
+
+    def _zimu_shuo_ming(self):
+        """说话人的候选：原 ASS 里出现过的那些"""
+        ming = []
+        for _chun, _qi, _zhi, _yang, shuo, _yuan, _fu in self._ass_qing_hang():
+            shuo = str(shuo or "").strip()
+            if shuo and shuo not in ming:
+                ming.append(shuo)
+        return ming
+
+    def _zimu_yangshi_ming_quan(self):
+        """样式名候选：ASS 样式表里的 + 列表里实际用到过的（合并去重）"""
+        ming = list(self._zimu_yangshi_ming())
+        for yang, _shuo, _yuan, _fu in self._zimu_pipei(
+            self.zimu_mianban.zimu_liebiao()
+        ):
+            yang = str(yang or "").strip()
+            if yang and yang not in ming:
+                ming.append(yang)
+        if not ming:
+            ming.append("Default")
+        return ming
 
     def _ass_geshi_biao(self):
         """打开的那份 ASS 的基准分辨率 + 样式表（读一次存着）"""
@@ -5030,40 +6211,47 @@ class VideoWorkDialog(QtWidgets.QDialog):
         """把播放头这一刻该显示的字幕塞给画面（样式照 ASS 来的）
 
         画面上该有的就是"播放头现在压着的这几条"，摞在一起的也都画。
+        注释行不画；样式 / 边距都认编辑区上方改过的那份。
         """
         hua = getattr(self, "huamian", None)
         if hua is None:
             return
         zimu = self.zimu_mianban.zimu_liebiao()
-        if not self._zimu_hua or not zimu:
+        if not zimu:
             hua.shezhi_zimu([])
             return
-        ji = self._zimu_hang_ji
-        if ji is None or ji[0] is not self._ass_yuan:
-            ji = (
-                self._ass_yuan,
-                [(yang, yuan) for yang, _shuo, yuan in self._zimu_pipei(zimu)],
-            )
-            self._zimu_hang_ji = ji
+        fu_men = self._zimu_fu_ji
+        if len(fu_men) != len(zimu):
+            fu_men = self._zimu_fujia(zimu)
+        pei = self._zimu_pei_ji
+        if len(pei) != len(zimu):
+            pei = self._zimu_pipei(zimu)
         jizhun, biao = self._ass_geshi_biao()
         ms = int(self._bofang_ms)
         xuan = []
         for i, (qi, zhi, wenben) in enumerate(zimu):
             if not (int(qi) <= ms < max(int(qi) + 1, int(zhi))):
                 continue
-            yang, yuan = (
-                ji[1][i] if i < len(ji[1]) else ("Default", "")
-            )
+            fu = fu_men[i] if i < len(fu_men) else {}
+            if fu.get("zhushi"):
+                continue                    # 注释行不画在画面上
+            yang = str(fu.get("yang") or "Default")
+            yuan = pei[i][2] if i < len(pei) else ""
             ge = dict(_ASS_MOREN_YANGSHI)
-            zhao = biao.get(str(yang or "").strip().lower())
+            zhao = biao.get(yang.strip().lower())
             if zhao:
                 ge = dict(zhao)
-            # 文字没动过就照原文来（\pos \an \fs 这些行内标签都在里面）；
-            # 改过字就按新文字画，原来的标签不带
-            chun = _ass_chun_wen(wenben)
+            # 行边距：只有写了数才盖样式的边距（0 就是"照样式来"，跟 libass 一样）
+            for jian, wei in (("ml", "zuo"), ("mr", "you"), ("mv", "shu")):
+                zhi_shu = int(fu.get(wei) or 0)
+                if zhi_shu > 0:
+                    ge[jian] = zhi_shu
+            # 整条（文字 + 行内标签）跟原文一模一样才照原文来；只要动过 ——
+            # 改了字，或者上面那排加了 \1c \b \fn 这些标签 —— 就按列表里这份画。
+            # （只比"纯文字"会把只加标签的改动当成没改，改完颜色画面不动）
             wen = (
                 str(yuan or "")
-                if yuan and chun == _ass_chun_wen(yuan)
+                if yuan and _ass_yuan_wen(yuan) == _ass_yuan_wen(wenben)
                 else str(wenben or "")
             )
             hang, gs = _jie_ass_tiao(wen, ge, biao)
@@ -5075,37 +6263,433 @@ class VideoWorkDialog(QtWidgets.QDialog):
                     "qi": int(qi),
                     "zhi": int(zhi),
                     "ms": ms,
+                    "ceng": int(fu.get("ceng") or 0),
                 }
             )
             if len(xuan) >= 8:
                 break
+        # 层大的盖在上面（跟 libass 一个规矩）
+        xuan.sort(key=lambda x: x["ceng"])
         hua.shezhi_zimu(xuan, jizhun)
 
-    def _qiehuan_hua_zimu(self, kai):
-        """右上角那个勾：画面里显不显示字幕"""
-        self._zimu_hua = bool(kai)
-        self._shuaxin_huamian_zimu()
-
     def _shezhi_bianji_zimu(self, zimu, xuan=None):
-        """刷「字幕编辑」页的列表：条数、时间、文字、样式、说话人一起给过去"""
-        self._zimu_hang_ji = None        # 列表变了：画面里那条的缓存跟着作废
-        self.bianji_mianban.shezhi_zimu(
-            zimu, xuan, self._zimu_fujia(zimu)
+        """刷「字幕编辑」页的列表 + 编辑区上方那排
+
+        条数、时间、文字、样式、说话人、字段都一起给过去；画面里那条的缓存
+        也跟着作废（_zimu_fu_ji / _zimu_pei_ji 就是缓存本身，这里重算）。
+        """
+        fu_men = self._zimu_fujia(zimu)
+        self._zimu_fu_ji = fu_men
+        self.bianji_mianban.shezhi_yangshi_ming(self._zimu_yangshi_ming())
+        self.bianji_mianban.shezhi_shuo_ming(self._zimu_shuo_ming())
+        self.bianji_mianban.shezhi_zimu(zimu, xuan, fu_men)
+        self._shuaxin_gongju(zimu, fu_men)
+
+    def _shuaxin_gongju(self, zimu=None, fu_men=None):
+        """把当前这条的字段 + 实际生效的样式填进编辑区上方那排"""
+        if zimu is None:
+            zimu = self.zimu_mianban.zimu_liebiao()
+        if fu_men is None:
+            fu_men = self._zimu_fu_ji
+            if len(fu_men) != len(zimu):
+                fu_men = self._zimu_fujia(zimu)
+        xu = self.bianji_mianban.dangqian_xu()
+        if not (0 <= xu < len(zimu)):
+            self.bianji_mianban.shezhi_gongju({}, None)
+            return
+        fu = dict(fu_men[xu]) if xu < len(fu_men) else {}
+        fu["qi"], fu["zhi"] = zimu[xu][0], zimu[xu][1]
+        self.bianji_mianban.shezhi_gongju(
+            fu, self._hang_gs(xu, zimu, fu_men), str(zimu[xu][2] or "")
         )
 
+    def _hang_gs(self, xu, zimu=None, fu_men=None):
+        """第 xu 条实际生效的格式（样式底子 + 行内标签）
+
+        编辑区上方那排的 B/I/U/S 按钮和四个色块显示的就是这个。
+        """
+        if zimu is None:
+            zimu = self.zimu_mianban.zimu_liebiao()
+        if fu_men is None:
+            fu_men = self._zimu_fu_ji
+        if not (0 <= xu < len(zimu)):
+            return {}
+        _jizhun, biao = self._ass_geshi_biao()
+        fu = fu_men[xu] if xu < len(fu_men) else {}
+        yang = str(fu.get("yang") or "Default")
+        ge = dict(biao.get(yang.strip().lower()) or _ASS_MOREN_YANGSHI)
+        pei = self._zimu_pei_ji
+        if len(pei) != len(zimu):
+            pei = self._zimu_pipei(zimu)
+        yuan = pei[xu][2] if xu < len(pei) else ""
+        _qi, _zhi, wenben = zimu[xu]
+        # 跟画面里一个规矩：整条（文字 + 行内标签）都没动过才照原文来
+        wen = (
+            str(yuan or "")
+            if yuan and _ass_yuan_wen(yuan) == _ass_yuan_wen(wenben)
+            else str(wenben or "")
+        )
+        _hang, gs = _jie_ass_tiao(wen, ge, biao)
+        return gs
+
     def _jia_zimu_kuai(self, qi_ms, zhi_ms, wenben):
-        self.zimu_mianban.tianjia_zimu(qi_ms, zhi_ms, wenben)
+        """新建一条字幕：三处（硬字幕列表 / 底部时间轴 / 字幕编辑列表）一起加
+
+        返回新的一条插在第几行 —— 是按时间插的，不一定是最后一行。
+        """
+        wei = self.zimu_mianban.tianjia_zimu(qi_ms, zhi_ms, wenben)
         self.shijianzhou.tianjia_zimu(qi_ms, zhi_ms, wenben)
         self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao())
+        return wei
 
     def _shoudao_xuan_zhong_zimu(self, xu):
         """字幕列表 ↔ 时间轴 ↔ 字幕编辑：选中同一段，几处高亮对齐，时间轴滚过去"""
         self.shijianzhou.shezhi_xuan_zhong(xu)
         self.zimu_mianban.shezhi_xuan_zhong(xu)
         self.bianji_mianban.shezhi_xuan_zhong(xu)
+        self._shuaxin_gongju()
         self.shijianzhou.gundong_dao_zimu(xu)
 
+    def _shoudao_xuan_zhong_duo(self, hang):
+        """字幕列表里多选 / 全选：时间轴整批跟着高亮（不动播放头）"""
+        if len(hang) < 2:
+            return
+        self.shijianzhou.shezhi_xuan_zhong_duo(hang)
+
     # ---- 改字幕 ----
+    def _shoudao_gongju(self, jian, zhi):
+        """编辑区上方那排改了东西 -> 落到当前这一条字幕上
+
+        行内标签（B/I/U/S/fn/四个颜色）是直接改进文字里那一对花括号；样式 /
+        说话人 / 层 / 边距 / 特效 / 注释是那一行的字段；时间走改时间那条路。
+        """
+        if jian == "moshi":
+            # 上面那排切了「时间 / 帧」：字幕列表的时间两列跟着换
+            # （这是全局显示设置，跟有没有选中字幕无关，所以放在最前）
+            self.bianji_mianban.shezhi_xianshi_moshi(
+                str(zhi or "") == "zhen"
+            )
+            return
+        xu = self.bianji_mianban.dangqian_xu()
+        zimu = self.zimu_mianban.zimu_liebiao()
+        if jian == "zhushi":
+            # 列表里多选着的时候勾「注释」：一次把选中的这几条全设成注释
+            # （Ctrl+A 全选再打勾 = 把整屏字幕全藏了）
+            duo = self.bianji_mianban.xuan_zhong_hang()
+            if len(duo) >= 2:
+                self._piliang_zhushi(duo, bool(zhi))
+                return
+        if not (0 <= xu < len(zimu)):
+            return
+        if jian == "bianji":
+            self._kai_yangshi_bianji()
+            return
+        if jian == "xiayihang":
+            self._tiao_xiayitiao()
+            return
+        if jian == "tag":
+            ming, can = zhi[0], zhi[1]
+            xuan = zhi[2] if len(zhi) > 2 else None
+            wen = str(zimu[xu][2] or "")
+            if xuan and ming in ("fn", "b", "i", "u", "s"):
+                # 编辑框里选中了一段：只给这一段插标签（照 AEG）
+                # B/I/U/S 尾巴上用反向标签（{\b1}…{\b0}），这样就掀不掉前面
+                # 已经打好的颜色；字体用 {\r} 截断。
+                if ming == "fn":
+                    xin = _wei_yiduan(wen, xuan, "{\\fn" + str(can) + "}", "{\\r}")
+                else:
+                    kai, fan = ("1", "0") if can else ("0", "1")
+                    xin = _wei_yiduan(
+                        wen, xuan,
+                        "{\\%s%s}" % (ming, kai),
+                        "{\\%s%s}" % (ming, fan),
+                    )
+            elif ming == "fn":
+                xin = _jia_biaoqian(wen, f"\\fn{can}")
+            elif can:
+                xin = _jia_biaoqian(wen, f"\\{ming}1")
+            else:
+                xin = _qu_biaoqian(wen, ming)
+            self._huan_zimu_wenben(xu, xin)
+            return
+        if jian == "yanse":
+            wei, se = zhi[0], zhi[1]
+            xuan = zhi[2] if len(zhi) > 2 else None
+            # 主色写 \c（Aegisub 那四个色块就是这么写的），其它三个照 ASS 写
+            bian = {"c1": "\\c", "c2": "\\2c", "c3": "\\3c", "c4": "\\4c"}
+            tou = bian.get(wei) or bian["c1"]
+            wen = str(zimu[xu][2] or "")
+            if xuan:
+                # 选中的那一段上色，尾巴 {\r} 截断 —— 后面的字还是原来的颜色
+                xin = _wei_yiduan(wen, xuan, "{" + tou + str(se) + "}", "{\\r}")
+            else:
+                xin = _qu_biaoqian(wen, wei)
+                xin = _jia_biaoqian(xin, tou + str(se))
+            self._huan_zimu_wenben(xu, xin)
+            return
+        if jian in ("qi", "zhi"):
+            qi, zhi_ms = int(zimu[xu][0]), int(zimu[xu][1])
+            if jian == "qi":
+                qi = max(0, int(zhi))
+            else:
+                zhi_ms = max(0, int(zhi))
+            if zhi_ms < qi:
+                qi, zhi_ms = zhi_ms, qi
+            self._shoudao_zimu_tuo(xu, qi, zhi_ms)
+            return
+        # 剩下的都是那一行的字段
+        fu = dict(self.bianji_mianban.hang_fu(xu))
+        fu.update(self.zimu_mianban.hang_fu(xu))
+        fu[jian] = zhi
+        self.zimu_mianban.shezhi_hang_fu(xu, fu)
+        self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao(), xu)
+        self._zimu_tiao_wen = None
+        self._shuaxin_huamian_zimu()
+        xie = self._chong_xie_zimu_wenjian()
+        self.shezhi_mianban.zhuangtai_shezhi(
+            "字幕已改" + ("，SRT / ASS 已重写" if xie else "")
+            + "（Ctrl+S 保存字幕）"
+        )
+
+    def _piliang_zhushi(self, hang, kai):
+        """把选中的这几条一起设成注释 / 取消注释（等于 AEG 全选后打勾）
+
+        注释行存进 ASS 是 Comment 行，画面上不显示 —— 想整屏藏字幕就
+        Ctrl+A 全选再打勾；只藏一条就单选后打勾（走原来那条路）。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        hang = [int(x) for x in (hang or []) if 0 <= int(x) < len(zimu)]
+        if not hang:
+            return
+        for i in hang:
+            fu = dict(self.bianji_mianban.hang_fu(i))
+            fu.update(self.zimu_mianban.hang_fu(i))
+            fu["zhushi"] = bool(kai)
+            self.zimu_mianban.shezhi_hang_fu(i, fu)
+        self._shezhi_bianji_zimu(zimu, self.bianji_mianban.dangqian_xu())
+        # 整表重建会把多选冲掉，重新选回原来这一批
+        self.bianji_mianban.shezhi_xuan_zhong_duo(hang)
+        self._zimu_tiao_wen = None
+        self._shuaxin_huamian_zimu()
+        xie = self._chong_xie_zimu_wenjian()
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"已把 {len(hang)} 条设成"
+            + ("注释（画面上不显示）" if kai else "普通字幕（照常显示）")
+            + ("，SRT / ASS 已重写" if xie else "")
+            + "（Ctrl+S 保存字幕）"
+        )
+
+    def _tao_caowei(self, hao, hang=None):
+        """套槽位：把选中的字幕的「说话人 + 样式」设成第 hao 个槽位
+
+        F1~F12 和字幕列表右键菜单都走这里；槽位在样式编辑器的
+        「自动化脚本 ▸ 设置说话人+样式 配置管理」里配。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        if hang is None:
+            hang = self.bianji_mianban.xuan_zhong_hang()
+        hang = [int(x) for x in (hang or []) if 0 <= int(x) < len(zimu)]
+        if not hang:
+            self.shezhi_mianban.zhuangtai_shezhi("先选中要套槽位的字幕")
+            return
+        cao = du_zidonghua_peizhi().get("caowei") or []
+        if not (0 <= hao < len(cao)):
+            return
+        shuo = str(cao[hao].get("shuohua") or "")
+        yang = str(cao[hao].get("yangshi") or "Default")
+        if not shuo and yang == "Default":
+            self.shezhi_mianban.zhuangtai_shezhi(
+                f"槽位{hao + 1:02d} 还没配"
+                "（样式编辑器 ▸ 自动化脚本 ▸ 设置说话人+样式）"
+            )
+            return
+        for i in hang:
+            fu = dict(self.bianji_mianban.hang_fu(i))
+            fu.update(self.zimu_mianban.hang_fu(i))
+            fu["shuo"] = shuo
+            fu["yang"] = yang
+            self.zimu_mianban.shezhi_hang_fu(i, fu)
+        self._shezhi_bianji_zimu(zimu, self.bianji_mianban.dangqian_xu())
+        self._zimu_tiao_wen = None
+        self._shuaxin_huamian_zimu()
+        xie = self._chong_xie_zimu_wenjian()
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"槽位{hao + 1:02d} 套到 {len(hang)} 条："
+            f"说话人「{shuo or '（空）'}」样式「{yang}」"
+            + ("，SRT / ASS 已重写" if xie else "")
+            + "（Ctrl+S 保存字幕）"
+        )
+
+    def _zhixing_kuohao(self, hang):
+        """【-批量添加方括号】：给选中字幕的文字套上「」
+
+        照 AEG 那个 Lua 脚本的规矩，这三种跳过：
+          说话人 / 样式里含排除关键词的
+          文本本身已经是（…）/ (…) 的
+          文本里已经有排除符号的（「」『』（）() …）
+        开头的特效标签（花括号包起来那种）留在引号外面，标签原样不动。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        hang = [int(x) for x in (hang or []) if 0 <= int(x) < len(zimu)]
+        if not hang:
+            self.shezhi_mianban.zhuangtai_shezhi("先选中要加「」的字幕")
+            return
+        pei = du_zidonghua_peizhi()
+        guan = [str(x) for x in (pei.get("paichu_ci") or []) if str(x)]
+        fuhao = [str(x) for x in (pei.get("paichu_fuhao") or []) if str(x)]
+        fu_men = self._zimu_fu_ji
+        if len(fu_men) != len(zimu):
+            fu_men = self._zimu_fujia(zimu)
+
+        gai = 0
+        for i in hang:
+            fu = fu_men[i] if i < len(fu_men) else {}
+            shuo = str(fu.get("shuo") or "")
+            yang = str(fu.get("yang") or "")
+            if any(k in shuo or k in yang for k in guan):
+                continue        # 旁白之类的：不套
+            jiu = str(zimu[i][2] or "")
+            tou = re.match(r"^(\{[^}]*\})", jiu)
+            biaoqian = tou.group(1) if tou else ""
+            zhengwen = jiu[len(biaoqian):]
+            chun = re.sub(r"\{[^}]*\}", "", zhengwen)
+            if not chun.strip():
+                continue        # 只有标签 / 空行
+            if re.match(r"^（.+）$", chun) or re.match(r"^\(.+\)$", chun):
+                continue        # 已经是括号了
+            if any(h in chun for h in fuhao):
+                continue        # 已经有那些符号了
+            xin = biaoqian + "「" + zhengwen + "」"
+            self.zimu_mianban.gai_zimu_wenben(i, xin)
+            self.shijianzhou.gai_zimu_wenben(i, xin)
+            gai += 1
+
+        if not gai:
+            self.shezhi_mianban.zhuangtai_shezhi(
+                f"这 {len(hang)} 条都不用加（旁白 / 已是括号 / 已有那些符号）"
+            )
+            return
+        self._shezhi_bianji_zimu(
+            self.zimu_mianban.zimu_liebiao(), self.bianji_mianban.dangqian_xu()
+        )
+        self._zimu_hang_ji = None
+        self._zimu_tiao_wen = None
+        self._shuaxin_zimu_tiao()
+        xie = self._chong_xie_zimu_wenjian()
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"已给 {gai} 条套上「」"
+            + ("，SRT / ASS 已重写" if xie else "")
+            + "（Ctrl+S 保存字幕）"
+        )
+
+    def _qiehuan_zhushi(self):
+        """Alt+S：把当前这条（列表里多选就这一批）在「注释 / 普通」之间翻一下
+
+        直接翻那个「注释」勾选框 —— 它的 toggled 早连着整条链路（单选改一条、
+        多选整批改、刷列表和画面、重写 SRT / ASS），不用再走一遍。
+        """
+        self.bianji_mianban.gongjulan.gou_zhushi.toggle()
+
+    def _huan_zimu_wenben(self, xu, xin):
+        """点按钮改出来的文字（加了 / 去了行内标签）：几处一起同步再写回"""
+        zimu = self.zimu_mianban.zimu_liebiao()
+        if not (0 <= xu < len(zimu)) or str(zimu[xu][2]) == str(xin):
+            return
+        self.zimu_mianban.gai_zimu_wenben(xu, xin)
+        self.shijianzhou.gai_zimu_wenben(xu, xin)
+        self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao(), xu)
+        # 文字 / 标签都动了：折行缓存作废，画面和时间轴上的块立刻重画
+        self._zimu_hang_ji = None
+        self._zimu_tiao_wen = None
+        self._shuaxin_zimu_tiao()
+        xie = self._chong_xie_zimu_wenjian()
+        self.shezhi_mianban.zhuangtai_shezhi(
+            "字幕已改" + ("，SRT / ASS 已重写" if xie else "")
+            + "（Ctrl+S 保存字幕）"
+        )
+
+    def _tiao_xiayitiao(self):
+        """工具栏那个 ✓：跳到下一条；已经是最后一条就在它后面接一条新的"""
+        zimu = self.zimu_mianban.zimu_liebiao()
+        xu = self.bianji_mianban.dangqian_xu()
+        if not (0 <= xu < len(zimu)):
+            return
+        if xu + 1 < len(zimu):
+            self._shoudao_xuan_zhong_zimu(xu + 1)
+            return
+        qi = int(zimu[xu][1])
+        chang = max(300, int(zimu[xu][1]) - int(zimu[xu][0]))
+        xin = self._jia_zimu_kuai(qi, qi + chang, "")
+        self._shoudao_xuan_zhong_zimu(xin)
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"末尾新加一条 · {self._shijian_wenben(qi)} → "
+            f"{self._shijian_wenben(qi + chang)}"
+        )
+
+    def _kai_yangshi_bianji(self):
+        """点了「编辑」：弹样式编辑器，改当前这条用的那个样式
+
+        改的时候先只改内存里的样式表，画面立刻能看到效果；点「确定 / 应用」
+        才写回 ASS。点「取消」就把这次改的全退回去，文件也跟着退回去。
+        """
+        xu = self.bianji_mianban.dangqian_xu()
+        zimu = self.zimu_mianban.zimu_liebiao()
+        if not (0 <= xu < len(zimu)):
+            self.shezhi_mianban.zhuangtai_shezhi("先选一条字幕，再点编辑")
+            return
+        fu_men = self._zimu_fu_ji
+        if len(fu_men) != len(zimu):
+            fu_men = self._zimu_fujia(zimu)
+        fu = fu_men[xu] if xu < len(fu_men) else {}
+        yang = str(fu.get("yang") or "Default")
+        _jizhun, biao = self._ass_geshi_biao()
+        ge = dict(biao.get(yang.strip().lower()) or _ASS_MOREN_YANGSHI)
+        ge["name"] = yang
+        jiu = dict(ge)
+        dlg = YangshiBianjiDialog(
+            ge, self, _ziti_ming_men(), _jizhun,
+            # 预览里造字体跟画面里同一个函数：字号 / 粗档 / 字距全都一样
+            lambda zs: _hua_ziti(zs, 1.0),
+            # 下面「自动化脚本」里的槽位配置要拿样式名当候选
+            yang_men=self._zimu_yangshi_ming_quan(),
+        )
+        dlg.gaile.connect(lambda z: self._yulan_yangshi(z, yang))
+        dlg.queren.connect(lambda z: self._luo_yangshi(z, yang))
+        dlg.exec_()
+        if dlg.result() != QtWidgets.QDialog.Accepted:
+            self._luo_yangshi(jiu, yang, tui=True)
+
+    def _yulan_yangshi(self, zi, yang):
+        """样式编辑器里改一下：先只改内存里的样式表，画面上立刻能看到"""
+        if self._ass_yuan is None:
+            return
+        tou = list(self._ass_yuan.get("tou") or [])
+        if not _hui_yangshi_tou(tou, yang, zi):
+            return
+        self._ass_yuan["tou"] = tou
+        self._zimu_hua_ji = None
+        self._shuaxin_huamian_zimu()
+
+    def _luo_yangshi(self, zi, yang, tui=False):
+        """「确定 / 应用」或「取消」：写回 [V4+ Styles]，重画 + 重写文件"""
+        if self._ass_yuan is None:
+            return
+        tou = list(self._ass_yuan.get("tou") or [])
+        if not _hui_yangshi_tou(tou, yang, zi):
+            self.shezhi_mianban.zhuangtai_shezhi(
+                f"这份字幕里没找到样式「{yang}」，没写回去"
+            )
+            return
+        self._ass_yuan["tou"] = tou
+        self._zimu_hua_ji = None
+        self._shuaxin_huamian_zimu()
+        self._shuaxin_gongju()
+        xie = self._chong_xie_zimu_wenjian()
+        self.shezhi_mianban.zhuangtai_shezhi(
+            (f"样式「{yang}」已还原" if tui else f"样式「{yang}」已改")
+            + ("，SRT / ASS 已重写" if xie else "")
+        )
+
     def _shoudao_zimu_zhengzai_gai(self, xu, wenben):
         """字幕编辑区正在打字：只改这一条的字，不重建列表、不写盘
 
@@ -5211,6 +6795,51 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if len(xu) >= 2:
             self._shoudao_zimu_hebing(xu)
 
+    def _qiefen_zimu_kuai(self):
+        """按了 S：把游标（播放头）停着的那条字幕块，从游标位置切成两块
+
+        切出来两条文字一模一样，只是时间一分为二 —— 硬字幕提取把两句
+        连成一条、时间没分开时，用它手动断开。焦点在输入框里时不抢。
+        """
+        zhu = QtWidgets.QApplication.focusWidget()
+        if isinstance(
+            zhu,
+            (QtWidgets.QLineEdit, QtWidgets.QTextEdit,
+             QtWidgets.QPlainTextEdit, QtWidgets.QAbstractSpinBox),
+        ):
+            return
+        zimu = self.zimu_mianban.zimu_liebiao()
+        if not zimu:
+            return
+        dao = int(self.shijianzhou.bofangtou_ms())
+        xu = None
+        for i, (qi, zhi, _wenben) in enumerate(zimu):
+            if int(qi) <= dao <= int(zhi):
+                xu = i
+                break
+        if xu is None:
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "切分：游标不在任何字幕块上"
+            )
+            return
+        qi, zhi, wenben = zimu[xu]
+        qi, zhi = int(qi), int(zhi)
+        if not (qi < dao < zhi):
+            # 游标正好压在块头或块尾上：再切就会切出一条 0 长度的块
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "切分：游标贴着字幕块的头 / 尾，把游标挪开一点再切"
+            )
+            return
+        sheng = list(zimu)
+        sheng[xu:xu + 1] = [(qi, dao, wenben), (dao, zhi, wenben)]
+        # 切完就地留在切出来的前半段上（后半段不选）
+        xie = self._ying_yong_zimu(sheng, xu)
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"已在 {self._shijian_wenben(dao)} 把这条字幕切成两块"
+            + ("，SRT / ASS 已重写" if xie else "")
+            + "（Ctrl+S 保存字幕）"
+        )
+
     def _shoudao_zimu_shanchu(self, xu_liebiao):
         """删掉这几条：右侧列表、时间轴、SRT / ASS 一起改"""
         zimu = self.zimu_mianban.zimu_liebiao()
@@ -5272,6 +6901,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
     def _shuaxin_zimu_tiao(self):
         """画面下方那条 + 画面里叠的那层字幕（都跟着播放头走）"""
         self._shuaxin_huamian_zimu()
+        # 字幕列表里"正播到"的那一行跟着上色 / 滚动（跟手动选中的行互不干扰）
+        self.bianji_mianban.shezhi_bofang_ms(self._bofang_ms)
         zai = self.zimu_mianban.zimu_zai_ms(self._bofang_ms)
         wenben = _ass_chun_wen(zai[2]) if zai else ""
         if wenben == self._zimu_tiao_wen:
@@ -5284,8 +6915,87 @@ class VideoWorkDialog(QtWidgets.QDialog):
         )
         self.zimu_tiao.setText(zi)
 
+    # ---- 自动保存 / 自动备份（照 AEG 那套） ----
+    def _zimu_mulu(self):
+        """字幕文件放在哪一层：存的哪个文件就在它旁边，还没存过就按输出目录 / 视频目录"""
+        if self.zimu_wenjian:
+            return osp.dirname(self.zimu_wenjian)
+        shuchu = self.shezhi_mianban.shuchu_shuru.text().strip()
+        if shuchu:
+            return osp.dirname(shuchu)
+        if self.lujing:
+            return osp.dirname(self.lujing)
+        return ""
+
+    def _zidong_beifen(self, lu):
+        """要动这份字幕之前，先把磁盘上的原件抄一份进「自动备份」
+
+        照 AEG：只在"打开 / 第一次写"这个动作前做一次，同名覆盖 —— 一个文件
+        永远只留一份原件。它救的是"越改越烂"：不管后面怎么改，打开时长什么样
+        随时能拿回来。文件还不存在（头一回生成）就不用备。
+        """
+        if not lu or lu in self._zidong_beifen_guo or not osp.isfile(lu):
+            return ""
+        self._zidong_beifen_guo.add(lu)
+        gen, kuo = osp.splitext(lu)
+        shuo = osp.join(
+            osp.dirname(lu),
+            ZIDONG_BEIFEN_JIA,
+            osp.basename(gen) + ".ORIGINAL" + kuo,
+        )
+        try:
+            os.makedirs(osp.dirname(shuo), exist_ok=True)
+            shutil.copy2(lu, shuo)
+        except OSError as cuowu:
+            logger.error(f"视频工作台：自动备份失败 {cuowu}")
+            return ""
+        logger.info(f"视频工作台：已自动备份 {shuo}")
+        return shuo
+
+    def _zidong_baocun(self):
+        """到点了：字幕跟上次自动保存时不一样，就再存一份带时间戳的
+
+        照 AEG：文件名是「原名(连扩展名).年月日-时分秒.AUTOSAVE.ass」，一次
+        一份、从不覆盖，攒成一串历史版本。没改过就一份都不写。
+        """
+        if not self._zidong_gai_dong:
+            return ""
+        zimu = self.zimu_mianban.zimu_liebiao()
+        mulu = self._zimu_mulu()
+        if not zimu or not mulu or not osp.isdir(mulu):
+            return ""
+        xian = [(int(q), int(z), str(w)) for q, z, w in zimu]
+        if xian == self._zidong_shange:
+            self._zidong_gai_dong = False
+            return ""
+        ming = osp.basename(self.zimu_wenjian) or (
+            osp.basename(self.lujing) or "未命名"
+        )
+        shuo = osp.join(
+            mulu,
+            ZIDONG_BAOCUN_JIA,
+            ming + "." + time.strftime("%Y-%m-%d-%H-%M-%S") + ".AUTOSAVE.ass",
+        )
+        try:
+            os.makedirs(osp.dirname(shuo), exist_ok=True)
+            _xie_zimu_dao_wenjian(
+                shuo, zimu, self._ass_yuan, self._zimu_fujia(zimu)
+            )
+        except OSError as cuowu:
+            logger.error(f"视频工作台：自动保存失败 {cuowu}")
+            return ""
+        self._zidong_gai_dong = False
+        self._zidong_shange = xian
+        self.shezhi_mianban.zhuangtai_shezhi(f"已自动保存 · {osp.basename(shuo)}")
+        logger.info(f"视频工作台：已自动保存 {shuo}")
+        return shuo
+
     def _chong_xie_zimu_wenjian(self):
         """改完字幕把 SRT / ASS 重写一遍（规矩跟跑完时一样，写在输出文件夹同级）"""
+        # 标记放最前：改没改过跟"这次有没有写出去"没关系。
+        # 输出目录没设好时下面会直接返回，标记要是放在它后面就永远置不上，
+        # 自动保存一次都不会触发。
+        self._zidong_gai_dong = True    # 字幕变过了：下一轮到点就自动存一份
         zimu = self.zimu_mianban.zimu_liebiao()
         shuchu = self.shezhi_mianban.shuchu_shuru.text().strip()
         if not zimu or not shuchu or not osp.isdir(shuchu):
@@ -5295,6 +7005,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         ming = osp.basename(shuchu)
         xie = []
         srt_lu = osp.join(osp.dirname(shuchu), f"{ming}.srt")
+        self._zidong_beifen(srt_lu)     # 覆盖前先把原来那份抄进「自动备份」
         try:
             with open(srt_lu, "w", encoding="utf-8") as f:
                 for xu, (qi, zhi, wenben) in enumerate(zimu, 1):
@@ -5308,16 +7019,44 @@ class VideoWorkDialog(QtWidgets.QDialog):
             logger.error(f"视频工作台：重写 SRT 失败 {cuowu}")
 
         ass_lu = osp.join(osp.dirname(shuchu), f"{ming}.ass")
+        self._zidong_beifen(ass_lu)     # 同上
         try:
-            _xie_zimu_dao_wenjian(ass_lu, zimu, self._ass_yuan)
+            _xie_zimu_dao_wenjian(
+                ass_lu, zimu, self._ass_yuan, self._zimu_fujia(zimu)
+            )
             xie.append(ass_lu)
         except Exception as cuowu:  # noqa
             logger.error(f"视频工作台：重写 ASS 失败 {cuowu}")
         return xie
 
+    # ---- 拖放：把 .srt / .ass 拖进工作台就直接载入 ----
+    def _tuo_de_zimu(self, event):
+        """拖进来的东西里第一个字幕文件；没有就返回空串"""
+        if not event.mimeData().hasUrls():
+            return ""
+        for i in event.mimeData().urls():
+            lu = i.toLocalFile()
+            if lu and lu.lower().endswith(ZIMU_HOUZHUI) and osp.isfile(lu):
+                return lu
+        return ""
+
+    def dragEnterEvent(self, event):
+        if self._tuo_de_zimu(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        lu = self._tuo_de_zimu(event)
+        if not lu:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self._jiazai_zimu_lu(lu)
+
     # ---- 字幕文件的打开 / 保存 ----
     def _dakai_zimu_wenjian(self):
-        """载入一份 SRT / ASS 到时间轴上（打轴 / 调轴 / 看轴用）"""
+        """（弹框选文件）载入一份 SRT / ASS 到时间轴上"""
         if not self.lujing:
             QtWidgets.QMessageBox.warning(self, "提示", "先打开一个视频")
             return
@@ -5331,18 +7070,24 @@ class VideoWorkDialog(QtWidgets.QDialog):
         )
         if not lu:
             return
+        self._jiazai_zimu_lu(lu)
+
+    def _jiazai_zimu_lu(self, lu):
+        """按路径载入字幕：弹框选的、拖进来的、跟视频一块拖进来的都走这儿"""
+        if not lu or not osp.isfile(lu):
+            return False
         try:
             zimu = _du_zimu_wenjian(lu)
         except OSError as cuowu:
             QtWidgets.QMessageBox.critical(
                 self, "错误", f"读不了这个字幕：\n{cuowu}"
             )
-            return
+            return False
         if not zimu:
             QtWidgets.QMessageBox.warning(
                 self, "提示", "这份字幕里没读出字幕行"
             )
-            return
+            return False
 
         geshi = osp.splitext(lu)[1].lower().lstrip(".")
         # 打开的是 ASS / SSA：把原结构留着，保存时按它写（样式之类不丢）。
@@ -5364,11 +7109,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._shuaxin_zimu_tiao()
         self.zimu_wenjian = lu
         self.zimu_geshi = geshi
+        self._zidong_beifen(lu)     # 打开就先把它抄一份进「自动备份」（没改过之前）
+        self._zidong_gai_dong = False
+        self._zidong_shange = [(int(q), int(z), str(w)) for q, z, w in zimu]
         self.shezhi_mianban.zhuangtai_shezhi(
             f"已载入字幕 {len(zimu)} 条 · {osp.basename(lu)}"
             + (f"（替换原有 {jiu} 条）" if jiu else "")
         )
         logger.info(f"视频工作台：载入字幕 {lu}，{len(zimu)} 条")
+        return True
 
     def _cun_zimu(self):
         """保存字幕（按钮 / Ctrl+S）：有目标文件就直接存回去，没有就弹另存为"""
@@ -5405,8 +7154,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
 
     def _xie_zimu_dao(self, lu, zimu):
         """把字幕写到指定文件，并把它记成之后 Ctrl+S 的目标"""
+        self._zidong_beifen(lu)     # 覆盖前先把原来那份抄进「自动备份」
         try:
-            _xie_zimu_dao_wenjian(lu, zimu, self._ass_yuan)
+            _xie_zimu_dao_wenjian(
+                lu, zimu, self._ass_yuan, self._zimu_fujia(zimu)
+            )
         except OSError as cuowu:
             QtWidgets.QMessageBox.critical(
                 self, "错误", f"写不了这个文件：\n{cuowu}"
@@ -5414,6 +7166,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
             return False
         self.zimu_wenjian = lu
         self.zimu_geshi = osp.splitext(lu)[1].lower().lstrip(".")
+        self._zidong_gai_dong = False
+        self._zidong_shange = [(int(q), int(z), str(w)) for q, z, w in zimu]
         self.shezhi_mianban.zhuangtai_shezhi(
             f"字幕已保存 · {osp.basename(lu)}（{len(zimu)} 条）"
         )
@@ -5537,19 +7291,58 @@ class VideoWorkDialog(QtWidgets.QDialog):
         ApplicationShortcut —— 焦点落在视频工作台（主窗口的子窗口）上也照样触发。
         结果 Q/W/E/R 这种单键跟主界面撞车，Qt 打歧义警告。降成窗口级之后，
         只有主窗口自己是活动窗口时才响应，视频工作台里就归本窗口独占了。
+
+        还有一类不是 QAction 而是 QShortcut：主界面按钮的快捷键
+        （label_widget._set_button_application_shortcut，比如"取消"按钮 = Alt+S）
+        也是 ApplicationShortcut，一样全局抢键，上面那遍 QAction 收不到它。
+        不一起降下来，本窗口的 Alt+S 就跟它撞成歧义，Qt 两个都不响应 ——
+        也就是按了没反应。所以这里连 QShortcut 一起收。
+
+        扫描范围：从直接父级（标注面板）一路往上扫到主窗口，两级都收 ——
+        menu 那批 action 挂在主窗口上、按钮那批 QShortcut 挂在标注面板上，
+        只扫一级会漏掉另一级。同一个对象被扫到两遍也没事，按 id 去重。
+
+        往上走用 parentWidget() 而不是 parent()：标注面板（LabelingWrapper）
+        自己存了个叫 parent 的属性，把 QObject.parent() 顶掉了，调它直接报错。
         """
-        zhu = self.parent()
-        if zhu is None:
-            return
-        for dongzuo in zhu.findChildren(QtWidgets.QAction):
-            if dongzuo.shortcutContext() == Qt.ApplicationShortcut:
+        gen = []
+        shang = QtWidgets.QWidget.parentWidget(self)
+        while shang is not None:
+            gen.append(shang)
+            shang = QtWidgets.QWidget.parentWidget(shang)
+        yikan = set()
+        for yi in gen:
+            for dongzuo in yi.findChildren(QtWidgets.QAction):
+                if dongzuo.shortcutContext() != Qt.ApplicationShortcut:
+                    continue
+                if id(dongzuo) in yikan:
+                    continue
+                yikan.add(id(dongzuo))
                 self._beiping_kuangjie.append(dongzuo)
                 dongzuo.setShortcutContext(Qt.WindowShortcut)
+            for jian in yi.findChildren(QtWidgets.QShortcut):
+                if jian.context() != Qt.ApplicationShortcut:
+                    continue
+                # 本窗口自己那批别动（它们挂在 self 底下，也在扫描范围里）
+                fu = jian.parent()
+                if fu is self or (
+                    isinstance(fu, QtWidgets.QWidget)
+                    and self.isAncestorOf(fu)
+                ):
+                    continue
+                if id(jian) in yikan:
+                    continue
+                yikan.add(id(jian))
+                self._beiping_kuangjie.append(jian)
+                jian.setContext(Qt.WindowShortcut)
 
     def _huanyuan_zhujiemian_kuangjie(self):
         """关窗口时把主界面快捷键的上下文还回去"""
         for dongzuo in self._beiping_kuangjie:
-            dongzuo.setShortcutContext(Qt.ApplicationShortcut)
+            if isinstance(dongzuo, QtWidgets.QShortcut):
+                dongzuo.setContext(Qt.ApplicationShortcut)
+            else:
+                dongzuo.setShortcutContext(Qt.ApplicationShortcut)
         self._beiping_kuangjie = []
 
     def eventFilter(self, duixiang, shijian):
@@ -5590,6 +7383,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if self._yingyong_lan_jian is not None:
             self._yingyong_lan_jian.removeEventFilter(self)
             self._yingyong_lan_jian = None
+        self._zidong_jishi.stop()
+        self._cun_jiemian_buju()          # 记下窗口位置 / 标签页 / 分栏 / 缩放
         self._huanyuan_zhujiemian_kuangjie()
         self._guanbi_video()
         super().closeEvent(event)
@@ -5616,8 +7411,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
         super().keyPressEvent(event)
 
 
-def dakai_video_gongzuotai(parent=None, video_lujing=None):
-    """入口：没给路径就弹框选；打开视频工作台窗口并返回它"""
+def dakai_video_gongzuotai(parent=None, video_lujing=None, zimu_lujing=None):
+    """入口：没给路径就弹框选；打开视频工作台窗口并返回它
+
+    zimu_lujing 给了就顺手把这份字幕载进来（主界面同时拖视频 + 字幕时走这条）。
+    """
     if not video_lujing or not osp.isfile(video_lujing):
         video_lujing, _ = QtWidgets.QFileDialog.getOpenFileName(
             parent, "打开视频文件", "", SHIPIN_FILTER
@@ -5633,6 +7431,8 @@ def dakai_video_gongzuotai(parent=None, video_lujing=None):
     if not chuang.dakai(video_lujing):
         chuang.close()
         return None
+    if zimu_lujing and osp.isfile(zimu_lujing):
+        chuang._jiazai_zimu_lu(zimu_lujing)
     # 记进"最近打开的视频"，下次直接从菜单点开，不用再翻目录
     if parent is not None and hasattr(parent, "add_recent_video"):
         parent.add_recent_video(video_lujing)

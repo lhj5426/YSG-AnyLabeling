@@ -17820,8 +17820,18 @@ class LabelingWidget(QtWidgets.QWidget):
         video_extensions = ('.asf', '.avi', '.m4v', '.mkv', '.mov', '.mp4', '.mpeg', '.mpg', '.ts', '.wmv')
         video_files = [i for i in items if i.lower().endswith(video_extensions)]
         if video_files:
+            # 同一批里还拖了字幕（.srt/.ass/.ssa）就一起带进工作台：打开视频后直接载入
+            zimu_files = [
+                i
+                for i in items
+                if i.lower().endswith((".srt", ".ass", ".ssa"))
+            ]
+            zimu_lujing = zimu_files[0] if zimu_files else None
             # 使用延迟调用，让拖放操作先完成，避免阻塞资源管理器
-            QTimer.singleShot(100, lambda: utils.open_video_file(self, video_files[0]))
+            QTimer.singleShot(
+                100,
+                lambda: utils.open_video_file(self, video_files[0], zimu_lujing),
+            )
             return
         
         # 拖放图片文件时，打开图片所在的文件夹并定位到该图片
