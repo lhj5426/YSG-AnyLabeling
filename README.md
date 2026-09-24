@@ -67,14 +67,14 @@ https://github.com/lhj5426/YSG
 
 
 
-同时支持硬字幕提取
+同时支持 Motion Anime 动态漫 的硬字幕提取
 
-<img width="1920" height="1050" alt="image" src="https://github.com/user-attachments/assets/5224268c-2728-4c01-a9df-8267998fdfd7" />
+<img width="1920" height="1050" alt="image" src="https://github.com/user-attachments/assets/0ac38548-6768-4862-9b8d-bca6134bdbea" />
 
-和ASS字幕编辑
+和ASS字幕编辑 使用逻辑基于Aegisub + Arctime Pro 支持字幕编辑模式 和打轴模式
 
-<img width="1920" height="1050" alt="image" src="https://github.com/user-attachments/assets/8d485499-f91f-4c2b-a354-e5706a5aee2b" />
 
+<img width="1920" height="1050" alt="image" src="https://github.com/user-attachments/assets/d599fbfb-b7a0-49ec-b4c3-958e3ec08b4d" />
 
 提升了字幕的提取和编辑体验
 
