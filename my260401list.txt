@@ -104,3 +104,5 @@ ultralytics-thop==2.0.18
 urllib3==2.6.1
 Werkzeug==3.1.4
 zipp==3.23.0
+pip install PyQt5 PyQt5-sip
+pip install imageio-ffmpeg

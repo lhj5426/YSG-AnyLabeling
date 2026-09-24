@@ -165,3 +165,5 @@ Werkzeug==3.1.4
 winsdk==1.0.0b10
 zipp==3.23.0
 transformers==4.51.3
+pip install PyQt5 PyQt5-sip
+pip install imageio-ffmpeg

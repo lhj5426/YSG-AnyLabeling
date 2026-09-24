@@ -21,3 +21,5 @@ json_repair
 importlib_metadata
 markdown
 transformers==4.51.3
+pip install PyQt5 PyQt5-sip
+pip install imageio-ffmpeg
