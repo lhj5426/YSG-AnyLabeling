@@ -32,6 +32,7 @@ import shutil
 import struct
 import subprocess
 import time
+from collections import OrderedDict
 
 import cv2
 import numpy as np
@@ -65,6 +66,10 @@ from anylabeling.views.labeling.widgets.video_infer_panel import (
     du_zidonghua_peizhi,
     zimu_charu_weizhi,
 )
+from anylabeling.views.labeling.widgets.video_work_search import (
+    SuoSuoDialog,
+    XuanZeDialog,
+)
 
 try:
     from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
@@ -85,6 +90,8 @@ SUOFANG_MOREN = 15.0              # 打开视频时时间轴的默认放大倍�
 BO_CAN_YANG_LV = 8000             # 波形解码采样率（单声道）
 BO_HAO_MIAO = 1                   # 波形每格 = 多少毫秒（越细越清晰、越费内存）
 JIE_LIU_HAO_MIAO = 12             # 解析音频时每块之间歇多少毫秒（0 = 不歇）
+BO_WANCHENG_MIAO = 1200           # 波形解完后"波形就绪"在带上停留多久（毫秒）
+BO_ZHONG_GAO = 1                  # 波形带中线的粗细（像素）
 BEISU_LIEBIAO = [                     # 倍速下拉里可选的倍速（跟 Arctime 一样，从快到慢排）
     4.0, 2.5, 2.0, 1.75, 1.5, 1.25, 1.0, 0.75, 0.5, 0.25,
 ]
@@ -112,6 +119,10 @@ JIEMIAN_SUOFANG_JIAN = "jiemian/shijianzhou_suofang"  # 记住时间轴的放大
 JIEMIAN_MEIHANG_GAO = "jiemian/meihang_gao"          # 记住字幕块每行多高
 JIEMIAN_BO_FANGDA = "jiemian/bo_fangda"              # 记住波形振幅放大倍数
 JIEMIAN_ZIMU_TIAO_JIAN = "jiemian/zimu_tiao"         # 记住画面下方那条独立字幕条开不开
+JIEMIAN_GEN_TIAO = "jiemian/gen_tiao"                # 记住「选中字幕时画面跟着跳」开关
+JIEMIAN_SHISHI_GUN = "jiemian/shishi_gun"            # 记住「时间轴实时滚动」开关
+CHEXIAO_ZUIDA = 100               # 撤销栈最多留几版（照 AEG 的 Limits/Undo Levels）
+CHEXIAO_HEBING_MIAO = 1.5         # 同一类动作连着做，隔这么近就算一笔（长按挪块不刷爆栈）
 ZIMU_HOUZHUI = (".srt", ".ass", ".ssa")   # 认得的字幕文件后缀（拖进窗口就载入）
 ZIMU_TIAO_GAO = 34                # 画面下方那条字幕对照条的高度
 ZIMU_TIAO_ZIHAO = 15              # 字幕对照条的字号
@@ -154,7 +165,7 @@ _YANSE_AN = {
     "juzi": "#FF9F0A",
     "qing": "#30D158",
     "bo": "#c7c7cc",
-    "bo_zhong": "#48484a",
+    "bo_zhong": "#373839",
     "bo_di": "#1c1c1e",
 }
 
@@ -176,7 +187,7 @@ _YANSE_LIANG = {
     "juzi": "#FF9F0A",
     "qing": "#30D158",
     "bo": "#9aa0a6",
-    "bo_zhong": "#d2d7dc",
+    "bo_zhong": "#F0F0F1",
     "bo_di": "#ffffff",
 }
 
@@ -499,6 +510,31 @@ def _ys_ci_anniu():
     """
 
 
+def _ys_ci_anniu_xiao():
+    """视频底栏用的小号文字按钮（打开字幕 / 保存字幕）
+
+    底栏那行控件都只有 22px 高，用普通按钮（32px）会整条撑高。
+    """
+    c = _ys()
+    return f"""
+    QPushButton {{
+        background-color: {c['mian']};
+        color: {c['wenzi']};
+        border: 1px solid {c['biankuang_liang']};
+        border-radius: 4px;
+        font-size: 11px;
+        padding: 0 8px;
+        min-height: {SHURU_GAO}px;
+        max-height: {SHURU_GAO}px;
+    }}
+    QPushButton:hover {{ background-color: {c['mian_hover']}; }}
+    QPushButton:disabled {{
+        color: {c['wenzi_ci']};
+        border-color: {c['biankuang']};
+    }}
+    """
+
+
 def _ys_huadong_tiao():
     c = _ys()
     return f"""
@@ -630,8 +666,576 @@ def _huifu_jingdu():
         pass
 
 
+# 取帧定位：拿这个片子实测过（720p、30fps、关键帧 10 秒一个）
+#   · 顺着往下 read 一帧         7 ms
+#   · 重新 set 定位再 read 一帧  0.1 ~ 2.1 秒
+# 差这么多是因为 OpenCV 一 set 就跳回目标前面那个关键帧，再一帧一帧解到目标；
+# 关键帧 300 帧一个，落得离关键帧最远时就等于要解 299 帧 ≈ 2 秒 —— 前后挪帧
+# 时"字幕切过去了画面还在后头"就是这么来的。所以：
+#   · 往前挪（含"下一帧"）-> 顺着 read 往下追，7ms
+#   · 往回挪             -> 翻缓存里刚显示过的帧，瞬间
+#   · 跳得远             -> 才准 set
+ZHEN_SHUNDU_ZUI_DUO = 30            # 往前挪不超过这么多帧就顺着读，不 set
+ZHEN_HOU_TUI_BEIHUAN = 30           # 暂停时定位，顺手把目标前面这么多帧也解出来存着
+ZHEN_HUANCUN_ZUI_DUO = 96           # 往回退最多能退多少帧（更远就得重新定位）
+ZHEN_HUANCUN_ZUI_DA = 192 * 1024 * 1024   # 这份帧缓存最多占多少内存
+
+
+# ---------------------------------------------------------------------
+# mpv 播放内核（libmpv）
+#   解码 / 声音 / 定位 / 变速 / 时钟全交给 mpv —— 跟 ArcTime 用的是同一个
+#   引擎，所以拖播放头跟手，不会像 OpenCV 那样一次定位几百毫秒到两秒。
+#   画面：mpv 渲染进 Qt 的 OpenGL 画布（不是另开一个窗口），所以画面上叠的
+#         字幕、检测框、框选还是我们自己用 QPainter 画，一行都不用改。
+#   dll：软件根目录下 mpv\libmpv-2.dll（跟 gongzuotai.ini 平级）
+# ---------------------------------------------------------------------
+MPV_JIA = "mpv"                       # 播放内核放软件根目录下这个文件夹里
+MPV_DLL_MING = "libmpv-2.dll"
+
+# 拖着播放头走时，每隔这么多毫秒看一眼鼠标在哪（毫秒）。
+# 指针一秒能挪上百个位置，每个位置都发一发 seek 会把 mpv 淹了 —— 反而一
+# 张新图都出不来。所以按这个节拍看一眼，每次只把"当前最新位置"交出去，中
+# 间滑过的位置一律扔掉。
+# 交出去的定位是精确到帧的：画面永远落在鼠标指着的那一帧上，不将就。真正
+# 发给 mpv 的节奏由解码速度决定（上一发解完了才发下一个，见
+# DINGWEI_CHAO_SHI_MS），这个节拍只是"看鼠标"的频率。
+# 只改这一行：数越小越不容易漏掉鼠标位置、mpv 越吃力；数越大越省。
+TUO_SEEK_JIAN_GE_MS = 40
+
+# 一次定位最多认它"还没落地"多久（毫秒）。定位是一发一发排队的：上一发没
+# 落地就不发下一发（互相打断的话每一发都解不完，画面一直是残的）。落地靠
+# mpv 的 PLAYBACK_RESTART 事件通知；正常情况这个值用不到，只有那事件没来
+# 时才靠它把队列放行，免得卡死。
+# 只改这一行：一般不用动。
+DINGWEI_CHAO_SHI_MS = 800
+
+# 给 mpv 的参数（想调画质 / 性能就改这里）
+MPV_CANSHU = [
+    ("vo", "libmpv"),              # 画面由我们自己取去渲染（不另开窗口）
+    ("gpu-api", "opengl"),
+    ("hwdec", "auto-safe"),        # 硬解优先，4K / 高码率省 CPU
+    ("keep-open", "yes"),          # 播到结尾留住最后一帧
+    ("keep-open-pause", "yes"),
+    ("idle", "yes"),
+    ("pause", "yes"),              # 载入先停着，等按播放
+    # 定位默认不精确到帧：一按播放头就拖的时候，每一次都精确到帧得从关键帧
+    # 重解几百帧，画面根本追不上鼠标。拖的过程用不精确的（落最近的关键帧，
+    # 二三十毫秒），松手那一下再补一发精确的落到位。
+    ("hr-seek", "no"),
+    ("osc", "no"),                 # 不要 mpv 自己的那套界面
+    ("osd-level", "0"),
+    # 不许 mpv 显示任何字幕：我们是字幕编辑工具，字幕是自己画在画面上的。
+    # sub-auto 是"自动加载同目录同名字幕"（mpv 默认 fuzzy），sid 管内封软字幕。
+    ("sub-auto", "no"),
+    ("sid", "no"),
+    ("input-default-bindings", "no"),
+    ("input-vo-keyboard", "no"),
+    ("terminal", "no"),
+    ("msg-level", "all=no"),
+]
+
+MPV_RENDER_PARAM_INVALID = 0
+MPV_RENDER_PARAM_API_TYPE = 1
+MPV_RENDER_PARAM_OPENGL_INIT_PARAMS = 2
+MPV_RENDER_PARAM_OPENGL_FBO = 3
+MPV_RENDER_PARAM_FLIP_Y = 4
+
+MPV_FORMAT_FLAG = 3
+MPV_FORMAT_DOUBLE = 5
+
+MPV_EVENT_NONE = 0
+MPV_EVENT_END_FILE = 7
+MPV_EVENT_FILE_LOADED = 8
+# 一次定位（seek）真正落地了：mpv 解到目标位置、画面已就位。定位排队就靠
+# 这个事件判"上一发完事了没有"（不能看 time-pos —— 命令一发出去它就报目标
+# 位置了，比画面早）。
+MPV_EVENT_PLAYBACK_RESTART = 21
+
+# mpv_render_context_update() 返回的标记：该渲染了。
+# 注意：重画（画面没变）也带这个标记，它区分不了"真出了新视频帧"。
+MPV_RENDER_UPDATE_FRAME = 1
+
+# 问"接下来要画的这一帧到底是什么帧"用的（mpv_render_context_get_info）。
+# 只有真解出来的新视频帧才算数：重画（画面没变）和重复上一帧都不算 ——
+# 那两种时候画面上还是老那一帧，字幕跟着换就跑到画面前头去了。
+MPV_RENDER_PARAM_NEXT_FRAME_INFO = 11
+ZHEN_PRESENT = 1 << 0   # 有一帧要画（重画也算）
+ZHEN_REDRAW = 1 << 1    # 不是真新解出来的视频帧，只是重画
+ZHEN_REPEAT = 1 << 2    # 要求把上一帧一模一样再画一遍
+
+GL_COLOR_BUFFER_BIT = 0x00004000
+
+
+class _MpvRenderParam(ctypes.Structure):
+    _fields_ = [("leixing", ctypes.c_int), ("shuju", ctypes.c_void_p)]
+
+
+class _MpvOpenglInitParams(ctypes.Structure):
+    _fields_ = [
+        ("qu_hanshu", ctypes.c_void_p),      # get_proc_address 回调
+        ("shangxiawen", ctypes.c_void_p),    # 上面那个回调的上下文
+    ]
+
+
+class _MpvOpenglFbo(ctypes.Structure):
+    _fields_ = [
+        ("fbo", ctypes.c_int),
+        ("kuan", ctypes.c_int),
+        ("gao", ctypes.c_int),
+        ("nei_geshi", ctypes.c_int),
+    ]
+
+
+class _MpvZhenXinxi(ctypes.Structure):
+    """mpv_render_frame_info：接下来要画的那一帧的说明（标记 + 该显示的时刻）"""
+
+    _fields_ = [
+        ("biaozhi", ctypes.c_uint64),
+        ("mubiao_shike", ctypes.c_int64),
+    ]
+
+
+class _MpvEvent(ctypes.Structure):
+    _fields_ = [
+        ("shi_jian", ctypes.c_int),
+        ("cuowu", ctypes.c_int),
+        ("huifu_id", ctypes.c_uint64),
+        ("shuju", ctypes.c_void_p),
+    ]
+
+
+_OPENGL32 = None
+_KERNEL32 = None
+
+
+def _qu_gl_hanshu(_shangxiawen, mingzi):
+    """mpv 来问 OpenGL 函数地址时给它（wglGetProcAddress 先，再退到导出的）"""
+    global _OPENGL32, _KERNEL32
+    if _OPENGL32 is None:
+        try:
+            _OPENGL32 = ctypes.WinDLL("opengl32")
+            _OPENGL32.wglGetProcAddress.argtypes = [ctypes.c_char_p]
+            _OPENGL32.wglGetProcAddress.restype = ctypes.c_void_p
+            _OPENGL32.glClear.argtypes = [ctypes.c_uint]
+            _OPENGL32.glClearColor.argtypes = [ctypes.c_float] * 4
+        except Exception:  # noqa
+            _OPENGL32 = False
+            return None
+    if not _OPENGL32:
+        return None
+    try:
+        dizhi = _OPENGL32.wglGetProcAddress(mingzi)
+    except Exception:  # noqa
+        dizhi = None
+    if dizhi:
+        return dizhi
+    try:
+        if _KERNEL32 is None:
+            _KERNEL32 = ctypes.WinDLL("kernel32")
+            _KERNEL32.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            _KERNEL32.GetProcAddress.restype = ctypes.c_void_p
+        return _KERNEL32.GetProcAddress(_OPENGL32._handle, mingzi)
+    except Exception:  # noqa
+        return None
+
+
+_MPV_DLL = None                # 载进来的 libmpv（整个进程一份）
+_MPV_JIAZAI_CUO = ""           # 载入失败的原因
+_API_TYPE_OPENGL = ctypes.c_char_p(b"opengl")
+
+
+def mpv_dll_lu():
+    """libmpv-2.dll 的绝对路径：软件根目录下 mpv\（不写死盘符 / 目录名）"""
+    gen = osp.dirname(
+        osp.dirname(osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))))
+    )
+    return osp.join(gen, MPV_JIA, MPV_DLL_MING)
+
+
+def jiazai_mpv():
+    """载入 libmpv，把要用到的函数签名标好（只做一次）"""
+    global _MPV_DLL, _MPV_JIAZAI_CUO
+    if _MPV_DLL is not None:
+        return _MPV_DLL
+    lu = mpv_dll_lu()
+    if not osp.isfile(lu):
+        _MPV_JIAZAI_CUO = f"没找到播放内核：{lu}"
+        return None
+    if hasattr(os, "add_dll_directory"):
+        try:
+            os.add_dll_directory(osp.dirname(lu))
+        except Exception:  # noqa
+            pass
+    try:
+        d = ctypes.CDLL(lu)
+    except Exception as e:  # noqa
+        _MPV_JIAZAI_CUO = f"载入播放内核失败：{e}"
+        return None
+    d.mpv_create.restype = ctypes.c_void_p
+    d.mpv_initialize.argtypes = [ctypes.c_void_p]
+    d.mpv_initialize.restype = ctypes.c_int
+    d.mpv_set_option_string.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+    ]
+    d.mpv_set_option_string.restype = ctypes.c_int
+    d.mpv_set_property_string.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+    ]
+    d.mpv_set_property_string.restype = ctypes.c_int
+    d.mpv_get_property.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p,
+    ]
+    d.mpv_get_property.restype = ctypes.c_int
+    d.mpv_command.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p)]
+    d.mpv_command.restype = ctypes.c_int
+    d.mpv_wait_event.argtypes = [ctypes.c_void_p, ctypes.c_double]
+    d.mpv_wait_event.restype = ctypes.POINTER(_MpvEvent)
+    d.mpv_error_string.argtypes = [ctypes.c_int]
+    d.mpv_error_string.restype = ctypes.c_char_p
+    d.mpv_terminate_destroy.argtypes = [ctypes.c_void_p]
+    d.mpv_render_context_create.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(_MpvRenderParam),
+    ]
+    d.mpv_render_context_create.restype = ctypes.c_int
+    d.mpv_render_context_render.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_MpvRenderParam),
+    ]
+    d.mpv_render_context_render.restype = ctypes.c_int
+    d.mpv_render_context_update.argtypes = [ctypes.c_void_p]
+    d.mpv_render_context_update.restype = ctypes.c_uint64
+    d.mpv_render_context_set_update_callback.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    d.mpv_render_context_report_swap.argtypes = [ctypes.c_void_p]
+    d.mpv_render_context_free.argtypes = [ctypes.c_void_p]
+    # 问"接下来这一帧是不是真新视频帧"用的。老版本 mpv 没这个函数 —— 那就
+    # 不标签名，用的时候自己会发现（见 HuamianQu._zhe_yi_zhen_shi_xin_zhen）。
+    try:
+        d.mpv_render_context_get_info.argtypes = [
+            ctypes.c_void_p, _MpvRenderParam,
+        ]
+        d.mpv_render_context_get_info.restype = ctypes.c_int
+    except AttributeError:
+        pass
+    _MPV_DLL = d
+    return d
+
+
+class MpvBofang(QtCore.QObject):
+    """libmpv 封装：播放这一件事全归它
+
+    对外的名字跟老的取帧线程对齐（zanting / jixu / tiaozheng / zhen_hao /
+    shezhi_beisu / tingzhi / daowei），外面那一堆调用点基本不用动。
+    """
+
+    daowei = pyqtSignal()          # 播到结尾了（跟老的一样）
+    xin_zhen = pyqtSignal()        # 有新画面了，画布收到就重画
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._d = jiazai_mpv()
+        self.h = None
+        self.fps = 30.0
+        self.lujing = ""
+        self.suo_dao = None        # 老接口留的占位（缩放交给 mpv）
+        self.zhen_hook = None      # 老接口留的占位（跟随播放推理另开一路解码）
+        self._yinliang = int(MO_REN_YINLIANG)
+        self._beisu = float(MO_REN_BEISU)
+        self._daowei_bao = False
+        self._zai_ru_wan = False     # 片子真载入完了没有
+        self._dai_dingwei = None     # 载入完成前先攒着的那次定位
+        # 定位排队：一次只让一发 seek 在飞。
+        #   后一发会把前一发的解码打断 —— 每一发都解不完，画面就一直是残的，
+        #   直到你松手那一发才真解出来（那 1 秒延迟就是这么来的）。所以有在
+        #   飞的就先不发，只记下最新位置（_dai_fa），等它落地（mpv 发
+        #   PLAYBACK_RESTART）立刻把最新的那发补出去。
+        self._seek_fa_hao = 0        # 已发出的定位编号
+        self._seek_luo_di = 0        # 已确认落地的定位编号
+        self._seek_fa_shi = 0.0      # 上一发是什么时候发出去的（兜底用）
+        self._dai_fa = None          # 有在飞时攒着的最新目标 (秒, 精确?)
+        if self._d is None:
+            logger.error(f"视频工作台：{_MPV_JIAZAI_CUO}")
+            return
+        self._kai()
+
+    # ---- 内核 ----
+    def _cuo(self, hao):
+        try:
+            return self._d.mpv_error_string(hao).decode("utf-8", "ignore")
+        except Exception:  # noqa
+            return str(hao)
+
+    def _mingling(self, *can):
+        """给 mpv 下命令（参数一律 UTF-8，中文路径也认）"""
+        if self.h is None:
+            return False
+        bu = (ctypes.c_char_p * (len(can) + 1))()
+        for i, can_shu in enumerate(can):
+            bu[i] = str(can_shu).encode("utf-8")
+        bu[len(can)] = None
+        return self._d.mpv_command(self.h, bu) >= 0
+
+    def _she(self, ming, zhi):
+        if self.h is None:
+            return
+        self._d.mpv_set_property_string(
+            self.h, ming.encode("utf-8"), str(zhi).encode("utf-8")
+        )
+
+    def _shi_ma(self, ming):
+        """读一个"是 / 不是"的属性；读不到当 False"""
+        if self.h is None:
+            return False
+        zhi = ctypes.c_int(0)
+        hao = self._d.mpv_get_property(
+            self.h, ming.encode("utf-8"), MPV_FORMAT_FLAG, ctypes.byref(zhi)
+        )
+        return bool(zhi.value) if hao >= 0 else False
+
+    def _shuzi(self, ming, moren=0.0):
+        """读一个数字属性（time-pos / duration 这种）"""
+        if self.h is None:
+            return moren
+        zhi = ctypes.c_double(0.0)
+        hao = self._d.mpv_get_property(
+            self.h, ming.encode("utf-8"), MPV_FORMAT_DOUBLE, ctypes.byref(zhi)
+        )
+        return float(zhi.value) if hao >= 0 else moren
+
+    def _kai(self):
+        """建内核 + 设参数（只建一次，换视频是 loadfile）"""
+        if self.h is not None:
+            return True
+        self.h = self._d.mpv_create()
+        if not self.h:
+            logger.error("视频工作台：播放内核创建失败")
+            return False
+        for ming, zhi in MPV_CANSHU + [("volume", str(self._yinliang))]:
+            hao = self._d.mpv_set_option_string(
+                self.h, ming.encode("utf-8"), zhi.encode("utf-8")
+            )
+            if hao < 0:
+                logger.warning(
+                    f"视频工作台：mpv 参数 {ming}={zhi} 没设上（{self._cuo(hao)}）"
+                )
+        hao = self._d.mpv_initialize(self.h)
+        if hao < 0:
+            logger.error(f"视频工作台：播放内核初始化失败 {self._cuo(hao)}")
+            self.h = None
+            return False
+        return True
+
+    def dakai(self, lu):
+        """换片子"""
+        self.lujing = lu or ""
+        self._daowei_bao = False
+        self._zai_ru_wan = False
+        self._dai_dingwei = None
+        self._dai_fa = None
+        self._seek_fa_hao = self._seek_luo_di = 0
+        if not self._kai():
+            return False
+        return self._mingling("loadfile", lu, "replace")
+
+    def zanting(self):
+        self._she("pause", "yes")
+
+    def jixu(self):
+        self._she("pause", "no")
+
+    def zai_bofang(self):
+        return not self._shi_ma("pause")
+
+    def daowei_ma(self):
+        """播到结尾没有"""
+        return self._shi_ma("eof-reached")
+
+    def shijian_ms(self):
+        return int(round(max(0.0, self._shuzi("time-pos", 0.0)) * 1000))
+
+    def shichang_ms(self):
+        return int(round(max(0.0, self._shuzi("duration", 0.0)) * 1000))
+
+    def zhen_hao(self):
+        """现在在第几帧（时间换算出来的，跟画面显示的那一帧对得上）"""
+        return int(round(self._shuzi("time-pos", 0.0) * max(1e-6, self.fps)))
+
+    def tiaozheng(self, zhen_hao, dan_bu=False, jingque=True):
+        """定位到某一帧（排队：一次只让一发在飞）
+
+        定位是精确到帧的：mpv 得从前面那个关键帧一路解到目标帧，几百毫秒。
+        这期间要是又发一发（拖动时鼠标一直在动），mpv 会把前一发扔掉重来 ——
+        每一发都解不完，画面就一直是残的，直到你松手那一发才真解出来。
+        所以这里排队：有在飞的就只记下最新位置，等它落地（PLAYBACK_RESTART）
+        立刻把最新的补出去。画面的节奏跟着解码速度走，但每一发都真解出来。
+        （dan_bu 是老接口留下的，mpv 不需要，收下不用）
+        """
+        self._pai_tiaozheng(
+            max(0, int(zhen_hao)) / max(1e-6, self.fps), bool(jingque)
+        )
+
+    def _zai_fei(self):
+        """有一发定位还没落地？
+
+        落地靠 mpv 的 PLAYBACK_RESTART 事件（不能看 time-pos：命令一发出去
+        它就报目标位置了，比画面早）。万一那事件没来，超过兜底时长就当落地，
+        免得整条队列卡死。
+        """
+        if self._seek_fa_hao <= self._seek_luo_di:
+            return False
+        if time.perf_counter() - self._seek_fa_shi > DINGWEI_CHAO_SHI_MS / 1000.0:
+            self._seek_luo_di = self._seek_fa_hao
+            return False
+        return True
+
+    def _pai_tiaozheng(self, miao, jingque):
+        """把一次定位交给队列：能发就发，不能发就先攒着（只留最新那份）"""
+        miao = max(0.0, float(miao))
+        if self.h is None:
+            return
+        if not self._zai_ru_wan:
+            # 片子还没载入完：先攒着，等载入完再定位。
+            # （载入期间发出去的 seek 会被丢掉 —— 那一帧就永远等不到了）
+            self._dai_dingwei = (miao, jingque)
+            return
+        if self._zai_fei():
+            self._dai_fa = (miao, jingque)
+            return
+        self._fa_tiaozheng(miao, jingque)
+
+    def _fa_tiaozheng(self, miao, jingque):
+        self._seek_fa_hao += 1
+        self._seek_fa_shi = time.perf_counter()
+        self._mingling(
+            "seek", "%.6f" % max(0.0, float(miao)),
+            "absolute+exact" if jingque else "absolute",
+        )
+
+    def tiaozheng_miao(self, miao, jingque=True):
+        self._pai_tiaozheng(miao, bool(jingque))
+
+    def tiaozheng_ms(self, ms, jingque=True):
+        self.tiaozheng_miao(max(0, int(ms)) / 1000.0, jingque=jingque)
+
+    def zhen_bu(self, fangxiang):
+        """走一帧（正数前进、负数后退），下成了返回真
+
+        用 mpv 自己的单帧步进：前进是接着往下解一帧，后退是翻它自己的回退
+        缓存，都是十几毫秒。走 seek 那条路每一下都得回关键帧重解，几百毫秒，
+        而且往前和往后一样慢 —— 这就是挪一帧画面跟不上的原因。
+        """
+        if self.h is None:
+            return False
+        return self._mingling(
+            "frame-step" if fangxiang >= 0 else "frame-back-step"
+        )
+
+    def shezhi_beisu(self, beisu):
+        self._beisu = max(0.05, float(beisu or 1.0))
+        self._she("speed", "%g" % self._beisu)
+
+    def shezhi_yinliang(self, zhi):
+        self._yinliang = max(0, min(100, int(zhi)))
+        self._she("volume", str(self._yinliang))
+
+    def yinliang(self):
+        return int(self._yinliang)
+
+    def pai_shijian(self):
+        """顺手排一下 mpv 的事件队列（没人取的话它会一直攒着）
+
+        顺带认一下"载入完了没有"：载入期间发出去的定位先攒着，等它载入完
+        再补上，不然那一下会被丢掉。
+        """
+        if self.h is None:
+            return
+        for _ in range(64):
+            e = self._d.mpv_wait_event(self.h, 0.0)
+            if not e or e.contents.shi_jian == MPV_EVENT_NONE:
+                break
+            if e.contents.shi_jian == MPV_EVENT_FILE_LOADED:
+                self._zai_ru_wan = True
+                if self._dai_dingwei is not None:
+                    miao, jingque = self._dai_dingwei
+                    self._dai_dingwei = None
+                    self._fa_tiaozheng(miao, jingque)
+            elif e.contents.shi_jian == MPV_EVENT_END_FILE:
+                self._zai_ru_wan = False
+            elif e.contents.shi_jian == MPV_EVENT_PLAYBACK_RESTART:
+                # 上一发定位落地了（画面已经到那一帧）
+                self._seek_luo_di = self._seek_fa_hao
+        # 前一发落地了、还攒着新位置没发 -> 立刻补上。
+        # （拖动中手停住不再产生新位置时，就靠这一条把攒的那份消化掉）
+        if self._dai_fa is not None and not self._zai_fei():
+            miao, jingque = self._dai_fa
+            self._dai_fa = None
+            self._fa_tiaozheng(miao, jingque)
+
+    def tingzhi(self):
+        """停播并卸掉当前文件（内核留着，下次 loadfile 直接用）"""
+        if self.h is None:
+            return
+        self._mingling("stop")
+        self.lujing = ""
+        self._daowei_bao = False
+        self._zai_ru_wan = False
+        self._dai_dingwei = None
+        self._dai_fa = None
+        self._seek_fa_hao = self._seek_luo_di = 0
+
+    def guan(self):
+        """整个关掉（关窗口时）"""
+        if self.h is None:
+            return
+        try:
+            self._d.mpv_terminate_destroy(self.h)
+        except Exception:  # noqa
+            pass
+        self.h = None
+
+
+class _YinpinDaiLi:
+    """把原来那个 Qt 音频播放器换成 mpv —— 声音也归播放内核
+
+    方法名照旧，外面写 setVolume / volume / play / pause / stop /
+    setPlaybackRate 的地方一行都不用改。定位不在这儿做（统一走 mpv 的
+    seek，画面和声音一起走）。
+    """
+
+    def __init__(self, mpv):
+        self.mpv = mpv
+
+    def setMedia(self, *_a):
+        pass
+
+    def setPosition(self, _ms):
+        pass
+
+    def play(self):
+        self.mpv.jixu()
+
+    def pause(self):
+        self.mpv.zanting()
+
+    def stop(self):
+        self.mpv.zanting()
+
+    def setVolume(self, zhi):
+        self.mpv.shezhi_yinliang(zhi)
+
+    def volume(self):
+        return self.mpv.yinliang()
+
+    def setPlaybackRate(self, beisu):
+        self.mpv.shezhi_beisu(beisu)
+
+
 # ---------------------------------------------------------------------
 # 视频取帧线程
+#   OpenCV 逐帧读取。以前画面靠它，现在画面归 mpv 了，这一路只留给
+#   「跟随播放做推理」用（只喂模型，不显示、不转色、不留缓存）。
 # ---------------------------------------------------------------------
 class _ZhenDuQu(QtCore.QThread):
     """OpenCV 逐帧读取。支持暂停、定位、变速、单帧步进。"""
@@ -645,14 +1249,21 @@ class _ZhenDuQu(QtCore.QThread):
         self._yunxing = True
         self._zanting = True
         self._beisu = 1.0
-        self._tiaozheng = None              # 请求定位到的帧号
+        self._tiaozheng = None              # 请求定位到的 (帧号, 是不是一下一下挪)
         self._dangqian = 0
         self._chong_ji_zhun = False         # 改倍速时要求重设时间基准
         self.suo_dao = None                 # (宽,高) 显示尺寸；None = 原尺寸
         self._zui_xin = None                # 最新一帧 (RGB, 帧号)，主线程来取
+        self._xiaci = 0                     # 读取器内部"下一帧"是第几号（顺着读记的）
+        self._huan_cun = OrderedDict()      # 刚显示过的帧 {帧号: RGB}，往回退帧直接取
+        self._huan_cun_zi = 0               # 上面这份缓存一共占了多少字节
         # 推理用：每读一帧原图（BGR，不缩放）就回调一次；
         # 为 None 表示没开推理，一帧都不往外送，不白耗内存
         self.zhen_hook = None
+        # 只喂模型（跟随播放做推理）：不转色、不留缓存、不往主线程送图
+        self.zhi_tuili = False
+        # 跟着 mpv 的播放时间走：返回"现在播到第几秒"，None = 不跟
+        self.pace_hook = None
 
     # ---- 外部控制 ----
     def zanting(self):
@@ -671,8 +1282,13 @@ class _ZhenDuQu(QtCore.QThread):
         self._beisu = max(0.05, float(beisu or 1.0))
         self._chong_ji_zhun = True
 
-    def tiaozheng(self, zhen_hao):
-        self._tiaozheng = max(0, int(zhen_hao))
+    def tiaozheng(self, zhen_hao, dan_bu=False):
+        """请求定位到第 zhen_hao 帧
+
+        dan_bu=True = 一下一下挪（方向键 / 点一下定位），不是鼠标拖着扫。
+        这种就把目标前面一段也顺手解出来存着，往回退帧同样是瞬间。
+        """
+        self._tiaozheng = (max(0, int(zhen_hao)), bool(dan_bu))
 
     def zhen_hao(self):
         return self._dangqian
@@ -680,6 +1296,8 @@ class _ZhenDuQu(QtCore.QThread):
     def tingzhi(self):
         self._yunxing = False
         self.wait(3000)
+        self._huan_cun.clear()
+        self._huan_cun_zi = 0
 
     # ---- 帧转换（缩放和转色都放本线程，主线程只管画）----
     def _zhen_zhuan(self, zhen):
@@ -692,6 +1310,105 @@ class _ZhenDuQu(QtCore.QThread):
                 zhen = cv2.resize(zhen, (bw, bh), interpolation=cv2.INTER_AREA)
         return cv2.cvtColor(zhen, cv2.COLOR_BGR2RGB)
 
+    def _cun_zhen(self, hao, rgb):
+        """把已经显示过的那一帧留在缓存里
+
+        留着是为了往回退帧：往回退只能靠 set 重新定位，一次几百毫秒到两秒，
+        卡就卡在这。缓存里有就直接取，往前、往回一样快。
+        """
+        if hao in self._huan_cun:
+            return
+        self._huan_cun[hao] = rgb
+        self._huan_cun_zi += int(rgb.nbytes)
+        while (
+            len(self._huan_cun) > ZHEN_HUANCUN_ZUI_DUO
+            or self._huan_cun_zi > ZHEN_HUANCUN_ZUI_DA
+        ):
+            _, jiu = self._huan_cun.popitem(last=False)   # 丢最老的那帧
+            self._huan_cun_zi -= int(jiu.nbytes)
+
+    def _song_zhen(self, zhen, hao):
+        """把原始帧交给推理（钩子里只是丢进槽位，很快，不拖慢读取）"""
+        if self.zhen_hook is None:
+            return
+        try:
+            self.zhen_hook(zhen, hao)
+        except Exception as cuowu:  # noqa
+            logger.error(f"视频工作台：送推理失败 {cuowu}")
+
+    def _deng_bofang(self):
+        """只喂模型的那一路：读到画面前头去了就等一等（跟着 mpv 播放走）"""
+        hs = self.pace_hook
+        if hs is None:
+            return
+        while self._yunxing and not self._zanting:
+            dq = hs()
+            if dq is None:
+                break
+            if self._dangqian / max(1e-6, self.fps) <= dq + 0.25:
+                break
+            self.msleep(4)
+
+    def _dao_mubiao(self, cap, mubiao, dan_bu=False):
+        """走到第 mubiao 帧，返回它的 RGB（拿不到返回 None）
+
+        三条路，按开销从便宜到贵：
+          1. 缓存里有（刚显示过 / 刚顺手解过）-> 直接拿，瞬间；
+          2. 正好在前面不远 -> 顺着 read 往下追，一帧 7ms；
+          3. 别的（往回退得远、大跨度跳）-> 只能 set 重新定位。
+        """
+        # 0) 只喂模型的那一路：定位一下、读一帧丢给钩子就完事，
+        #    不转色、不留缓存、不往主线程送（省内存也省时间）
+        if self.zhi_tuili:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(mubiao)))
+            chenggong, zhen = cap.read()
+            if not chenggong or zhen is None:
+                return None
+            self._dangqian = int(mubiao)
+            self._xiaci = self._dangqian + 1
+            self._song_zhen(zhen, self._dangqian)
+            return None
+
+        # 1) 刚显示过：直接翻缓存，往前往回都是瞬间
+        jiu = self._huan_cun.get(mubiao)
+        if jiu is not None:
+            return jiu
+
+        # 2) 在前面不远（含"下一帧"）：顺着读过去，别 set。一下一下挪的时候
+        #    中间跳过的帧也一并收进缓存（往前跳 20 帧再往回退一帧也不用定位）。
+        tiao = mubiao - self._xiaci
+        if 0 <= tiao <= ZHEN_SHUNDU_ZUI_DUO:
+            hao = self._xiaci
+            xian = None
+            while hao <= mubiao:
+                chenggong, zhen = cap.read()
+                if not chenggong or zhen is None:
+                    return None
+                if dan_bu or hao == mubiao:
+                    xian = self._zhen_zhuan(zhen)
+                    self._cun_zhen(hao, xian)
+                hao += 1
+            self._xiaci = hao
+            return xian
+
+        # 3) 剩下的只能重新定位。定位这一下不管目标是哪一帧都要跳回它前面那个
+        #    关键帧再解过来，所以一下一下挪的时候干脆从目标前面一点起步，把
+        #    中间这几帧顺手收进缓存 —— 往回退帧就不用再定位了，前后一样快。
+        hou = ZHEN_HOU_TUI_BEIHUAN if dan_bu else 0
+        qi = max(0, mubiao - hou)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, qi)
+        xian = None
+        hao = qi
+        while hao <= mubiao:
+            chenggong, zhen = cap.read()
+            if not chenggong or zhen is None:
+                return None
+            xian = self._zhen_zhuan(zhen)
+            self._cun_zhen(hao, xian)
+            hao += 1
+        self._xiaci = hao
+        return xian
+
     # ---- 线程体 ----
     def run(self):
         cap = cv2.VideoCapture(self.lujing)
@@ -700,6 +1417,7 @@ class _ZhenDuQu(QtCore.QThread):
             self.daowei.emit()
             return
 
+        self._xiaci = 0                         # 刚打开，读到的下一帧是第 0 帧
         _tigao_jingdu()
         try:
             ji_zhun = time.perf_counter()       # 基准时刻
@@ -711,13 +1429,13 @@ class _ZhenDuQu(QtCore.QThread):
                     ji_zhun_zhen = self._dangqian
 
                 if self._tiaozheng is not None:
-                    mubiao = self._tiaozheng
+                    mubiao, dan_bu = self._tiaozheng
                     self._tiaozheng = None
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, mubiao)
-                    chenggong, zhen = cap.read()
-                    if chenggong and zhen is not None:
+                    xian = self._dao_mubiao(cap, mubiao, dan_bu)
+                    if xian is not None:
                         self._dangqian = mubiao
-                        self._zui_xin = (self._zhen_zhuan(zhen), mubiao)
+                        self._cun_zhen(mubiao, xian)
+                        self._zui_xin = (xian, mubiao)
                     ji_zhun = time.perf_counter()
                     ji_zhun_zhen = self._dangqian
                     if self._zanting:
@@ -734,13 +1452,17 @@ class _ZhenDuQu(QtCore.QThread):
                     self.daowei.emit()
                     break
                 self._dangqian += 1
+                self._xiaci = self._dangqian + 1
+                if self.zhi_tuili:
+                    # 只喂模型：读到画面前头去了就等 MPV 一下，别跑飞
+                    self._deng_bofang()
+                    self._song_zhen(zhen, self._dangqian)
+                    continue
                 # 原始帧先交给推理（钩子里只是丢进槽位，很快，不拖慢播放）
-                if self.zhen_hook is not None:
-                    try:
-                        self.zhen_hook(zhen, self._dangqian)
-                    except Exception as cuowu:  # noqa
-                        logger.error(f"视频工作台：送推理失败 {cuowu}")
-                self._zui_xin = (self._zhen_zhuan(zhen), self._dangqian)
+                self._song_zhen(zhen, self._dangqian)
+                xian = self._zhen_zhuan(zhen)
+                self._cun_zhen(self._dangqian, xian)
+                self._zui_xin = (xian, self._dangqian)
 
                 # 关键：按"这一帧本该出现的绝对时刻"校准，而不是按上一帧花了多久
                 # 来睡。msleep 在 Windows 上总会多睡几毫秒，用相对睡眠会一帧帧累积
@@ -903,6 +1625,8 @@ class ShipinJinduTiao(QtWidgets.QWidget):
     """视频下方的刻度进度条：整条片子的进度（不跟时间轴缩放走）"""
 
     dingwei = pyqtSignal(int)     # 点 / 拖 -> 要定位到的毫秒
+    tuo_kaishi = pyqtSignal()     # 鼠标按下去、准备拖播放头了
+    tuo_jieshu = pyqtSignal()     # 手松了（拖播放头结束）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -936,6 +1660,7 @@ class ShipinJinduTiao(QtWidgets.QWidget):
     def mousePressEvent(self, shi_jian):
         if shi_jian.button() == Qt.LeftButton:
             self._tuozhe = True
+            self.tuo_kaishi.emit()
             self.dingwei.emit(self._x_dui_hao_miao(shi_jian.x()))
 
     def mouseMoveEvent(self, shi_jian):
@@ -944,7 +1669,12 @@ class ShipinJinduTiao(QtWidgets.QWidget):
 
     def mouseReleaseEvent(self, shi_jian):
         if shi_jian.button() == Qt.LeftButton:
-            self._tuozhe = False
+            if self._tuozhe:
+                self._tuozhe = False
+                self.tuo_jieshu.emit()
+                # 松手这一下再定一次位：拖动过程里音视频都没跟着走，
+                # 这回才真正落到帧上（画面 + 音频一次到位）
+                self.dingwei.emit(self._x_dui_hao_miao(shi_jian.x()))
 
     # ---- 一格代表多少毫秒（照 AEG 按每秒像素数选）----
     def _dan_wei(self):
@@ -1005,11 +1735,19 @@ class ShipinJinduTiao(QtWidgets.QWidget):
 # ---------------------------------------------------------------------
 # 视频画面
 # ---------------------------------------------------------------------
-class HuamianQu(QtWidgets.QWidget):
-    """视频画面：等比缩放居中、黑底。检测框画在画面上面。"""
+class HuamianQu(QtWidgets.QOpenGLWidget):
+    """视频画面：mpv 把视频直接渲染到这块 OpenGL 画布上
+
+    画面上叠的东西（检测区域虚线、检测框、字幕）还是我们用 QPainter 画，
+    跟以前一模一样 —— 只是底下那张视频不再是我们自己贴的图了。
+
+    另外留了一条老路：外面把整张图塞进来（全片扫描时那样）就直接画那张图，
+    这时候不让 mpv 插手，免得两边打架。
+    """
 
     chicun_bian = pyqtSignal()      # 控件尺寸变了 -> 外面重算该把帧缩到多大
     quyu_bian = pyqtSignal(object)  # 框选完了 -> (x,y,w,h) 原始像素；没框成 -> None
+    xin_zhen_dao = pyqtSignal(bool)  # mpv 那边说该重画了（真出新帧 -> True）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1025,6 +1763,21 @@ class HuamianQu(QtWidgets.QWidget):
         self._zai_kuang_xuan = False  # 是否正处于框选状态
         self._tuo_qi = None          # 拖拽起点（原始像素）
         self._tuo_dao = None         # 拖拽终点（原始像素）
+        # mpv 渲染上下文（建一次，关窗口时释放）
+        self._mpv = None             # MpvBofang
+        self._render = None
+        self._hui_c = None           # mpv 的回调，得留着引用，不然会被回收
+        self._gl_qu = None
+        self._guan_le = False        # 已经松开了，mpv 再回调就别理它
+        # 字幕层缓存：(指纹, QImage)。画面上叠的那层字幕逐字量宽度、折行、
+        # 描边加填充，比贴一张现成的图贵几十倍，而它只在"换条 / 淡入淡出
+        # 进度变了 / 画面尺寸变了"时才真不一样 —— 播放时一秒 30 帧里绝大
+        # 多数帧画出来的东西一个像素都不差，白画。
+        self._zimu_tu = None
+        # mpv 每出来一帧、重画之前先叫外面一声：外面按 mpv 这一帧的时刻把
+        # 画面上那层字幕换好（拖动时字幕得跟画面一起出，不能跑在画面前头）
+        self._huan_zhen_hui = None
+        self.xin_zhen_dao.connect(self._shuo_hua, Qt.QueuedConnection)
         self.setMouseTracking(True)
 
     # ---- 检测区域 ----
@@ -1207,26 +1960,284 @@ class HuamianQu(QtWidgets.QWidget):
         th = max(1, int(round(ih * bi)))
         return QtCore.QRect((w - tw) // 2, (h - th) // 2, tw, th)
 
-    def paintEvent(self, event):
-        huabi = QtGui.QPainter(self)
-        huabi.fillRect(self.rect(), QtGui.QColor("#000000"))
-        if self._tupian is None or self._tupian.isNull():
+    # ---- mpv：把视频渲染进这块画布 ----
+    def shezhi_mpv(self, mpv):
+        """接上播放内核（真正的渲染上下文等 GL 起来了再建，见 zhunbei_mpv）"""
+        self._mpv = mpv
+
+    def zhunbei_mpv(self):
+        """保证渲染上下文已建好
+
+        必须赶在载入视频之前建好 —— mpv 那边要是载入时还没看到渲染上下文，
+        它就自己去开一个窗口（那画面就跑到我们控件外面去了）。
+        """
+        if self._render is not None:
+            return True
+        try:
+            # 先把 GL 上下文拉起来（Qt 会在这一步把 initializeGL 叫起来）
+            self.makeCurrent()
+            self.doneCurrent()
+        except Exception as cuowu:  # noqa
+            logger.warning(f"视频工作台：OpenGL 还没准备好（{cuowu}）")
+        self._jian_render()
+        return self._render is not None
+
+    def initializeGL(self):
+        self._jian_render()
+
+    def _jian_render(self):
+        """建 mpv 的渲染上下文（得 GL 已就绪 + 已有内核句柄，两个都齐了才建）"""
+        if self._render is not None or self._mpv is None:
             return
-        mubiao = self.mubiao_qu()
-        # 尺寸已经对上就直接贴；只有对不上（刚改窗口）才走一次平滑缩放
-        if (
-            self._tupian.width() == mubiao.width()
-            and self._tupian.height() == mubiao.height()
-        ):
-            huabi.drawImage(mubiao.topLeft(), self._tupian)
+        handle = getattr(self._mpv, "h", None)
+        if handle is None:
+            return
+        d = jiazai_mpv()
+        if d is None:
+            return
+        try:
+            self.makeCurrent()
+        except Exception as cuowu:  # noqa
+            logger.warning(f"视频工作台：拿不到 OpenGL 上下文（{cuowu}）")
+            return
+        try:
+            self._gl_qu = ctypes.CFUNCTYPE(
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p
+            )(_qu_gl_hanshu)
+            can = _MpvOpenglInitParams(
+                ctypes.cast(self._gl_qu, ctypes.c_void_p), None
+            )
+            can_shu = (_MpvRenderParam * 3)(
+                _MpvRenderParam(
+                    MPV_RENDER_PARAM_API_TYPE,
+                    ctypes.cast(_API_TYPE_OPENGL, ctypes.c_void_p),
+                ),
+                _MpvRenderParam(
+                    MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
+                    ctypes.cast(ctypes.byref(can), ctypes.c_void_p),
+                ),
+                _MpvRenderParam(MPV_RENDER_PARAM_INVALID, None),
+            )
+            zhi = ctypes.c_void_p()
+            hao = d.mpv_render_context_create(
+                ctypes.byref(zhi), handle, can_shu
+            )
+            if hao < 0:
+                logger.error(
+                    f"视频工作台：mpv 渲染上下文建不起来（错误码 {hao}）"
+                )
+                return
+            self._render = zhi
+            # mpv 那边说有新画面就回主线程重画（回调是它自己的线程调的）
+            self._hui_c = ctypes.CFUNCTYPE(
+                None, ctypes.c_void_p
+            )(self._mpv_shuo_hua)
+            d.mpv_render_context_set_update_callback(
+                self._render, ctypes.cast(self._hui_c, ctypes.c_void_p), None
+            )
+        except Exception as cuowu:  # noqa
+            logger.error(f"视频工作台：建 mpv 渲染上下文出错（{cuowu}）")
+        finally:
+            self.doneCurrent()
+
+    def _mpv_shuo_hua(self, *_a):
+        """mpv 说"该重画了"（这是它自己的线程）
+
+        顺手问一句"是不是真新出了一帧视频"：定位（seek）还没走完的时候 mpv
+        也会叫我们重画，可画面上还是老那一帧。那种不算新帧 —— 字幕得等真出
+        新帧才换，这样画面和字幕永远对在同一个时刻上。
+        """
+        if self._guan_le:
+            return
+        xin_zhen = False
+        try:
+            d = jiazai_mpv()
+            if d is not None and self._render:
+                xin_zhen = bool(
+                    d.mpv_render_context_update(self._render)
+                    & MPV_RENDER_UPDATE_FRAME
+                )
+        except Exception:  # noqa
+            pass
+        try:
+            self.xin_zhen_dao.emit(xin_zhen)
+        except Exception:  # noqa
+            pass
+
+    def shezhi_huan_zhen_hui(self, hui):
+        """外面接这个回调：mpv 每出一帧、重画之前先叫一声（在主线程里叫）"""
+        self._huan_zhen_hui = hui
+
+    def _shuo_hua(self):
+        """mpv 那边该重画了（已经回到主线程）
+
+        这儿只管叫重画。画面上那层字幕该不该换，挪到 paintGL 里判：那儿能
+        先问清楚"这一帧到底是不是真新解出来的视频帧"（见 _zhe_yi_zhen_shi_xin_zhen），
+        问准了才重算 —— 而且和画面是同一笔画出去的，一起出来。
+        """
+        self.update()
+
+    def _rang_mpv_hua(self):
+        """让 mpv 把当前这一帧渲染到这块画布上（没有视频就什么都不做）"""
+        if self._render is None:
+            return
+        d = jiazai_mpv()
+        if d is None:
+            return
+        bei = self.devicePixelRatioF()
+        kuan = max(1, int(round(self.width() * bei)))
+        gao = max(1, int(round(self.height() * bei)))
+        fbo = _MpvOpenglFbo(
+            int(self.defaultFramebufferObject()), kuan, gao, 0
+        )
+        fan = ctypes.c_int(1)
+        can_shu = (_MpvRenderParam * 3)(
+            _MpvRenderParam(
+                MPV_RENDER_PARAM_OPENGL_FBO,
+                ctypes.cast(ctypes.byref(fbo), ctypes.c_void_p),
+            ),
+            _MpvRenderParam(
+                MPV_RENDER_PARAM_FLIP_Y,
+                ctypes.cast(ctypes.byref(fan), ctypes.c_void_p),
+            ),
+            _MpvRenderParam(MPV_RENDER_PARAM_INVALID, None),
+        )
+        d.mpv_render_context_render(self._render, can_shu)
+        try:
+            d.mpv_render_context_report_swap(self._render)
+        except Exception:  # noqa
+            pass
+
+    def shifang(self):
+        """松开 mpv 的渲染上下文（关窗口时调，得先让 GL 上下文当前）"""
+        if self._render is None:
+            return
+        self._guan_le = True
+        d = jiazai_mpv()
+        self.makeCurrent()
+        try:
+            if d is not None:
+                d.mpv_render_context_free(self._render)
+        except Exception:  # noqa
+            pass
+        finally:
+            self._render = None
+            self._hui_c = None
+            self.doneCurrent()
+
+    def _hei_di(self):
+        """先把画布刷黑（letterbox 那两条黑边）"""
+        global _OPENGL32
+        if _OPENGL32 is None:
+            _qu_gl_hanshu(None, b"glClearColor")     # 顺手把它载进来
+        if not _OPENGL32:
+            return
+        try:
+            _OPENGL32.glClearColor(0.0, 0.0, 0.0, 1.0)
+            _OPENGL32.glClear(GL_COLOR_BUFFER_BIT)
+        except Exception:  # noqa
+            pass
+
+    def _zhe_yi_zhen_shi_xin_zhen(self):
+        """接下来要画的这一帧，是不是真解出来的新视频帧
+
+        问 mpv 的渲染接口（get_info + 帧信息里的标记位）。它要是说"重画"或
+        "重复上一帧"，那就不是新帧 —— 那会儿画面上还是老那一帧，字幕跟着换
+        就跑到画面前头去了。问不出来（老版本 mpv）就一律当新帧，退回老样子，
+        宁可字幕跟着时间走，也别卡着不换。
+        """
+        if self._render is None:
+            return False
+        d = jiazai_mpv()
+        if d is None or not hasattr(d, "mpv_render_context_get_info"):
+            return True
+        xinxi = _MpvZhenXinxi()
+        can = _MpvRenderParam(
+            MPV_RENDER_PARAM_NEXT_FRAME_INFO,
+            ctypes.cast(ctypes.byref(xinxi), ctypes.c_void_p),
+        )
+        try:
+            hao = d.mpv_render_context_get_info(self._render, can)
+        except Exception:  # noqa
+            return True
+        if hao < 0:
+            return True
+        if not (xinxi.biaozhi & ZHEN_PRESENT):
+            return False
+        return not (xinxi.biaozhi & (ZHEN_REDRAW | ZHEN_REPEAT))
+
+    def paintGL(self):
+        self._jian_render()          # 头一回画的时候把渲染上下文建上
+        tupian = self._tupian
+        if tupian is not None and tupian.isNull():
+            tupian = None
+        if tupian is None:
+            # 视频走 mpv，我们只把底刷黑 + 叠自己的东西。
+            # 先问清楚这一帧是不是真新帧（得赶在画之前问：它说的是"接下来要
+            # 画的这一帧"），画完再按 mpv 现在的位置重算画面上那层字幕 ——
+            # 同一笔画出去，字幕和画面就是同一刻出来的，不会字幕先跑。
+            shi_xin = self._zhe_yi_zhen_shi_xin_zhen()
+            self._hei_di()
+            self._rang_mpv_hua()
         else:
-            huabi.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
-            huabi.drawImage(mubiao, self._tupian)
+            # 整张图塞进来的老路（全片扫描）：每来一张都当新的一帧
+            shi_xin = True
+        if shi_xin:
+            hui = self._huan_zhen_hui
+            if hui is not None:
+                try:
+                    hui()
+                except Exception:  # noqa
+                    pass
+        huabi = QtGui.QPainter(self)
+        mubiao = self.mubiao_qu()
+        if tupian is not None:
+            # 整张图塞进来的老路（全片扫描）：自己贴图
+            if (
+                tupian.width() == mubiao.width()
+                and tupian.height() == mubiao.height()
+            ):
+                huabi.drawImage(mubiao.topLeft(), tupian)
+            else:
+                huabi.setRenderHint(
+                    QtGui.QPainter.SmoothPixmapTransform, True
+                )
+                huabi.drawImage(mubiao, tupian)
         # 先画检测区域（框外压暗），再把检测框压在上面，最后叠字幕
         self._hua_quyu(huabi, mubiao)
         self._hua_kuang(huabi, mubiao)
+        tu = self._zimu_ceng(mubiao)
+        if tu is not None:
+            huabi.drawImage(mubiao.topLeft(), tu)
+        huabi.end()
+
+    def _zimu_ceng(self, mubiao):
+        """画面上那层字幕：整层合成一张图缓存着，每帧只贴这张图
+
+        指纹里用的是算好的透明度倍数，不是毫秒 —— 这样 \\fad 渐入渐出的
+        时候该重画还得重画，不给它加 fad 的时候一动不动。
+        """
+        if not self._zimu or mubiao.width() <= 8 or mubiao.height() <= 8:
+            return None
+        qian = _zimu_qian(self._zimu, mubiao, self._zimu_jizhun)
+        jiu = self._zimu_tu
+        if jiu is not None and jiu[0] == qian:
+            return jiu[1]
+        bi = self.devicePixelRatioF() or 1.0
+        tu = QtGui.QImage(
+            max(1, int(round(mubiao.width() * bi))),
+            max(1, int(round(mubiao.height() * bi))),
+            QtGui.QImage.Format_ARGB32_Premultiplied,
+        )
+        tu.setDevicePixelRatio(bi)
+        tu.fill(Qt.transparent)
+        huabi = QtGui.QPainter(tu)
+        qu = QtCore.QRect(0, 0, mubiao.width(), mubiao.height())
         for tiao in self._zimu:
-            _hua_ass_tiao(huabi, mubiao, tiao, self._zimu_jizhun)
+            _hua_ass_tiao(huabi, qu, tiao, self._zimu_jizhun)
+        huabi.end()
+        self._zimu_tu = (qian, tu)
+        return tu
 
     def _hua_quyu(self, huabi, mubiao):
         """画检测区域：只有一圈虚线框，不动画面；正在拖的时候显示拖出来的框"""
@@ -2618,6 +3629,30 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
     huabi.restore()
 
 
+def _zimu_qian(tiao_men, mubiao, jizhun):
+    """给画面上这一屏字幕算个指纹：指纹一样就不用重画
+
+    影响画面的全在这儿：折好的行、各段格式、这一刻的透明度、画面多大、
+    ASS 的基准分辨率。毫秒不进指纹 —— 毫秒只用来算透明度，剔掉之后正常
+    播放（没写 \\fad 的那种）每一帧的指纹都跟上一帧一模一样，图直接复用。
+    """
+    bu = []
+    for tiao in tiao_men:
+        bu.append(
+            (
+                repr(tiao.get("hang") or []),
+                repr(tiao.get("gs") or {}),
+                round(float(_fad_bei(tiao)), 3),
+            )
+        )
+    return (
+        tuple(bu),
+        int(mubiao.width()),
+        int(mubiao.height()),
+        tuple(jizhun or ()),
+    )
+
+
 def _chai_ass(wenben):
     """把 ASS 拆开留着"原样"：骨架原文 + 每行 Dialogue 的完整字段
 
@@ -2784,6 +3819,8 @@ class ShijianZhou(QtWidgets.QWidget):
     """刻度尺 + 音频波形 + 播放头；点击/拖动定位；可缩放、可左右平移"""
 
     tiaozheng = pyqtSignal(int)     # 请求定位到 ms
+    tuo_kaishi = pyqtSignal()       # 鼠标按在刻度尺上、准备拖播放头了
+    tuo_jieshu = pyqtSignal()       # 手松了（拖播放头结束）
     shitu_bian = pyqtSignal()       # 视图（缩放/平移）变了 -> 外面刷新滚动条
     xuan_zhong = pyqtSignal(int)    # 点了字幕块 -> 第几条（跟右侧列表对齐）
     zimu_tuo = pyqtSignal(int, int, int)    # 拖完字幕块 -> 第几条, 新起ms, 新止ms
@@ -2791,6 +3828,10 @@ class ShijianZhou(QtWidgets.QWidget):
     hebing_zimu = pyqtSignal(object)        # 请求把这几条并成一条
     fangxiang_jian = pyqtSignal(int)        # 焦点在时间轴上按左右方向键 -> -1 后退 / +1 前进一帧
     zimu_nuo = pyqtSignal(object)           # 方向键挪了选中的块 -> [(第几条, 新起ms, 新止ms), ...]
+    xiayitiao = pyqtSignal()                # 焦点在时间轴上按 Ins -> 换到下一条字幕
+    fuzhi_kuai = pyqtSignal()               # 时间轴上 Ctrl+C -> 复制选中的块（外面写剪贴板）
+    zhantie_kuai = pyqtSignal()             # 时间轴上 Ctrl+V -> 复制一份落在原块的下面一行
+    kuang_xuan = pyqtSignal(object)         # 空白处拖框选了一批块 -> 第几条的列表（外面同步列表多选）
 
     CHIDU_GAO = 28
     ZUO_PAD = 12
@@ -2801,6 +3842,7 @@ class ShijianZhou(QtWidgets.QWidget):
     ZIMU_BIAN_KUAN_DU = 2           # 字幕块描边粗细（奇数/偶数块交替两种颜色）
     ZIMU_HANG_ZUIDA = 8             # 字幕带最多摞几行（自己往上/往下挪，想摆哪行摆哪行）
     BO_SHOU_KUAN = 16               # 波形左上角调振幅的小把手多大（正方形边长）
+    KUANG_DONG_PX = 4               # 空白处按住拖这么多像素才算框选（不到就算点了一下空白）
     XIFU_PX = 8                     # 拖块时离别的块边缘这么近（像素）就吸上去
     GENSUI_BI = 0.25                # 自动跟随时播放头放在视图左边这个比例处
 
@@ -2818,6 +3860,7 @@ class ShijianZhou(QtWidgets.QWidget):
         self._bofangtou = 0
         self._fps = 0.0
         self._tuodong = False
+        self._kuaisu = False            # 外面正在拖播放头（进度条那种）：只画窄带
         self._xuanfu_x = None
 
         # 波形包络：每格（BO_HAO_MIAO 毫秒）一组 最大/最小振幅
@@ -2826,6 +3869,13 @@ class ShijianZhou(QtWidgets.QWidget):
         self._bo_you = 0                # 已解出来的格数
         self._bo_cankao = None          # (已算到第几格, 满量程参考幅值)
         self._bo_tishi = "正在解析音频…"
+        self._bo_zong = 0               # 这条视频一共要解几格（算进度用）
+        self._bo_zhengzai = False       # 音频正在解析：波形带中间画进度条
+        self._bo_wancheng = ""          # 解完了在同一个位置闪一下"波形就绪"
+        self._bo_wancheng_ji = QtCore.QTimer(self)
+        self._bo_wancheng_ji.setSingleShot(True)
+        self._bo_wancheng_ji.setInterval(BO_WANCHENG_MIAO)
+        self._bo_wancheng_ji.timeout.connect(self._bo_wancheng_wan)
         self._shangci_shuaxin = 0.0     # 解析期间限频用
         self._bo_fangda = _du_bo_fangda() or BO_FANGDA_MOREN  # 波形振幅缩放（波形左下角的小把手拖它）
         self._tuo_bo = None             # 正在拖那个把手
@@ -2834,11 +3884,16 @@ class ShijianZhou(QtWidgets.QWidget):
         # 视图窗口
         self._beishu = 1.0              # 1 = 整条铺满；越大越放大
         self._shi_ms = 0                # 视图左边界
+        self._shishi_gun = False        # 「时间轴实时滚动」：开着 = 播放时把播放头锁在视口中间
+        self._zai_bofang = False        # 外面告诉的：现在在不在播放
         self._huatu_huancun = None      # (key, QPixmap)
+        self._jing_huancun = None       # (key, QPixmap) 整条轨道的静层（见 _jing_tu）
+        self._jing_ban = 0              # 静层版本号：字幕数据一改就 +1，让静层缓存作废
 
         # 字幕块（硬字幕提取出来的），叠在波形下半截
         self._zimu = []                 # [(起ms, 止ms, 文字), ...]
         self._zimu_tao = []             # 每块字幕摆在第几行（0 起，自己挪的）
+        self._kuai_yanse = []           # 每块字幕的底色（外面按说话人用的样式色喂进来的）；None = 默认蓝
         self._xuan_zhong = -1           # 主选是第几段（跟右侧字幕列表对齐）
         self._xuan_duo = []             # 多选里都是第几段（有序；单选时只有一个）
         # 播放头现在压在哪几块上（只用来判断"要不要整条重画"：进 / 出块时那块
@@ -2852,6 +3907,8 @@ class ShijianZhou(QtWidgets.QWidget):
         self._zimu_gao_guding = _du_zimu_gao()   # 用户调过的每行字幕块高度；None = 用默认
         self._tuo_gao = None            # 正在拖字幕带下边缘调高度：{"an_y": y, "an_gao": 高度}
         self._fen_ge_liang = False      # 鼠标有没有停在字幕带下边缘上（只换光标，不画线）
+        # 空白处按住拖出来的选框：{"x0","y0","x1","y1","dong"}；None = 没在框选
+        self._kuang = None
 
     # ---- 字幕块 ----
     def shezhi_zimu(self, zimu):
@@ -2869,6 +3926,9 @@ class ShijianZhou(QtWidgets.QWidget):
             tao.append(sheng.pop(0) if sheng else 0)
         self._zimu = xin
         self._zimu_tao = tao
+        if len(self._kuai_yanse) != len(self._zimu):
+            self._kuai_yanse = []   # 条数变了，颜色表先作废（外面马上重喂一遍）
+        self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
         n = len(self._zimu)
         # 字幕条数变了（删了 / 合并了）：把越界的选中项清掉
         self._xuan_duo = [x for x in self._xuan_duo if 0 <= x < n]
@@ -2879,6 +3939,21 @@ class ShijianZhou(QtWidgets.QWidget):
         self._zai_kuai = None       # 块变了，播放头压着哪几块重新认
         self.update()
 
+    def shezhi_kuai_yanse(self, men):
+        """整表喂进每块字幕的底色（外面按说话人那个样式的主文字色算好）
+
+        None = 这块照旧用默认蓝。长度跟现存块数对不上就整表作废 ——
+        宁可全用默认色，也不要拿错颜色糊到别的块上。
+        """
+        men = list(men or [])
+        if len(men) != len(self._zimu):
+            men = []
+        if men == self._kuai_yanse:
+            return
+        self._kuai_yanse = men
+        self._jing_ban += 1     # 块色变了，静层缓存作废（见 _jing_tu）
+        self.update()
+
     def tianjia_zimu(self, qi_ms, zhi_ms, wenben):
         """新建一块：按时间插到该在的位置，行号表跟着插一格；返回插在第几块
 
@@ -2887,6 +3962,9 @@ class ShijianZhou(QtWidgets.QWidget):
         wei = zimu_charu_weizhi(self._zimu, qi_ms, zhi_ms)
         self._zimu.insert(wei, (int(qi_ms), int(zhi_ms), str(wenben or "")))
         self._zimu_tao.insert(wei, 0)   # 新块默认摆第一行
+        if len(self._kuai_yanse) == len(self._zimu) - 1:
+            self._kuai_yanse.insert(wei, None)  # 新块先按默认色，外面重喂再换
+        self._jing_ban += 1             # 字幕数据变了，静层缓存作废（见 _jing_tu）
         if wei <= self._xuan_zhong:
             self._xuan_zhong += 1
         self._xuan_duo = [x + 1 if x >= wei else x for x in self._xuan_duo]
@@ -2908,12 +3986,15 @@ class ShijianZhou(QtWidgets.QWidget):
         if wenben == jiu:
             return
         self._zimu[xu] = (qi, zhi, wenben)
+        self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
         self.update()
 
     def qingkong_zimu(self):
         if self._zimu:
             self._zimu = []
             self._zimu_tao = []
+            self._kuai_yanse = []
+            self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
             self._xuan_zhong = -1
             self._xuan_duo = []
             self._miao_dian = None
@@ -2957,6 +4038,7 @@ class ShijianZhou(QtWidgets.QWidget):
         if (qi, zhi) == self._zimu[xu][:2]:
             return False
         self._zimu[xu] = (qi, zhi, wen)
+        self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
         self.update()
         self.zimu_nuo.emit([(xu, qi, zhi)])
         return True
@@ -2996,6 +4078,7 @@ class ShijianZhou(QtWidgets.QWidget):
         if (qi, zhi) == self._zimu[xu][:2]:
             return False
         self._zimu[xu] = (qi, zhi, wen)
+        self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
         self.update()
         self.zimu_nuo.emit([(xu, qi, zhi)])
         return True
@@ -3008,8 +4091,11 @@ class ShijianZhou(QtWidgets.QWidget):
     def nuo_xuan_zhong(self, zhen_shu):
         """选中的字幕块整体左右挪 zhen_shu 帧（撞到片头 / 片尾就整组停）
 
-        直接改本地的块时间，不等外面回填 —— 连按方向键才能一下一下累加。
+        直接改本地的块时间，不等外面回填 —— 连着调才能一下一下累加。
         改完喊外面同步右侧列表 / SRT。
+
+        注意：方向键已经不走这条路了（方向键只挪播放头，块的起止用 Q/W/E/R
+        拉），这里当前没有调用者，留着备用。
         """
         xuan = self.xuan_zhong_liebiao()
         if not xuan or self._shichang <= 0 or not zhen_shu:
@@ -3033,6 +4119,7 @@ class ShijianZhou(QtWidgets.QWidget):
             xin_zhi = max(0, min(self._shichang, int(round(zhi + dong))))
             self._zimu[xu] = (xin_qi, xin_zhi, wen)
             gai.append((xu, xin_qi, xin_zhi))
+        self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
         self.update()
         self.zimu_nuo.emit(gai)
         return True
@@ -3094,11 +4181,34 @@ class ShijianZhou(QtWidgets.QWidget):
         self._xuan_zhong = xu
         self.update()
 
+    def quan_xuan_kuai(self):
+        """Ctrl+A：整条轨道上的块全选上
+
+        跟框选一条路：选中一批之后喊外面，让字幕列表也整批跟着选上。
+        """
+        n = len(self._zimu)
+        if n <= 0:
+            return
+        self._xuan_duo = list(range(n))
+        self._xuan_zhong = n - 1
+        self._miao_dian = 0
+        self.update()
+        self.kuang_xuan.emit(list(self._xuan_duo))
+
     def gundong_dao_zimu(self, xu):
-        """把第 xu 段滚进视野（只动视图，不动播放头）"""
+        """把第 xu 段滚进视野（只动视图，不动播放头）
+
+        这块的起点已经在视野里就什么都别做 —— 贴着屏幕边缘、尾巴探出去一点
+        的那种块本来就在眼前，再按"整块要装得下"去判，就会把它拽到正中间，
+        看着就是"块自己乱跑"。只有起点也在视野外（比如在右侧列表里选了很后
+        面的一条）才真滚过去。
+        """
         if not (0 <= int(xu) < len(self._zimu)):
             return
         qi, zhi, _w = self._zimu[int(xu)]
+        ke = self._keshi_ms()
+        if ke > 0 and self._shi_ms <= int(qi) < self._shi_ms + ke:
+            return
         self.gundong_dao_ms(qi, int(zhi) - int(qi))
 
     def gundong_dao_ms(self, qi_ms, chang_ms=0):
@@ -3150,12 +4260,39 @@ class ShijianZhou(QtWidgets.QWidget):
             # 外面（帧回调定时器 / 异步定位回来的结果）还在不停回写位置，
             # 跟鼠标一抢，播放头就在原地来回抖，所以拖动期间一律不理。
             return
+        self._nuo_bofangtou(ms, gensui)
+
+    def _nuo_bofangtou(self, ms, gensui=True):
+        """把播放头挪到 ms 并重画
+
+        播放头只挪一点点的时候，只重画它扫过的那一条窄带，不整条时间轴重绘
+        （拖动的时候每挪一个像素就调一次，整条重绘会卡）。
+        """
         jiu_x = self._ms_to_x(self._bofangtou)
         jiu_shi = self._shi_ms
         self._bofangtou = max(0, min(int(ms or 0), self._shichang or int(ms or 0)))
         if gensui and self._beishu > 1.0:
-            self._gensui_bofangtou()
+            # 实时滚动开着 + 正在播（而且这会儿不是拿鼠标在拖）：播放头锁在视口
+            # 正中间；其余时候还是老规矩 —— 跑出视野才挪一屏
+            if (
+                self._shishi_gun
+                and self._zai_bofang
+                and not (self._tuodong or self._kuaisu)
+            ):
+                self._suoding_bofangtou()
+            else:
+                self._gensui_bofangtou()
         xin_x = self._ms_to_x(self._bofangtou)
+        if self._tuodong or self._kuaisu:
+            # 鼠标正拖着播放头：只擦播放头扫过的那一条窄带。
+            # 这里特意不算"播放头压着哪一块"（那要扫一遍所有字幕块），
+            # 也不整条重绘 —— 鼠标一快就会频繁整条重绘，播放头就落在
+            # 鼠标后头，看着完全不跟手。块上的描边高亮等松手再统一刷。
+            self.update(
+                min(jiu_x, xin_x) - 10, 0, abs(xin_x - jiu_x) + 20,
+                self.height(),
+            )
+            return
         xin_zai = self._bofangtou_zai_kuai()
         if xin_zai != self._zai_kuai:
             # 播放头进 / 出了哪块：那块的描边要换色，窄带擦不干净 —— 整条重画
@@ -3177,6 +4314,15 @@ class ShijianZhou(QtWidgets.QWidget):
         """播放头现在停在哪一毫秒"""
         return int(self._bofangtou)
 
+    def shezhi_kuaisu_hua(self, kai):
+        """外面（视频下方那条进度条）正按着拖播放头：这期间只画窄带
+
+        不然进度条一拖，时间轴整条来回重绘，播放头就跟不上手。
+        进出这个状态各重画一次：把"正播到哪块"的红圈擦掉 / 补回来。
+        """
+        self._kuaisu = bool(kai)
+        self.update()
+
     def shezhi_fps(self, fps):
         try:
             self._fps = max(0.0, float(fps or 0.0))
@@ -3185,8 +4331,29 @@ class ShijianZhou(QtWidgets.QWidget):
         self.update()
 
     def shezhi_bo_tishi(self, wenben):
-        self._bo_tishi = str(wenben or "")
+        """波形那行的提示 / 进度
+
+        外面一共调三次：
+          · 打开视频时「正在解析音频…」→ 开始解析，画进度条
+          · 解完了给空串 → 进度条收掉，原地闪一下「波形就绪」
+          · 出错给「没有波形：…」→ 进度条收掉，只留错误提示
+        """
+        wenben = str(wenben or "")
+        self._bo_tishi = wenben
+        if "正在解析" in wenben:
+            self._bo_wancheng = ""
+            self._bo_wancheng_ji.stop()
+        else:
+            self._bo_zhengzai = False
+            self._bo_wancheng = "波形就绪" if not wenben else ""
+            if self._bo_wancheng:
+                self._bo_wancheng_ji.start()
         self._huatu_huancun = None
+        self.update()
+
+    def _bo_wancheng_wan(self):
+        """「波形就绪」闪完收掉"""
+        self._bo_wancheng = ""
         self.update()
 
     # ---- 波形数据 ----
@@ -3196,6 +4363,10 @@ class ShijianZhou(QtWidgets.QWidget):
         self._bo_max = np.zeros(zong_ge, dtype=np.int16)
         self._bo_min = np.zeros(zong_ge, dtype=np.int16)
         self._bo_you = 0
+        self._bo_zong = zong_ge             # 进度条按这个算百分比
+        self._bo_zhengzai = True            # 开始解析：画进度条
+        self._bo_wancheng = ""
+        self._bo_wancheng_ji.stop()
         self._huatu_huancun = None
         self.update()
 
@@ -3203,6 +4374,10 @@ class ShijianZhou(QtWidgets.QWidget):
         self._bo_max = np.zeros(0, dtype=np.int16)
         self._bo_min = np.zeros(0, dtype=np.int16)
         self._bo_you = 0
+        self._bo_zong = 0
+        self._bo_zhengzai = False
+        self._bo_wancheng = ""
+        self._bo_wancheng_ji.stop()
         self._huatu_huancun = None
         self.update()
 
@@ -3313,6 +4488,31 @@ class ShijianZhou(QtWidgets.QWidget):
             self._huatu_huancun = None
             self.shitu_bian.emit()
 
+    def shezhi_shishi_gun(self, kai):
+        """「时间轴实时滚动」开关（照 ARC）：开着 = 播放时播放头定在视口中间、轴往左滚"""
+        self._shishi_gun = bool(kai)
+        self.update()
+
+    def shezhi_zai_bofang(self, zai):
+        """外面告诉的：现在在播还是在暂停（实时滚动只在播的时候生效）"""
+        self._zai_bofang = bool(zai)
+
+    def _suoding_bofangtou(self):
+        """照 ARC：把播放头摆在视口正中间 —— 播放头看着不动，是时间轴在往左走
+
+        只有放大到一屏装不下整条视频时才有区别（1 倍铺满时整条都在视野里，
+        播放头本来就跑不出画面）。
+        """
+        ke = self._keshi_ms()
+        if ke <= 0:
+            return
+        jiu = self._shi_ms
+        self._shi_ms = int(round(self._bofangtou - ke / 2.0))
+        self._qia_zheng()
+        if self._shi_ms != jiu:
+            self._huatu_huancun = None
+            self.shitu_bian.emit()
+
     # ---- 坐标换算 ----
     def _guidao_qu(self):
         return QtCore.QRect(
@@ -3362,18 +4562,139 @@ class ShijianZhou(QtWidgets.QWidget):
 
     # ---- 绘制 ----
     def paintEvent(self, event):
-        c = _ys()
-        huabi = QtGui.QPainter(self)
-        huabi.fillRect(self.rect(), QtGui.QColor(c["beijing2"]))
-
         qu = self._guidao_qu()
+        huabi = QtGui.QPainter(self)
+        # 先贴静层：背景、波形、刻度、字幕块、重叠标记这些不跟鼠标走的东西，
+        # 全在这张现成的图里（Qt 只合成要擦的那一小块，所以擦一条窄带就只贴一条）
+        huabi.drawPixmap(0, 0, self._jing_tu())
+        # 再画实时层：播放头、它正压着的那块、鼠标悬停的高亮、吸附线、鼠标处的时间线
+        self._hua_kuai_zai(huabi, qu)
+        self._hua_bofangtou(huabi, qu)
+        self._hua_xuanfu_zimu(huabi, qu)
+        self._hua_xifu(huabi, qu)
+        self._hua_xuanfu(huabi)
+        self._hua_xuan_kuang(huabi)
+        huabi.end()
+
+    def _hua_xuan_kuang(self, huabi):
+        """框选时那个框：淡蓝填一层 + 主题色细边（照 ARC，画在最上面）"""
+        if self._kuang is None or not self._kuang["dong"]:
+            return
+        se = QtGui.QColor(_ys()["zhuse"])
+        tian = QtGui.QColor(se)
+        tian.setAlpha(48)               # 底下一层淡淡的，字幕块还看得清
+        huabi.setPen(QtGui.QPen(se, 1))
+        huabi.setBrush(tian)
+        huabi.drawRect(self._kuang_ju())
+        huabi.setBrush(Qt.NoBrush)
+
+    def _hua_bo_jindu(self, huabi, bo, c):
+        """波形带中间那条解析进度：解到几成就填几成，解完写「波形就绪」
+
+        进度按「已解格数 / 一共要解几格」算 —— 一共几格在 zhunbei_bofang
+        里照视频长度算好了（每格 BO_HAO_MIAO 毫秒），跟 ffmpeg 这一下送出
+        了多少无关，所以能一路走到 100%，不用去 CMD 看日志。
+        """
+        zong = max(1, int(self._bo_zong))
+        if self._bo_wancheng:
+            bili = 1.0
+            shuo = self._bo_wancheng
+        else:
+            bili = min(1.0, self._bo_you / float(zong))
+            shuo = f"正在解析音频 {int(round(bili * 100))}%"
+        gao = 26
+        kuan = max(220, min(460, bo.width() // 3))
+        jing = QtCore.QRectF(
+            bo.center().x() - kuan / 2.0,
+            bo.center().y() - gao / 2.0,
+            kuan,
+            gao,
+        )
+        # 照「字号 N」那个浮标做：黑底 + 白字，整块不透明，压在白波形带上
+        # 也一眼看得清。进度是块里一条绿从左往右长；整体形状走裁剪，所以
+        # 长到一半时右端是平的，外框不会跟着变圆。
+        kuang = QtGui.QPainterPath()
+        kuang.addRoundedRect(jing, 4.0, 4.0)
+        huabi.save()
+        huabi.setRenderHint(QtGui.QPainter.Antialiasing, True)   # 圆角才不毛
+        huabi.setPen(Qt.NoPen)
+        huabi.setBrush(QtGui.QColor(c["wenzi"]))          # 黑底
+        huabi.drawPath(kuang)
+        if bili > 0:
+            huabi.setClipPath(kuang)
+            huabi.setBrush(QtGui.QColor(c["qing"]))       # 已经解好的部分
+            huabi.drawRect(
+                QtCore.QRectF(
+                    jing.left(), jing.top(), jing.width() * bili, gao
+                )
+            )
+        huabi.restore()
+        # 白字：黑底白字本来就清楚。这里用 drawText 而不是画路径 —— 路径走的是
+        # 图形绘制、不带字体抗锯齿，字会发虚（上面那版就是），drawText 走系统
+        # 字体渲染，边缘才实。
+        jiu_ziti = huabi.font()
+        ziti = QtGui.QFont(jiu_ziti)
+        ziti.setPixelSize(16)
+        ziti.setBold(True)
+        huabi.setFont(ziti)
+        huabi.setPen(QtGui.QColor(c["beijing2"]))
+        huabi.drawText(jing, Qt.AlignCenter, shuo)
+        huabi.setFont(jiu_ziti)
+
+    def _jing_tu(self):
+        """整条轨道的"静层"：背景 + 波形 + 刻度 + 字幕块 + 重叠标记 + 波形把手
+
+        这些东西每画一遍都要几十毫秒（几千块得一块块画、重叠区间得整个重算
+        一遍），可它们只在"视图挪了 / 字幕改了 / 尺寸变了 / 播放头换了块"的
+        时候才变。所以合成一张图存起来，重绘时只贴这张图；播放头、悬停高亮、
+        吸附线这些跟着鼠标每一动都在变的东西，才实时盖在上面。
+        """
+        qu = self._guidao_qu()
+        key = (
+            self._jing_ban,                 # 字幕数据（内容 / 起止 / 摆第几行）改过
+            self._shi_ms,                   # 视图左边界
+            self._keshi_ms(),               # 一屏铺多少毫秒（= 缩放倍率）
+            self._shichang,
+            self._fps,
+            self.width(),
+            self.height(),
+            self._bo_you,                   # 波形解到第几格
+            self._bo_zhengzai,              # 正在解析：带中间那条进度条
+            self._bo_wancheng,              # 解完闪的「波形就绪」
+            self._bo_fangda,
+            self._bo_tishi,
+            self.man_liang_cheng(),
+            self._zimu_gao(qu),
+            self._xuan_zhong,
+            tuple(self._xuan_duo),
+            self._bo_shou_liang,
+            ZHUTI,                          # 换主题了整张都得重画
+        )
+        if self._jing_huancun is not None and self._jing_huancun[0] == key:
+            return self._jing_huancun[1]
+
+        c = _ys()
+        tu = QtGui.QPixmap(max(1, self.width()), max(1, self.height()))
+        tu.fill(QtGui.QColor(c["beijing2"]))
+        huabi = QtGui.QPainter(tu)
+
         bo = self._bo_qu(qu)
         huabi.fillRect(bo, QtGui.QColor(c["bo_di"]))
 
+        # 中线：整条一条、颜色极淡（深色主题照 ARC 取色 #373839）。粗细看
+        # BO_ZHONG_GAO。画在波形底下，有波形的地方让波形自己盖住
+        if self._bo_you > 0:
+            zhong_y = bo.top() + bo.height() / 2.0
+            huabi.setPen(QtGui.QPen(QtGui.QColor(c["bo_zhong"]), BO_ZHONG_GAO))
+            huabi.drawLine(bo.left(), int(zhong_y), bo.right(), int(zhong_y))
+
         huabi.drawPixmap(bo.left(), bo.top(), self._qu_bofang_tupian(bo))
 
-        # 视图里没有波形数据时给个提示
-        if self._bo_you <= 0:
+        # 正在解析音频：波形带中间压一条进度（解完在原地闪一下「波形就绪」）
+        if self._bo_zhengzai or self._bo_wancheng:
+            self._hua_bo_jindu(huabi, bo, c)
+        elif self._bo_you <= 0:
+            # 视图里没有波形数据时给个提示
             huabi.setPen(QtGui.QColor(c["wenzi_ci"]))
             if self._shichang <= 0:
                 tishi = "（还没打开视频）"
@@ -3381,22 +4702,15 @@ class ShijianZhou(QtWidgets.QWidget):
                 tishi = self._bo_tishi or "（没有音频波形）"
             huabi.drawText(bo, Qt.AlignCenter, tishi)
 
-        if self._bo_you > 0:
-            # 中线
-            zhong_y = bo.top() + bo.height() / 2.0
-            huabi.setPen(QtGui.QPen(QtGui.QColor(c["bo_zhong"]), 1))
-            huabi.drawLine(bo.left(), int(zhong_y), bo.right(), int(zhong_y))
-
         self._hua_zimu(huabi, qu)
-        self._hua_xuanfu_zimu(huabi, qu)
-        self._hua_xifu(huabi, qu)
         self._hua_chidu(huabi, qu)
         # 重叠标记放在刻度之后画：它的竖线要竖到刻度条里去，先画会被刻度条盖掉
         self._hua_chongdie(huabi, qu)
-        self._hua_bofangtou(huabi, qu)
         self._hua_bo_shou(huabi)
-        self._hua_xuanfu(huabi)
         huabi.end()
+
+        self._jing_huancun = (key, tu)
+        return tu
 
     # ---- 字幕块 ----
     def _zimu_gao_shangxian(self, qu):
@@ -3454,8 +4768,36 @@ class ShijianZhou(QtWidgets.QWidget):
             xu = int(xu)
             if 0 <= xu < n and self._zimu_tao[xu] != xin_hang:
                 self._zimu_tao[xu] = xin_hang
+                self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
                 gai = True
         if gai:
+            self.update()
+        return gai
+
+    def zimu_hang(self, xu):
+        """第 xu 块现在摆在第几行（重复行要照原件往下沉一行）"""
+        tao = self._zimu_hang()
+        xu = int(xu)
+        return tao[xu] if 0 <= xu < len(tao) else 0
+
+    def shezhi_hang(self, dui):
+        """按 [(第几条, 第几行), ...] 把行号摆上去
+
+        整份 shezhi_zimu 是按"内容"认行号的，重复出来的块跟原件内容一模一样，
+        认不到旧行号会落到第一行；所以重复完得再喊这一声，把副本沉到原件下面。
+        """
+        tao = self._zimu_hang()
+        n = len(self._zimu)
+        gai = False
+        for xu, hang in dui or ():
+            xu = int(xu)
+            hang = max(0, min(int(hang), self.ZIMU_HANG_ZUIDA - 1))
+            if 0 <= xu < n and tao[xu] != hang:
+                tao[xu] = hang
+                gai = True
+        if gai:
+            self._zimu_tao = tao
+            self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
             self.update()
         return gai
 
@@ -3479,6 +4821,7 @@ class ShijianZhou(QtWidgets.QWidget):
                 )
                 if xin != self._zimu_tao[xu]:
                     self._zimu_tao[xu] = xin
+                    self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
                     gai = True
         if gai:
             self.update()
@@ -3612,9 +4955,11 @@ class ShijianZhou(QtWidgets.QWidget):
         hang = self._zimu_hang()
         hangshu = self._zimu_hang_shu()
 
-        # 所有块一个样：半透明蓝底 + 白字，选不选中都不变
-        yanse = QtGui.QColor(YANSE_ZIMU)
-        yanse.setAlpha(ZIMU_TOUMING_DU)
+        # 默认所有块一个样：半透明蓝底 + 白字，选不选中都不变。
+        # 套过槽位（说话人非空）的块，外面会按它那个说话人用的样式的主文字色
+        # 喂一份颜色进来（_kuai_yanse），没喂到的照旧用这个默认蓝。
+        moren = QtGui.QColor(YANSE_ZIMU)
+        moren.setAlpha(ZIMU_TOUMING_DU)
         ziti = huabi.font()
         ziti.setPointSize(8)
         huabi.setFont(ziti)
@@ -3635,24 +4980,22 @@ class ShijianZhou(QtWidgets.QWidget):
             kuai = kuai.intersected(tiao)
             if kuai.width() <= 0:
                 continue
+            # 这块的底色：外面喂了就用外面的（说话人那个样式的色），没有就默认蓝
+            yanse = moren
+            if xu < len(self._kuai_yanse) and self._kuai_yanse[xu] is not None:
+                yanse = self._kuai_yanse[xu]
             xuan = xu in self._xuan_duo
             if xuan:
                 # 选中：只在块内部描一圈绿框，底色和文字都保持原样（跟别人
                 # 软件一样，选中只是"圈一下"，内容一个像素都不动）。
-                # 多选里"主选"那条（跟右侧列表对齐的）框画粗一点。
-                zhu = xu == self._xuan_zhong
+                # 绿框 5 像素，比普通块那圈 2 像素的描边粗，一眼看得出选中。
                 bian = QtGui.QColor(YANSE_ZIMU_XUAN)
-                kuan_bi = 3 if zhu else self.ZIMU_BIAN_KUAN_DU
-            elif min(qi, zhi) <= self._bofangtou < max(qi, zhi):
-                # 播放头正压着这块：描边换成播放头那档红，给个"正播到这块"的
-                # 反馈 —— 只是提示，不算选中（选中优先，所以这块要是选中的，
-                # 上面那个分支先接走，还是绿框）。半开区间：正好卡在块尾时
-                # 算下一块的开头，不会两块一起亮。
-                bian = QtGui.QColor(YANSE_ZIMU_ZAI)
-                kuan_bi = self.ZIMU_BIAN_KUAN_DU
+                kuan_bi = 5
             else:
                 # 紧挨着的块靠描边分个数：奇数块、偶数块交替用两种深色描边，
                 # 交界处永远是"这块的深蓝边 | 那块的深棕边"，一眼数得清几块。
+                # （播放头正压着的那块的红边不画在这儿 —— 那是跟着播放头每帧
+                # 在变的，画在这儿会让整条轨道静层反复作废，见 _hua_kuai_zai）
                 bian = QtGui.QColor(
                     YANSE_ZIMU_BIAN_A if xu % 2 == 0 else YANSE_ZIMU_BIAN_B
                 )
@@ -3926,6 +5269,7 @@ class ShijianZhou(QtWidgets.QWidget):
             qi, zhi = xin_qi, xin_qi + chang
         self._xifu_ms = shun
         self._zimu[tuo["xu"]] = (int(qi), int(zhi), self._zimu[tuo["xu"]][2])
+        self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
         self.update()
 
     def _zimu_tuo_hang(self, tuo, y):
@@ -3952,6 +5296,7 @@ class ShijianZhou(QtWidgets.QWidget):
             self._zimu_tao.extend([0] * (xu + 1 - len(self._zimu_tao)))
         if xin != self._zimu_tao[xu]:
             self._zimu_tao[xu] = xin
+            self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
 
     def _qu_bofang_tupian(self, qu):
         """把当前视图这段波形画成一张图缓存起来（只画一次，之后直接贴）"""
@@ -4144,6 +5489,61 @@ class ShijianZhou(QtWidgets.QWidget):
         huabi.drawLine(x, qu.top(), x, qu.bottom())
         huabi.restore()
 
+    def _hua_kuai_zai(self, huabi, qu):
+        """播放头正压着的那几块：描边换成"正播到这块"的红
+
+        这一圈不能画进静层（见 _jing_tu）：播放的时候播放头每一换块都要重画，
+        塞进静层就是每换块整条轨道重画一遍，白等一百多毫秒。所以挪到实时层，
+        静层那张图一动不动，只重画这几块所在的那一小片。
+        拖动播放头的时候不画：那会儿鼠标说了算，红圈跟着手乱跑没意义。
+        """
+        if self._tuodong or self._kuaisu or not self._zai_kuai:
+            return
+        tiao = self._zimu_qu(qu)
+        hang = self._zimu_hang()
+        hangshu = self._zimu_hang_shu()
+        bian = QtGui.QColor(YANSE_ZIMU_ZAI)
+        huabi.setPen(Qt.NoPen)
+        for xu in self._zai_kuai:
+            if not (0 <= xu < len(self._zimu)) or xu in self._xuan_duo:
+                continue            # 选中的那圈绿框优先，别盖上去
+            qi, zhi, _w = self._zimu[xu]
+            x1 = self._ms_to_x(qi)
+            x2 = self._ms_to_x(zhi)
+            if x2 < x1:
+                x1, x2 = x2, x1
+            if x2 - x1 < 3:
+                x2 = x1 + 3
+            hang_qu = self._zimu_hang_kuang(tiao, hang[xu], hangshu)
+            kuai = QtCore.QRect(
+                x1, hang_qu.top(), max(1, x2 - x1), hang_qu.height()
+            )
+            kuai = kuai.intersected(tiao)
+            if kuai.width() <= 0:
+                continue
+            kuan_bi = 5     # 播放头压着的红框 5 像素（跟选中那圈绿一样粗）
+            if kuan_bi * 2 + 1 > kuai.width():
+                huabi.fillRect(kuai, bian)
+            else:
+                huabi.fillRect(
+                    QtCore.QRect(kuai.left(), kuai.top(), kuai.width(), kuan_bi), bian
+                )
+                huabi.fillRect(
+                    QtCore.QRect(
+                        kuai.left(), kuai.bottom() - kuan_bi + 1, kuai.width(), kuan_bi
+                    ),
+                    bian,
+                )
+                huabi.fillRect(
+                    QtCore.QRect(kuai.left(), kuai.top(), kuan_bi, kuai.height()), bian
+                )
+                huabi.fillRect(
+                    QtCore.QRect(
+                        kuai.right() - kuan_bi + 1, kuai.top(), kuan_bi, kuai.height()
+                    ),
+                    bian,
+                )
+
     def _hua_bofangtou(self, huabi, qu):
         c = _ys()
         x = self._ms_to_x(self._bofangtou)
@@ -4195,10 +5595,52 @@ class ShijianZhou(QtWidgets.QWidget):
         }
         self._xifu_ms = None
 
+    def _fanyie(self, bu):
+        """PgDn / PgUp：前后翻一屏，拿当前屏里头 / 尾那条字幕当对齐点
+
+        往后翻（bu>0）：新视野左边界 = 当前屏最后一条字幕的**起点** —— 翻过去
+        那条贴在新屏最左，后面接着的内容都露出来。
+        往前翻（bu<0）：新视野右边界 = 当前屏第一条字幕的**结束点** —— 块是从
+        起点往右长的，拿起点去顶右边界等于整块掉到屏外面；用结束点顶，那条才
+        完整贴在新屏最右，前面接着的内容都露出来。
+        屏里一条字幕都没有（大段空白）就按一屏滚，不至于按了没反应。
+        只挪视野，播放头不动。
+        """
+        ke = self._keshi_ms()
+        if ke <= 0 or ke >= self._shichang:
+            return
+        jie = self._shi_ms + ke
+        zai = [i for i, (qi, _zhi, _w) in enumerate(self._zimu)
+               if self._shi_ms <= qi < jie]
+        if zai:
+            if bu > 0:
+                xin = self._zimu[zai[-1]][0]
+            else:
+                xin = self._zimu[zai[0]][1] - ke
+        else:
+            xin = self._shi_ms + (ke if bu > 0 else -ke)
+        jiu = self._shi_ms
+        self._shi_ms = int(xin)
+        self._qia_zheng()
+        if self._shi_ms == jiu:
+            return
+        self._huatu_huancun = None
+        self.shitu_bian.emit()
+        self.update()
+
     def keyPressEvent(self, event):
         # 焦点在时间轴上时，左右方向键逐帧移动播放头。时间轴自己拿到焦点后，
         # 按键不会再冒泡到外层窗口，得在这儿接住再喊外面去调帧。
         jian = event.key()
+        # PgUp / PgDn：前后翻一屏（带字幕对齐，见 _fanyie）
+        if jian == Qt.Key_PageUp:
+            self._fanyie(-1)
+            event.accept()
+            return
+        if jian == Qt.Key_PageDown:
+            self._fanyie(1)
+            event.accept()
+            return
         if jian == Qt.Key_Left:
             self.fangxiang_jian.emit(-1)
             event.accept()
@@ -4207,6 +5649,26 @@ class ShijianZhou(QtWidgets.QWidget):
             self.fangxiang_jian.emit(1)
             event.accept()
             return
+        # Ins = 换到下一条字幕（跟字幕列表回车一个手感）
+        if jian == Qt.Key_Insert:
+            self.xiayitiao.emit()
+            event.accept()
+            return
+        # Ctrl+A / Ctrl+C / Ctrl+V：全选整条轨道 / 复制选中的块 / 粘一份到下面一行
+        if event.modifiers() & Qt.ControlModifier:
+            if jian == Qt.Key_A:
+                self.quan_xuan_kuai()
+                event.accept()
+                return
+            if jian == Qt.Key_C:
+                self.fuzhi_kuai.emit()
+                event.accept()
+                return
+            if jian == Qt.Key_V:
+                self.zhantie_kuai.emit()
+                event.accept()
+                return
+        # 回车不在这儿接：让它冒泡到窗口那边（回车 = 建一条新字幕块）
         super().keyPressEvent(event)
 
     def mousePressEvent(self, event):
@@ -4257,18 +5719,17 @@ class ShijianZhou(QtWidgets.QWidget):
             # 跟别人的软件一样，播放头只认时间刻度。选中照旧不动。
             if y <= self.CHIDU_GAO:
                 self._tuodong = True
+                self.tuo_kaishi.emit()      # 先跟外面说一声：鼠标接管播放头了
                 ms = self._x_to_ms(x)
                 self._bofangtou = max(0, min(int(ms), self._shichang or int(ms)))
                 self.tiaozheng.emit(int(ms))
                 self.update()
                 event.accept()
                 return
-            # 其它空白（字幕带的空处、下面波形那一片）：不动播放头，
-            # 点空白 = 把选中清掉。
-            if self._xuan_duo:
-                self._xuan_ze_dan(-1)
-                self.xuan_zhong.emit(-1)
-                self.update()
+            # 其它空白（字幕带的空处、下面波形那一片）：不动播放头。
+            # 按住拖 = 拉一个框框选字幕块（照 ARC）；原地松手（没拖）= 清空选中。
+            self._kuang = {"x0": x, "y0": y, "x1": x, "y1": y, "dong": False}
+            self._xuanfu_zimu = None
             event.accept()
             return
         super().mousePressEvent(event)
@@ -4305,10 +5766,14 @@ class ShijianZhou(QtWidgets.QWidget):
             # 拖播放头：本地先按鼠标位置画（不吸附帧格，跟着手走），
             # 再把位置告诉外面去定位视频画面。拖动期间外面的回写会被
             # shezhi_bofangtou 挡掉，所以播放头不会被拉回去。
+            # 只擦播放头扫过的那一条窄带（别整条重画 —— 波形加所有字幕块
+            # 每挪一个像素画一遍，就是拖起来卡的原因）。
             ms = self._x_to_ms(event.pos().x(), xifu=False)
-            self._bofangtou = max(0, min(int(ms), self._shichang or int(ms)))
+            self._nuo_bofangtou(ms, gensui=False)
             self.tiaozheng.emit(int(ms))
-            self.update()
+        elif self._kuang is not None:
+            # 正在空白处拉框选
+            self._kuang_dao(event.pos().x(), event.pos().y())
         else:
             # 光标提示：块左右边缘 = 左右拉伸（拖长短）、字幕带下边缘 =
             # 上下拉伸（拖高度）、波形左上角小把手 = 上下拉伸（调振幅）、
@@ -4371,10 +5836,91 @@ class ShijianZhou(QtWidgets.QWidget):
                 self._tuodong = False
                 ms = self._x_to_ms(event.pos().x())
                 self._bofangtou = max(0, min(int(ms), self._shichang or int(ms)))
-                self.tiaozheng.emit(int(ms))
+                self.tuo_jieshu.emit()       # 先跟外面说一声：手松了
+                self.tiaozheng.emit(int(ms))  # 这一下才真定位（画面 + 音频）
                 self.update()
             self._tuodong = False
+            self._kuang_fang()
         super().mouseReleaseEvent(event)
+
+    def _kuang_dao(self, x, y):
+        """拉框选中：起点到鼠标之间那个矩形，四个方向都能拉
+
+        照 ARC：拖的过程中**碰到就选中**，不用等松手 —— 框拉到哪儿，
+        被框压住的块当场就亮起来，往回缩也会当场取消。
+        """
+        k = self._kuang
+        if k is None:
+            return
+        k["x1"], k["y1"] = x, y
+        if not k["dong"] and (
+            abs(k["x1"] - k["x0"]) > self.KUANG_DONG_PX
+            or abs(k["y1"] - k["y0"]) > self.KUANG_DONG_PX
+        ):
+            # 拖过几个像素才算框选（手抖一下不算）
+            k["dong"] = True
+            self.setCursor(Qt.CrossCursor)
+        if k["dong"]:
+            ming = self._kuang_ming_zhong()
+            if ming != self._xuan_duo:
+                # 只有"框到的块变了"才重设选中并通知外面：每挪一个像素都
+                # 去刷一遍字幕列表没必要，那一批本来就是同一次选择
+                self._xuan_duo = list(ming)
+                self._xuan_zhong = ming[-1] if ming else -1
+                self._miao_dian = ming[-1] if ming else None
+                self.kuang_xuan.emit(list(ming))
+        self.update()
+
+    def _kuang_ju(self):
+        """选框的像素矩形（起点终点对角，不分成谁大谁小）"""
+        k = self._kuang
+        if k is None:
+            return QtCore.QRect()
+        return QtCore.QRect(
+            QtCore.QPoint(min(k["x0"], k["x1"]), min(k["y0"], k["y1"])),
+            QtCore.QPoint(max(k["x0"], k["x1"]), max(k["y0"], k["y1"])),
+        )
+
+    def _kuang_ming_zhong(self):
+        """框套住了哪几块（按屏幕上块的像素矩形相交算，跨行也能框）"""
+        if self._kuang is None or not self._zimu:
+            return []
+        ju = self._kuang_ju()
+        qu = self._guidao_qu()
+        tiao = self._zimu_qu(qu)
+        hang = self._zimu_hang()
+        hangshu = self._zimu_hang_shu()
+        ming = []
+        for xu in range(len(self._zimu)):
+            hang_qu = self._zimu_hang_kuang(tiao, hang[xu], hangshu)
+            qi, zhi, _w = self._zimu[xu]
+            x1 = self._ms_to_x(qi)
+            x2 = self._ms_to_x(zhi)
+            if x2 < x1:
+                x1, x2 = x2, x1
+            if x2 - x1 < 3:
+                x2 = x1 + 3
+            kuai = QtCore.QRect(
+                x1, hang_qu.top(), max(1, x2 - x1), hang_qu.height()
+            )
+            if ju.intersects(kuai):
+                ming.append(xu)
+        return ming
+
+    def _kuang_fang(self):
+        """松手：框选结果按拖动中实时选好的定下（没拖过 = 就是点了一下空白）"""
+        if self._kuang is None:
+            return
+        dong = self._kuang["dong"]
+        self._kuang = None
+        self.setCursor(Qt.PointingHandCursor)
+        if dong:
+            return          # 选谁在拖动中已经实时选好了，这儿不再动
+        # 没拖（就是点了一下空白）：清空选中
+        if self._xuan_duo or self._xuan_zhong >= 0:
+            self._xuan_ze_dan(-1)
+            self.xuan_zhong.emit(-1)
+        self.update()
 
     def contextMenuEvent(self, event):
         """右键字幕块：合并 / 删除（只动选中的那几块）"""
@@ -4530,6 +6076,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.zhengzai_bofang = False
         self.duqu = None
         self.bo_xiancheng = None
+        # 播放内核：解码 / 声音 / 定位 / 变速 / 时钟全归 mpv
+        self.mpv = MpvBofang(self)
+        self._daowei_bao = False     # 结尾这件事只报一次
+        self.tuili_qu = None         # 跟随播放做推理时那一路取帧（只喂模型）
 
         # 推理 / 硬字幕提取
         self.chuliqi = None          # ZhenChuli：单帧处理
@@ -4551,9 +6101,20 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 那一帧一回来就把播放头往回拽 —— 于是播放头在"新位置"和"旧位置"
         # 之间来回蹦。定着位的时候不认旧帧的回写就不会抖。
         self._mubiao_zhen = None
+        # 上次已经让读取线程跳过去的帧号：同一个帧号不重复跳（拖播放头时省事）
+        self._shang_ci_tiaozheng_zhen = None
+        # 鼠标是不是正按着拖播放头（时间轴刻度尺 / 进度条）
+        self._tuo_bt_zhong = False
+        # 拖动期间攒着的最新帧号：等节拍到点才发给 mpv（见 _fa_tuo_dingwei）
+        self._tuo_dingwei_zhen = None
         # 「只播当前字幕块」要播到哪停：值 = 块尾毫秒；None = 一路播下去
         self._bo_dao_ms = None
         self._zimu_tiao_wen = None   # 字幕条现在显示的是哪句话（避免每帧重设）
+        # 撤销 / 重做（照 AEG）：一步存一整版字幕的快照，Ctrl+Z 往回退、Ctrl+Y 再往前。
+        # 栈里的元素 = (说明, 快照, 动作类别, 时刻)；快照 = (字幕表, 字段表, 选中行)。
+        self._chexiao_zhan = []
+        self._chongzuo_zhan = []
+        self._chexiao_zhong = False  # 正在撤销 / 重做：这期间的写盘别再重复记账
         self.zimu_wenjian = ""       # 当前字幕文件（打开 / 另存过就是它）
         self.zimu_geshi = ""         # "srt" / "ass"，决定存回去用哪种格式
         # 自动保存 / 自动备份（照 AEG 那套）：
@@ -4573,6 +6134,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._zimu_hua_ji = None      # (原结构, 基准分辨率, 样式表) 读一次存着
         self._zimu_pei_ji = []        # 每条配的（样式, 说话人, ASS 原文, 字段）
         self._zimu_fu_ji = []         # 每条的字段表（原 ASS 的 + 编辑区上方改过的）
+        self._fu_wai = {}             # 外面直接指定字段的行（粘贴进来的那种）
+                                      # 键 = tuple(起, 止, 文字)
         # 画面区高度：上半栏按画面比例贴着来，上下不留黑边（省出来的给时间轴）。
         # _shang_ci_he 存上次算过的（画面区宽, 画面原始尺寸），变了才主动重调；
         # 改分栏这个动作一律延到下一轮事件循环，不在 resize 里直接动（会打架）。
@@ -4583,18 +6146,23 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._he_jishi.setSingleShot(True)
         self._he_jishi.timeout.connect(self._shishi_he_gao)
 
-        # 主线程定时取"最新一帧"来画（约 60Hz）；取帧线程不主动推大图，
-        # 否则事件队列会越堆越长，帧率掉一半还越来越延迟。
+        # 定时处理 mpv 事件及片尾检测；播放头等新视频帧实际渲染后再更新。
         self.xianshi_dingshi = QtCore.QTimer(self)
         self.xianshi_dingshi.setInterval(16)
         self.xianshi_dingshi.timeout.connect(self._qu_zhen_xianshi)
 
+        # 拖播放头：按 TUO_SEEK_JIAN_GE_MS 的节拍把最新位置交给定位队列
+        # —— 一次只让一发 seek 在飞，落地了才发下一发（见 _fa_tuo_dingwei）
+        self.tuo_dingshi = QtCore.QTimer(self)
+        self.tuo_dingshi.setInterval(TUO_SEEK_JIAN_GE_MS)
+        self.tuo_dingshi.timeout.connect(self._fa_tuo_dingwei)
+
+        # 声音也归 mpv：这里留个代理，外面还是照老样子调 setVolume / play /
+        # pause / stop / setPlaybackRate，实际都转到 mpv 上
         self.yinpin = None
-        if _YOU_YINPIN:
-            self.yinpin = QMediaPlayer(self)
-            self.yinpin.setVolume(
-                0 if JINGYIN else int(MO_REN_YINLIANG)
-            )
+        if self.mpv.h is not None:
+            self.yinpin = _YinpinDaiLi(self.mpv)
+            self.yinpin.setVolume(0 if JINGYIN else int(MO_REN_YINLIANG))
 
         # 「时间轴」和「字幕列表」谁在下面（右键点这两块能切）。
         # 上次切过就按上次的来，头一回默认时间轴在下（打轴的摆法）。
@@ -4610,6 +6178,20 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._ye_bili = {}
 
         self._jian_ui()
+
+        # 两个界面开关（照 AEG / ARC）：
+        #   选中字幕时画面跟着跳 = 在字幕列表里点一条，画面要不要跟过去
+        #   时间轴实时滚动 = 播放时视图跟着播放头滚，还是播放头自己在轴上走
+        self._gen_tiao = self._du_kaiguan(JIEMIAN_GEN_TIAO, True)
+        self._shishi_gun = self._du_kaiguan(JIEMIAN_SHISHI_GUN, False)
+        self.shijianzhou.shezhi_shishi_gun(self._shishi_gun)
+        for ming in ("bianji_mianban", "zimu_mianban"):
+            mian = getattr(self, ming, None)
+            if mian is not None and hasattr(mian, "shezhi_zidong_tiao"):
+                mian.shezhi_zidong_tiao(self._gen_tiao)
+        self.bianji_mianban.gongjulan.shezhi_kaiguan(
+            self._gen_tiao, self._shishi_gun
+        )
 
         # 你亲手拖过上下大分栏 -> 记下来，以后不再自动贴合画面比例（听你的）
         self.shang_xia.splitterMoved.connect(self._shangxia_dong_le)
@@ -4753,6 +6335,34 @@ class VideoWorkDialog(QtWidgets.QDialog):
             jian.activated.connect(lambda h=hao: self._tao_caowei(h))
             self.caowei_jian.append(jian)
 
+        # Ctrl+R = 选择、Ctrl+F = 查找、Ctrl+H = 替换（照 AEG 那三个窗口）。
+        # 都是非模态窗口（show 不是 exec）：开着照样能播放、拖时间轴、改字幕。
+        # 同样只在本窗口生效，主界面那批快捷键打开工作台时已经降级了。
+        self.sousuo_jian = {}
+        for jian_ming, na in (
+            ("Ctrl+R", "xuan"),
+            ("Ctrl+F", "zhao"),
+            ("Ctrl+H", "huan"),
+        ):
+            jian = QtWidgets.QShortcut(QtGui.QKeySequence(jian_ming), self)
+            jian.setContext(Qt.WindowShortcut)
+            jian.activated.connect(lambda n=na: self._kai_sousuo(n))
+            self.sousuo_jian[na] = jian
+
+        # Ctrl+Z = 撤销、Ctrl+Y = 重做（照 AEG 那套：一步一整版字幕快照）。
+        # 焦点在输入框里时让给输入框自己（那儿 Ctrl+Z 该撤文字，不该撤字幕）。
+        # 同样只在本窗口生效，主界面那批快捷键打开工作台时已经降级了。
+        self.chexiao_jian = QtWidgets.QShortcut(
+            QtGui.QKeySequence("Ctrl+Z"), self
+        )
+        self.chexiao_jian.setContext(Qt.WindowShortcut)
+        self.chexiao_jian.activated.connect(self._chexiao)
+        self.chongzuo_jian = QtWidgets.QShortcut(
+            QtGui.QKeySequence("Ctrl+Y"), self
+        )
+        self.chongzuo_jian.setContext(Qt.WindowShortcut)
+        self.chongzuo_jian.activated.connect(self._chongzuo)
+
     # --------------------------------------------------------------
     # 界面
     # --------------------------------------------------------------
@@ -4841,6 +6451,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if chi_cun:
             self.shang_xia.setSizes(shang_chi)
             ce.setSizes(ce_chi)
+        # 列表铺在窗口下方时，把「字幕列表 + 条数」那行收掉（照 AEG 顶格显示）
+        ce.shezhi_liebiao_dingge(self._liebiao_zai_xia)
 
     def _qiehuan_weizhi(self):
         """把「时间轴」和「字幕列表」换个位置，并把这次的选择记下来"""
@@ -4953,6 +6565,59 @@ class VideoWorkDialog(QtWidgets.QDialog):
         except Exception as cuowu:  # noqa
             logger.warning(f"视频工作台：记界面摆放失败 {cuowu}")
 
+    def _jian_hang_caidan(self):
+        """字幕列表右键里那批「整行编辑」（照 AEG 的网格右键菜单）
+
+        action 只建一份长住：右键菜单挂一遍，字幕列表控件上也挂一遍 —— 挂
+        控件是为了让快捷键只在焦点落在列表上时才生效（挂窗口会跟编辑框自己
+        的 Ctrl+C / Ctrl+V 抢键），所以在列表里直接按也一样管用。
+        """
+        biao = self.bianji_mianban.biao
+        ding = [
+            ("插入(之前)", "Alt+J", lambda _=False: self._hang_charu(zai_qian=True)),
+            ("插入(之后)", "", lambda _=False: self._hang_charu(zai_qian=False)),
+            ("以视频时间插入(之前)", "",
+             lambda _=False: self._hang_charu_shipin(zai_qian=True)),
+            ("以视频时间插入(之后)", "Ctrl+K",
+             lambda _=False: self._hang_charu_shipin(zai_qian=False)),
+            None,
+            ("重复行", "Ctrl+L", lambda _=False: self._hang_fuzhi()),
+            ("以当前帧前分割行", "",
+             lambda _=False: self._hang_qiege(xiang_hou=False)),
+            ("以当前帧后分割行", "Ctrl+D",
+             lambda _=False: self._hang_qiege(xiang_hou=True)),
+            None,
+            ("互换行", "", lambda _=False: self._hang_huhuan()),
+            ("合并(连接)", "", lambda _=False: self._shoudao_zimu_hebing()),
+            ("合并(保留首行)", "",
+             lambda _=False: self._shoudao_zimu_hebing(liu_shou_hang=True)),
+            None,
+            ("使时间连续(更改开始时间)", "",
+             lambda _=False: self._hang_shijian_lianxu(gai_qi=True)),
+            ("使时间连续(更改结束时间)", "",
+             lambda _=False: self._hang_shijian_lianxu(gai_qi=False)),
+            ("重组行", "", lambda _=False: self._hang_chongzu()),
+            None,
+            ("剪切行", "Ctrl+X", lambda _=False: self._hang_jianqie(shan=True)),
+            ("复制行", "Ctrl+C", lambda _=False: self._hang_jianqie(shan=False)),
+            ("粘贴行", "Ctrl+V", lambda _=False: self._hang_zhantie()),
+            None,
+            ("删除行", "Ctrl+Delete", lambda _=False: self._shoudao_zimu_shanchu()),
+        ]
+        self._hang_actions = []
+        for xiang in ding:
+            if xiang is None:
+                self._hang_actions.append(None)     # None = 菜单里那条分隔线
+                continue
+            wenzi, jian, dong = xiang
+            a = QtWidgets.QAction(wenzi, self)
+            if jian:
+                a.setShortcut(jian)
+                a.setShortcutContext(Qt.WidgetShortcut)
+            a.triggered.connect(dong)
+            biao.addAction(a)
+            self._hang_actions.append(a)
+
     def _gua_youjian_caidan(self):
         """给这两块挂右键菜单
 
@@ -4970,6 +6635,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         for w in (self.shijianzhou_kuang, self.shijianzhou):
             w.setContextMenuPolicy(Qt.CustomContextMenu)
             w.customContextMenuRequested.connect(self._tan_weizhi_caidan)
+        self._jian_hang_caidan()
 
     def _tan_liebiao_caidan(self, kuang, pos):
         """字幕列表右键：批量加「」+ 位置切换
@@ -4988,6 +6654,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
             if 0 <= hang < len(zimu) and hang not in mu:
                 mu = [hang]
         mu = [i for i in mu if 0 <= i < len(zimu)]
+        # 这轮右键要处理哪几行：菜单里的动作触发时来这儿取（快捷键触发时
+        # 这儿是 None，回去拿列表里真正选中的那几行）
+        self._youjian_mu = list(mu)
 
         caidan = QtWidgets.QMenu(self)
         if mu:
@@ -4999,8 +6668,16 @@ class VideoWorkDialog(QtWidgets.QDialog):
             wu = caidan.addAction("先选中要处理的字幕")
             wu.setEnabled(False)
         caidan.addSeparator()
+        # AEG 那套整行编辑（插入 / 重复 / 分割 / 合并 / 时间 / 剪贴板 …）
+        for a in self._hang_actions:
+            if a is None:
+                caidan.addSeparator()
+            else:
+                caidan.addAction(a)
+        caidan.addSeparator()
         zhou, lie = self._tian_weizhi_caidan(caidan)
         dian = caidan.exec_(QtGui.QCursor.pos())
+        self._youjian_mu = None          # 菜单关了，之后只认列表里选中的
         self._caidan_dian_weizhi(dian, zhou, lie)
 
     def _caidan_dian_weizhi(self, dian, zhou, lie):
@@ -5044,6 +6721,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
 
         # ---- 画面（顶上不留标题栏，直接顶格） ----
         self.huamian = HuamianQu()
+        self.huamian.shezhi_mpv(self.mpv)      # 视频由 mpv 渲染进这块画布
+        # mpv 每真正画出一帧，播放头和字幕才一起跟到那一帧；这样时间轴不会
+        # 按 mpv 的时钟先走，而画面还停在上一帧。
+        self.huamian.shezhi_huan_zhen_hui(self._mpv_huan_zhen)
         self.huamian.chicun_bian.connect(self._tongbu_suo_dao)
         self.huamian.chicun_bian.connect(self._he_huamian_gao)
         bu.addWidget(self.huamian, 1)
@@ -5067,6 +6748,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 上排：整条片子的进度（刻度 + 指针），点 / 拖定位
         self.jindu_tiao = ShipinJinduTiao()
         self.jindu_tiao.dingwei.connect(self._shoudao_tiaozheng)
+        self.jindu_tiao.tuo_kaishi.connect(self._tuo_bofangtou_kaishi)
+        self.jindu_tiao.tuo_jieshu.connect(self._tuo_bofangtou_wancheng)
         di_zhong.addWidget(self.jindu_tiao)
 
         # 下排：小按钮 + 当前时间 - 帧号（照 Aegisub：按钮在最左，时间紧跟其后）
@@ -5111,6 +6794,25 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shijian_dangqian.setToolTip("当前时间 - 当前帧号")
         di_bu.addWidget(self.shijian_dangqian)
         di_bu.addStretch(1)
+
+        self.a_dakai_zimu = QtWidgets.QPushButton("打开字幕")
+        self.a_dakai_zimu.setStyleSheet(_ys_ci_anniu_xiao())
+        self.a_dakai_zimu.setCursor(Qt.PointingHandCursor)
+        self.a_dakai_zimu.setToolTip(
+            "载入一份 SRT / ASS 字幕到时间轴上（打轴、调轴、看轴）"
+        )
+        self.a_dakai_zimu.clicked.connect(self._dakai_zimu_wenjian)
+        di_bu.addWidget(self.a_dakai_zimu)
+
+        self.a_cun_zimu = QtWidgets.QPushButton("保存字幕")
+        self.a_cun_zimu.setStyleSheet(_ys_ci_anniu_xiao())
+        self.a_cun_zimu.setCursor(Qt.PointingHandCursor)
+        self.a_cun_zimu.setToolTip(
+            "另存为（弹框选路径和格式）；Ctrl+S 直接存回打开过的那个文件"
+        )
+        self.a_cun_zimu.clicked.connect(self._ling_cun_zimu)
+        di_bu.addWidget(self.a_cun_zimu)
+        di_bu.addSpacing(6)
 
         self.a_zimu_tiao = QtWidgets.QCheckBox("字幕条")
         self.a_zimu_tiao.setToolTip("显示 / 隐藏画面下方那条独立字幕")
@@ -5283,33 +6985,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
         bu.setContentsMargins(0, 0, 0, 0)
         bu.setSpacing(0)
 
-        tiao = QtWidgets.QFrame()
-        tiao.setObjectName("YsgTimelineBar")
-        tiao_bu = QtWidgets.QHBoxLayout(tiao)
-        tiao_bu.setContentsMargins(10, 6, 10, 6)
-        tiao_bu.setSpacing(6)
-
-        self.a_dakai_zimu = QtWidgets.QPushButton("打开字幕")
-        self.a_dakai_zimu.setStyleSheet(_ys_ci_anniu())
-        self.a_dakai_zimu.setToolTip(
-            "载入一份 SRT / ASS 字幕到时间轴上（打轴、调轴、看轴）"
-        )
-        self.a_dakai_zimu.clicked.connect(self._dakai_zimu_wenjian)
-        tiao_bu.addWidget(self.a_dakai_zimu)
-
-        self.a_cun_zimu = QtWidgets.QPushButton("保存字幕")
-        self.a_cun_zimu.setStyleSheet(_ys_ci_anniu())
-        self.a_cun_zimu.setToolTip(
-            "另存为（弹框选路径和格式）；Ctrl+S 直接存回打开过的那个文件"
-        )
-        self.a_cun_zimu.clicked.connect(self._ling_cun_zimu)
-        tiao_bu.addWidget(self.a_cun_zimu)
-        tiao_bu.addStretch(1)
-
-        bu.addWidget(tiao, 0)
-
         self.shijianzhou = ShijianZhou()
         self.shijianzhou.tiaozheng.connect(self._shoudao_tiaozheng)
+        self.shijianzhou.tuo_kaishi.connect(self._tuo_bofangtou_kaishi)
+        self.shijianzhou.tuo_jieshu.connect(self._tuo_bofangtou_wancheng)
         self.shijianzhou.xuan_zhong.connect(self._shoudao_xuan_zhong_zimu)
         self.shijianzhou.zimu_tuo.connect(self._shoudao_zimu_tuo)
         self.shijianzhou.shanchu_zimu.connect(self._shoudao_zimu_shanchu)
@@ -5317,6 +6996,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shijianzhou.shitu_bian.connect(self._shuaxin_shitu_tiao)
         self.shijianzhou.fangxiang_jian.connect(self._fangxiangjian_tiaobu)
         self.shijianzhou.zimu_nuo.connect(self._shoudao_zimu_nuo)
+        self.shijianzhou.xiayitiao.connect(self._shoudao_xiayitiao)
+        self.shijianzhou.fuzhi_kuai.connect(self._shoudao_kuai_fuzhi)
+        self.shijianzhou.zhantie_kuai.connect(self._shoudao_kuai_zhantie)
+        self.shijianzhou.kuang_xuan.connect(self._shoudao_kuang_xuan_kuai)
         # 时间轴能拿键盘焦点：点它之后空格 / 方向键 / 回车才落到这儿
         self.shijianzhou.setFocusPolicy(Qt.StrongFocus)
         bu.addWidget(self.shijianzhou, 1)
@@ -5385,14 +7068,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._shuaxin_shitu_tiao()
 
         if self.yinpin is not None:
-            self.yinpin.setMedia(QMediaContent(QtCore.QUrl.fromLocalFile(lujing)))
             self.yinpin.setVolume(
                 0 if JINGYIN else int(self.yinliang_tiao.value())
             )
 
         self._qidong_duqu()
-        if self.yinpin is not None:
-            self.yinpin.pause()
 
         # 后台解音轨画波形
         self.shijianzhou.zhunbei_bofang(
@@ -5413,6 +7093,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
             lujing, self.fps, self.zhen_kuan, self.zhen_gao, self.zong_zhen
         )
         self.zimu_mianban.qingkong()
+        self._chexiao_qingkong()
         self.zimu_mianban.shezhi_shichang(self.shichang_ms)
         self.shijianzhou.qingkong_zimu()
         self._shezhi_bianji_zimu([])
@@ -5432,6 +7113,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
 
     def _guanbi_video(self):
         self.xianshi_dingshi.stop()
+        self.tuo_dingshi.stop()
+        self._tuo_bt_zhong = False
+        self._tuo_dingwei_zhen = None
         # 模型还在后台加载：标记取消，加载完别再去碰已经清空的界面
         if self._jiazai_xc is not None and self._jiazai_xc.isRunning():
             self._jiazai_quxiao = True
@@ -5442,22 +7126,21 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 self.yunsuan = None
         self.chuliqi = None
         self.yunsuan_moshi = ""
-        if self.duqu is not None:
-            self.duqu.zhen_hook = None
+        self._tingzhi_tuili_qu()
         if self.duqu is not None:
             self.duqu.tingzhi()
             self.duqu = None
         if self.bo_xiancheng is not None:
             self.bo_xiancheng.tingzhi()
             self.bo_xiancheng = None
-        if self.yinpin is not None:
-            self.yinpin.stop()
+        self.mpv.zanting()
         self.zhengzai_bofang = False
         self.huamian.qingkong()
         self.huamian.qingkong_kuang()
         self.huamian.tingzhi_kuang_xuan()
         # 换片子 / 关窗口：字幕块和画面下方那条都清掉
         self.zimu_mianban.qingkong()
+        self._chexiao_qingkong()
         self.shijianzhou.qingkong_zimu()
         self._shezhi_bianji_zimu([])
         self.zimu_wenjian = ""
@@ -5468,6 +7151,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._zimu_hua_ji = None
         self._zimu_pei_ji = []
         self._zimu_fu_ji = []
+        self._fu_wai = {}
         self.huamian.shezhi_zimu([])
         self._bofang_ms = 0
         self._mubiao_zhen = None
@@ -5490,13 +7174,22 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self.shijianzhou.shezhi_bo_tishi("")
 
     def _qidong_duqu(self):
-        self.duqu = _ZhenDuQu(self.lujing, self.fps, self)
-        self.duqu.daowei.connect(self._bofang_daowei)
-        self.duqu.shezhi_beisu(self.beisu)
-        self._tongbu_suo_dao()      # 让线程按当前窗口大小缩放
-        self.duqu.start()
-        self.duqu.tiaozheng(0)      # 先把第一帧显示出来
-        self.xianshi_dingshi.start()
+        """把片子交给 mpv：解码 / 声音 / 定位 / 时钟全归它"""
+        if self.mpv.h is None:
+            logger.error(
+                f"视频工作台：没有播放内核，播不了（{_MPV_JIAZAI_CUO}）"
+            )
+            return
+        # 渲染上下文必须先建好，不然后面 mpv 会自己去开窗口
+        self.huamian.zhunbei_mpv()
+        if self.mpv.dakai(self.lujing):
+            self.mpv.fps = float(self.fps or 30.0)
+            self.mpv.shezhi_beisu(self.beisu)
+            self.duqu = self.mpv      # 外面那些 if self.duqu is None 的判断照旧好使
+            self._daowei_bao = False
+            self.xianshi_dingshi.start()
+        else:
+            logger.error(f"视频工作台：播放内核载入失败 {self.lujing}")
 
     def _tongbu_suo_dao(self):
         """把画面区该显示的尺寸告诉取帧线程（缩放由线程做，主线程只负责贴图）"""
@@ -5563,12 +7256,22 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._he_sile = (mubiao, xian) if xian == da_xiao[0] else None
 
     def _qu_zhen_xianshi(self):
-        """定时来取"最新一帧"来显示（取不到说明没新帧，什么都不做）"""
-        if self.duqu is None:
+        """定时处理 mpv 事件及片尾检测；播放头由新帧回调更新。"""
+        if self.mpv.h is None:
             return
-        zui = self.duqu.qu_zui_xin()
-        if zui is not None:
-            self._shoudao_zhen(zui[0], zui[1])
+        self.mpv.pai_shijian()
+        # 播到结尾：位置得真在尾巴上才算。刚按播放时要是从结尾跳回开头，
+        # mpv 的 eof-reached 会晚一拍才翻过来，那会儿位置已经在开头了 ——
+        # 拿位置一起卡住，就不会一按播放又被判成"已经播完"。
+        if (
+            self.zhengzai_bofang
+            and self.mpv.daowei_ma()
+            and self.shichang_ms > 0
+            and self.mpv.shijian_ms() >= self.shichang_ms - 300
+        ):
+            self._daowei_bao = True
+            self._bofang_daowei()
+            return
 
     # --------------------------------------------------------------
     # 播放控制
@@ -5605,6 +7308,24 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if zhi is None:
             return True
         return str(zhi).strip().lower() in ("1", "true", "yes", "on")
+
+    def _du_kaiguan(self, jian, moren):
+        """读一个界面开关（存 gongzuotai.ini，跟字幕条开关一处）；头一回用 moren"""
+        try:
+            zhi = self._weizhi_peizhi.value(jian, None)
+        except Exception:  # noqa
+            return bool(moren)
+        if zhi is None:
+            return bool(moren)
+        return str(zhi).strip().lower() in ("1", "true", "yes", "on")
+
+    def _cun_kaiguan(self, jian, kai):
+        """存一个界面开关"""
+        try:
+            self._weizhi_peizhi.setValue(jian, bool(kai))
+            self._weizhi_peizhi.sync()
+        except Exception as cuowu:  # noqa
+            logger.error(f"视频工作台：记录开关失败 {cuowu}")
 
     def _qiehuan_zimu_tiao(self, kai):
         """显示 / 隐藏画面下方那条独立字幕；关了就收掉那块地方，视频直接贴着底栏"""
@@ -5654,26 +7375,28 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._shoudao_tiaozheng(qi)
         self._bofang()
 
+    def _shezhi_zai_bofang(self, zai):
+        """改「在不在播」并告诉时间轴 —— 实时滚动那个开关只在播的时候生效"""
+        self.zhengzai_bofang = bool(zai)
+        zhou = getattr(self, "shijianzhou", None)
+        if zhou is not None:
+            zhou.shezhi_zai_bofang(bool(zai))
+
     def _bofang(self):
         if self.duqu is None:
             return
         if self.shichang_ms > 0 and self._dangqian_ms() >= self.shichang_ms - 1:
             self._tiaozheng_zhen(0)
         self._mubiao_zhen = None    # 播放中播放头就该跟着帧走，不设守卫
-        self.zhengzai_bofang = True
+        self._shezhi_zai_bofang(True)
+        self._daowei_bao = False
         _shezhi_tubiao(self.a_bofang, QtWidgets.QStyle.SP_MediaPause)
-        if self.yinpin is not None:
-            self.yinpin.setPosition(self._dangqian_ms())
-            self.yinpin.play()
-        self.duqu.jixu()
+        self.mpv.jixu()
 
     def _zanting(self):
-        self.zhengzai_bofang = False
+        self._shezhi_zai_bofang(False)
         _shezhi_tubiao(self.a_bofang, QtWidgets.QStyle.SP_MediaPlay)
-        if self.duqu is not None:
-            self.duqu.zanting()
-        if self.yinpin is not None:
-            self.yinpin.pause()
+        self.mpv.zanting()
 
     def _tiaobu_zhen(self, zhen_shu):
         """按钮上的上一帧 / 下一帧：点一下走一帧"""
@@ -5722,11 +7445,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
         else:
             bu = 20
 
-        # 选中了字幕块：方向键挪块（帧级别），不挪播放头
-        if self.shijianzhou.xuan_zhong_liebiao():
-            self.shijianzhou.nuo_xuan_zhong(fangxiang * bu)
-            return
-
+        # 方向键永远挪播放头（选中字幕块也一样）：打轴时是"选中块 + 一帧帧挪
+        # 播放头看硬字幕对不对齐"，对不上就用 E / R 把块的起止帧拉过来。
+        # 挪块那套（nuo_xuan_zhong）在这条路上不用了。
         mubiao = self._zou_dao_ms + fangxiang * bu * (1000.0 / self.fps)
         mubiao = max(0.0, min(float(self.shichang_ms), mubiao))
         zhen = int(round(mubiao / 1000.0 * self.fps))
@@ -5773,27 +7494,116 @@ class VideoWorkDialog(QtWidgets.QDialog):
         zhen = int(round(mubiao_ms / 1000.0 * self.fps))
         self._tiaozheng_zhen(max(0, min(self.zong_zhen - 1, zhen)))
 
-    def _tiaozheng_zhen(self, zhen_hao):
-        """定位到第 zhen_hao 帧；返回吸附到该帧后的毫秒数"""
+    def _tiaozheng_zhen(self, zhen_hao, yinpin=True, jingque=None):
+        """定位到第 zhen_hao 帧；返回吸附到该帧后的毫秒数
+
+        jingque 不给（None）就看是不是正拖着播放头：
+          · 拖着 -> 只挪界面，定位先攒着，由 _fa_tuo_dingwei 按节拍交给队列；
+          · 别的 -> 立刻交给队列（精确的）。
+        松手那一下会补一发精确的（见 _tuo_bofangtou_wancheng）。
+
+        yinpin 是老接口留下的：以前画面和声音分开，拖播放头时要单独把声音
+        拦住。现在声音也归 mpv，一次 seek 画面和声音一起走，而且拖动时是
+        暂停状态本来就不出声，所以这个参数收下不用。
+        """
         if self.duqu is None:
             return int(self._bofang_ms)
-        self.duqu.tiaozheng(zhen_hao)
-        # 记下"我要的是哪一帧"：等它回来之前，取帧线程递上来的旧帧不许动播放头
-        self._mubiao_zhen = (int(zhen_hao), time.perf_counter())
+        zhen_hao = int(zhen_hao)
+        if jingque is not None:
+            # 点名要精确（松手那一下 / 打轴）：立刻发
+            self.duqu.tiaozheng(zhen_hao, dan_bu=True, jingque=jingque)
+            self._shang_ci_tiaozheng_zhen = zhen_hao
+        elif self._tuo_bt_zhong:
+            # 鼠标正拖着：这儿不发，先攒着。等节拍到点由 _fa_tuo_dingwei 把
+            # 最新那个交给队列（队列一次只放一发在飞，落地了才发下一个）
+            self._tuo_dingwei_zhen = zhen_hao
+        elif zhen_hao != self._shang_ci_tiaozheng_zhen:
+            # 方向键 / 点一下定位：每次真跳，同帧不重复跳
+            self.duqu.tiaozheng(zhen_hao, dan_bu=True, jingque=True)
+            self._shang_ci_tiaozheng_zhen = zhen_hao
+        # 记下"我要的是哪一帧"：等它回来之前，报上来的旧位置不许动播放头
+        self._mubiao_zhen = (zhen_hao, time.perf_counter())
+        # 界面（播放头 / 时间码 / 画面字幕）立刻跟到鼠标位置，不等画面
+        return self._gen_xin_weizhi(zhen_hao)
+
+    def _gen_xin_weizhi(self, zhen_hao):
+        """光把界面（播放头 / 时间码 / 画面字幕）挪到这一帧，不给 mpv 发定位
+
+        mpv 单帧步进那条路用：那一帧是 mpv 自己走的，位置它已经挪了，我们
+        这边跟上就行。
+        """
+        zhen_hao = max(0, min(max(0, self.zong_zhen - 1), int(zhen_hao)))
         ms = int(round(zhen_hao / max(1e-6, self.fps) * 1000))
         self._bofang_ms = ms
         self.shijianzhou.shezhi_bofangtou(ms)
         self.jindu_tiao.shezhi_bofangtou(ms)
         self.shijian_dangqian.setText(_shijian_zhen_wenben(ms, zhen_hao))
-        self._shuaxin_zimu_tiao()
-        if self.yinpin is not None:
-            self.yinpin.setPosition(ms)
+        # hua=False：画面上那层字幕这次不换 —— 播放头/时间码立刻跟到鼠标位置，
+        # 那层等 mpv 真出帧时由 paintGL 换，两边就同一刻出来（见 _shuaxin_zimu_tiao）
+        self._shuaxin_zimu_tiao(hua=False)
         return ms
 
     def _shoudao_tiaozheng(self, ms):
         zhen = int(round(ms / 1000.0 * self.fps))
         zhen = max(0, min(max(0, self.zong_zhen - 1), zhen))
-        self._tiaozheng_zhen(zhen)
+        # 鼠标正拖着播放头：界面立刻跟到鼠标位置（_tiaozheng_zhen 里做），
+        # 给 mpv 的定位则压在 TUO_SEEK_JIAN_GE_MS 的节拍上，一次只发最新的
+        # 那个位置；松手那一下才补一发精确的落到鼠标指着的那一帧。
+        self._tiaozheng_zhen(zhen, yinpin=not self._tuo_bt_zhong)
+
+    def _fa_tuo_dingwei(self):
+        """拖动中的节拍：把攒着的最新位置交给定位队列
+
+        指针一秒能挪上百个位置，一个个发 seek 会把 mpv 淹了。这里按节拍看一
+        眼，每次只把最新那个交出去，中间滑过的位置一律扔掉。交出去之后由
+        MpvBofang 排队 —— 上一发没落地就不发新的，只记最新位置，落地立刻
+        补上（见 MpvBofang._pai_tiaozheng）。都是精确到帧的定位。
+        """
+        if self.duqu is None or not self._tuo_bt_zhong:
+            return
+        zhen_hao = self._tuo_dingwei_zhen
+        self._tuo_dingwei_zhen = None
+        if zhen_hao is None or zhen_hao == self._shang_ci_tiaozheng_zhen:
+            return
+        self.duqu.tiaozheng(zhen_hao, dan_bu=False, jingque=True)
+        self._shang_ci_tiaozheng_zhen = zhen_hao
+
+    # --------------------------------------------------------------
+    # 鼠标拖播放头（时间轴刻度尺 / 视频下方进度条）
+    #   照 Arctime：一按下去，正在播的就立刻停播、声音停；
+    #   拖动过程只让画面跟着刷新（不出声）；松手停在原地，
+    #   要接着看就再按一次播放 —— 不会自动续播。
+    # --------------------------------------------------------------
+    def _tuo_bofangtou_kaishi(self):
+        """鼠标接管播放头：正在播放就立刻停下（画面改由拖动位置驱动）
+
+        拖动期间主线程的活要尽量少：时间轴只画播放头那一小条、字幕列表的
+        上色和滚动先停下 —— 不然鼠标一快，播放头就落在鼠标后头。
+        """
+        self._tuo_bt_zhong = True
+        self._tuo_dingwei_zhen = None
+        self.tuo_dingshi.start()
+        self.shijianzhou.shezhi_kuaisu_hua(True)
+        if self.zhengzai_bofang:
+            self._zanting()
+
+    def _tuo_bofangtou_wancheng(self):
+        """手松了：把最后一发精确落位交给队列，再恢复正常重绘
+
+        松手这一下要落到鼠标指着的那一帧上。队列要是还有一发在飞，就先排
+        上（落地后自动补发，见 MpvBofang._pai_tiaozheng）—— 不硬插进去打断
+        它，省得白解一次。字幕列表拖动期间一直没刷，也跟着补一次。
+        """
+        self._tuo_bt_zhong = False
+        self.tuo_dingshi.stop()
+        self._tuo_dingwei_zhen = None
+        self.shijianzhou.shezhi_kuaisu_hua(False)
+        if self.duqu is not None:
+            zhen = int(round(self._bofang_ms / 1000.0 * max(1e-6, self.fps)))
+            self._tiaozheng_zhen(zhen, jingque=True)
+            self.shijianzhou.shezhi_bofangtou(self._bofang_ms, gensui=False)
+        self.bianji_mianban.shezhi_bofang_ms(self._bofang_ms, False)
+        self.zimu_mianban.shezhi_bofangtou(self._bofang_ms)
 
     def _qiehuan_beisu(self):
         b = self.beisu_kuang.currentData() or 1.0
@@ -5868,27 +7678,46 @@ class VideoWorkDialog(QtWidgets.QDialog):
     # 帧回调
     # --------------------------------------------------------------
     def _shoudao_zhen(self, zhen_rgb, zhen_hao):
+        """外面把整张图塞进来（全片扫描时那一帧）——直接贴上去，画面归它
+
+        平时画面是 mpv 自己渲染的，走不到这儿。
+        """
         tu = _zhen_tu_huan(zhen_rgb)
         self.huamian.shezhi_zhen(tu)
-        # 定位没落地之前送上来的帧是"旧的"：画面照换（总得显示东西），
-        # 但绝不能拿它去回写播放头 —— 一写就是往回跳，看着就是抖。
-        # 只有"正好是刚要求的那一帧"才算定位落地：往前按的时候旧帧比目标小、
-        # 往后按的时候旧帧比目标大，靠比大小判断总有一样判错，所以认帧号相等。
+        ms = int(round(zhen_hao / max(1e-6, self.fps) * 1000))
+        self._geng_xin_bofangtou(ms, zhen_hao)
+
+    def _mpv_huan_zhen(self):
+        """mpv 已渲染新帧：播放时同步播放头，随后同步画面字幕。"""
+        if self.duqu is not None:
+            ms = self.mpv.shijian_ms()
+            if self.zhengzai_bofang and not self._tuo_bt_zhong:
+                zhen = int(round(ms / 1000.0 * max(1e-6, self.fps)))
+                self._geng_xin_bofangtou(ms, zhen, hua=False)
+            self._shuaxin_huamian_zimu(ms)
+
+    def _geng_xin_bofangtou(self, ms, zhen_hao, hua=True):
+        """播放头那一圈（时间轴 / 进度条 / 时间码 / 字幕条）按这个位置刷一遍
+
+        定位刚发出去那会儿报上来的还是旧位置：那会儿不许动播放头，不然
+        播放头会在"新位置"和"旧位置"之间来回蹦，看着就是抖。
+        """
         mu = self._mubiao_zhen
         if mu is not None:
-            if zhen_hao == mu[0]:
+            if abs(int(zhen_hao) - int(mu[0])) <= 1:
                 self._mubiao_zhen = None          # 要的那一帧到了，守卫解除
             elif time.perf_counter() - mu[1] <= DINGWEI_SHOUWEI_MIAO:
                 return                            # 还在等，这次不理会
             else:
                 self._mubiao_zhen = None          # 等太久了（定位失败），别再拦着
-        ms = int(round(zhen_hao / max(1e-6, self.fps) * 1000))
         self._bofang_ms = ms
         self.shijianzhou.shezhi_bofangtou(ms)
         self.jindu_tiao.shezhi_bofangtou(ms)
         self.shijian_dangqian.setText(_shijian_zhen_wenben(ms, zhen_hao))
-        self.zimu_mianban.shezhi_bofangtou(ms)
-        self._shuaxin_zimu_tiao()
+        # 拖播放头的时候不动列表（见 _shuaxin_zimu_tiao 里的说明）
+        if not self._tuo_bt_zhong:
+            self.zimu_mianban.shezhi_bofangtou(ms)
+        self._shuaxin_zimu_tiao(hua=hua)
         # 「只播当前字幕块」：播到块尾就停在这儿（不在播放中就只是清掉残留）
         dao = self._bo_dao_ms
         if dao is not None and ms >= dao:
@@ -5897,16 +7726,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 self._zanting()
 
     def _bofang_daowei(self):
-        self.zhengzai_bofang = False
+        self._shezhi_zai_bofang(False)
         _shezhi_tubiao(self.a_bofang, QtWidgets.QStyle.SP_MediaPlay)
-        if self.yinpin is not None:
-            self.yinpin.pause()
+        self.mpv.zanting()
         logger.info("视频工作台：播放到结尾")
 
     def _dangqian_ms(self):
         if self.duqu is None:
             return 0
-        return int(round(self.duqu.zhen_hao() / max(1e-6, self.fps) * 1000))
+        return self.mpv.shijian_ms()
 
     def _shijian_wenben(self, ms):
         return _shijian_wenben(ms, self.fps)
@@ -5972,6 +7800,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         canyu["leibie_ming"] = leibie_ming
 
         self.zimu_mianban.qingkong()
+        self._chexiao_qingkong()
         self.zimu_mianban.shezhi_shichang(self.shichang_ms)
         self.shijianzhou.qingkong_zimu()
         self._shezhi_bianji_zimu([])
@@ -5989,8 +7818,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self.yunsuan = TuiliXiancheng(self.chuliqi, self)
             self.yunsuan.jieguo.connect(self._shoudao_tuili_jieguo)
             self.yunsuan.start()
-            if self.duqu is not None:
-                self.duqu.zhen_hook = self._duqu_hook
+            self._qidong_tuili_qu()
             self.shezhi_mianban.zhuangtai_shezhi("跟随播放中…")
             if not self.zhengzai_bofang:
                 self._bofang()
@@ -6075,6 +7903,34 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self._moxing_huancun[yao] = yuan
         return yuan
 
+    def _qidong_tuili_qu(self):
+        """跟随播放做推理：另开一路解码专门喂模型
+
+        画面那一路归 mpv，这一路不掺和：只读原图、不转色、不缩放、不留缓存，
+        跟着 mpv 的播放时间往前跟，别跑到画面前面去。
+        """
+        self._tingzhi_tuili_qu()
+        qu = _ZhenDuQu(self.lujing, self.fps, self)
+        qu.zhi_tuili = True
+        qu.zhen_hook = self._duqu_hook
+        qu.pace_hook = self._tuili_pace_miao
+        self.tuili_qu = qu
+        qu.start()
+        qu.tiaozheng(int(round(self._bofang_ms / 1000.0 * self.fps)))
+        qu.jixu()
+
+    def _tuili_pace_miao(self):
+        """mpv 现在播到第几秒（给喂模型那一路上做节拍用）"""
+        if self.mpv.h is None:
+            return None
+        return self.mpv.shijian_ms() / 1000.0
+
+    def _tingzhi_tuili_qu(self):
+        if self.tuili_qu is not None:
+            self.tuili_qu.zhen_hook = None
+            self.tuili_qu.tingzhi()
+            self.tuili_qu = None
+
     def _duqu_hook(self, zhen_bgr, zhen_hao):
         """取帧线程每读一帧就调这里（跟随播放时把原图丢给推理线程）"""
         if self.yunsuan is None or self.yunsuan_moshi != "gensui":
@@ -6150,16 +8006,18 @@ class VideoWorkDialog(QtWidgets.QDialog):
         """字幕编辑页列表的「样式 / 说话人」两列 + 编辑区上方那排要的字段
 
         原 ASS 里那一行是什么就带什么，编辑区上方改过的（存在 zimu_mianban 里）
-        盖在上面。算出来的这份顺手缓存成 _zimu_pei_ji / _zimu_fu_ji，画画面和
-        填那排工具都直接拿去用。
+        盖在上面，粘贴进来时外面直接指定的（_fu_wai）垫在底下。算出来的这份
+        顺手缓存成 _zimu_pei_ji / _zimu_fu_ji，画画面和填那排工具都直接拿去用。
         """
         pei = self._zimu_pipei(zimu)
         self._zimu_pei_ji = pei
+        wai = getattr(self, "_fu_wai", None) or {}
         fu_men = []
         for i, (yang, shuo, _yuan, fu) in enumerate(pei):
             ge = dict(fu or {})
             ge["yang"] = str(yang or "Default")
             ge["shuo"] = str(shuo or "")
+            ge.update(wai.get(tuple(zimu[i])) or {})
             ge.update(self.zimu_mianban.hang_fu(i))
             fu_men.append(ge)
         self._zimu_fu_ji = fu_men
@@ -6207,11 +8065,27 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._zimu_hua_ji = (jiegou, play, biao)
         return play, biao
 
-    def _shuaxin_huamian_zimu(self):
+    def _huamian_ms(self):
+        """画面上那层字幕按哪个时刻算：一律认 mpv 现在真正显示的那一帧
+
+        拖动 / 左右跳帧的时候画面是 mpv 解出来的，比鼠标位置晚几百毫秒。
+        字幕要是按鼠标位置画，就跑到画面前头去了（看着就是"字幕先切、画面
+        后到"）。跟画面同一个时刻算，画面和字幕就一块儿出来。
+        mpv 还没起来（没开视频）才退回界面上那个位置。
+        """
+        if self.duqu is not None:
+            try:
+                return int(self.mpv.shijian_ms())
+            except Exception:  # noqa
+                pass
+        return int(self._bofang_ms)
+
+    def _shuaxin_huamian_zimu(self, ms=None):
         """把播放头这一刻该显示的字幕塞给画面（样式照 ASS 来的）
 
         画面上该有的就是"播放头现在压着的这几条"，摞在一起的也都画。
         注释行不画；样式 / 边距都认编辑区上方改过的那份。
+        ms 不给就按 mpv 现在显示的那一帧算（见 _huamian_ms）。
         """
         hua = getattr(self, "huamian", None)
         if hua is None:
@@ -6227,7 +8101,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if len(pei) != len(zimu):
             pei = self._zimu_pipei(zimu)
         jizhun, biao = self._ass_geshi_biao()
-        ms = int(self._bofang_ms)
+        ms = int(self._huamian_ms() if ms is None else ms)
         xuan = []
         for i, (qi, zhi, wenben) in enumerate(zimu):
             if not (int(qi) <= ms < max(int(qi) + 1, int(zhi))):
@@ -6284,6 +8158,40 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.bianji_mianban.shezhi_shuo_ming(self._zimu_shuo_ming())
         self.bianji_mianban.shezhi_zimu(zimu, xuan, fu_men)
         self._shuaxin_gongju(zimu, fu_men)
+        self._shuaxin_kuai_yanse(zimu, fu_men)
+
+    def _shuaxin_kuai_yanse(self, zimu=None, fu_men=None):
+        """给时间轴上每块字幕算底色：说话人非空 -> 用它那个样式的主文字色
+
+        说话人为空 / 样式名在样式表里查不到 -> None，时间轴那边用默认蓝。
+        说话人和样式是一起套的（槽位），所以按说话人认就等于按样式认。
+        """
+        if zimu is None:
+            zimu = self.zimu_mianban.zimu_liebiao()
+        if fu_men is None:
+            fu_men = self._zimu_fu_ji
+            if len(fu_men) != len(zimu):
+                fu_men = self._zimu_fujia(zimu)
+        _jizhun, biao = self._ass_geshi_biao()
+        men = []
+        for i in range(len(zimu)):
+            fu = fu_men[i] if i < len(fu_men) else {}
+            men.append(self._kuai_yanse_yise(fu, biao))
+        self.shijianzhou.shezhi_kuai_yanse(men)
+
+    def _kuai_yanse_yise(self, fu, biao):
+        """一条字幕该用什么底色：没说话人 / 样式查不到 -> None（用默认蓝）"""
+        if not str(fu.get("shuo") or "").strip():
+            return None
+        ge = biao.get(str(fu.get("yang") or "Default").strip().lower())
+        if not ge:
+            return None
+        se = str(ge.get("c1") or "").strip()
+        if len(se) != 7 or not se.startswith("#"):
+            return None
+        yanse = QtGui.QColor(se)
+        yanse.setAlpha(ZIMU_TOUMING_DU)
+        return yanse
 
     def _shuaxin_gongju(self, zimu=None, fu_men=None):
         """把当前这条的字段 + 实际生效的样式填进编辑区上方那排"""
@@ -6340,6 +8248,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         wei = self.zimu_mianban.tianjia_zimu(qi_ms, zhi_ms, wenben)
         self.shijianzhou.tianjia_zimu(qi_ms, zhi_ms, wenben)
         self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao())
+        self._ji_chexiao("新建一条", "xinjian")
         return wei
 
     def _shoudao_xuan_zhong_zimu(self, xu):
@@ -6356,6 +8265,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
             return
         self.shijianzhou.shezhi_xuan_zhong_duo(hang)
 
+    def _shoudao_kuang_xuan_kuai(self, hang):
+        """时间轴上框选了一批字幕块：字幕列表整批跟着选中（跟列表里多选一回事）"""
+        hang = [int(x) for x in (hang or [])]
+        if not hang:
+            return
+        self.bianji_mianban.shezhi_xuan_zhong_duo(hang)
+
     # ---- 改字幕 ----
     def _shoudao_gongju(self, jian, zhi):
         """编辑区上方那排改了东西 -> 落到当前这一条字幕上
@@ -6369,6 +8285,21 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self.bianji_mianban.shezhi_xianshi_moshi(
                 str(zhi or "") == "zhen"
             )
+            return
+        if jian == "gen_tiao":
+            # 「选中字幕时画面跟着跳」：全局开关，跟当前有没有选中哪条无关
+            self._gen_tiao = bool(zhi)
+            for ming in ("bianji_mianban", "zimu_mianban"):
+                mian = getattr(self, ming, None)
+                if mian is not None and hasattr(mian, "shezhi_zidong_tiao"):
+                    mian.shezhi_zidong_tiao(self._gen_tiao)
+            self._cun_kaiguan(JIEMIAN_GEN_TIAO, self._gen_tiao)
+            return
+        if jian == "shishi_gun":
+            # 「时间轴实时滚动」：全局开关
+            self._shishi_gun = bool(zhi)
+            self.shijianzhou.shezhi_shishi_gun(self._shishi_gun)
+            self._cun_kaiguan(JIEMIAN_SHISHI_GUN, self._shishi_gun)
             return
         xu = self.bianji_mianban.dangqian_xu()
         zimu = self.zimu_mianban.zimu_liebiao()
@@ -6445,7 +8376,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao(), xu)
         self._zimu_tiao_wen = None
         self._shuaxin_huamian_zimu()
-        xie = self._chong_xie_zimu_wenjian()
+        xie = self._chong_xie_zimu_wenjian("改字段", "gongju")
         self.shezhi_mianban.zhuangtai_shezhi(
             "字幕已改" + ("，SRT / ASS 已重写" if xie else "")
             + "（Ctrl+S 保存字幕）"
@@ -6471,7 +8402,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.bianji_mianban.shezhi_xuan_zhong_duo(hang)
         self._zimu_tiao_wen = None
         self._shuaxin_huamian_zimu()
-        xie = self._chong_xie_zimu_wenjian()
+        xie = self._chong_xie_zimu_wenjian("批量注释")
         self.shezhi_mianban.zhuangtai_shezhi(
             f"已把 {len(hang)} 条设成"
             + ("注释（画面上不显示）" if kai else "普通字幕（照常显示）")
@@ -6510,9 +8441,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
             fu["yang"] = yang
             self.zimu_mianban.shezhi_hang_fu(i, fu)
         self._shezhi_bianji_zimu(zimu, self.bianji_mianban.dangqian_xu())
+        # 整表重建会把多选冲掉，重新选回原来这一批
+        self.bianji_mianban.shezhi_xuan_zhong_duo(hang)
         self._zimu_tiao_wen = None
         self._shuaxin_huamian_zimu()
-        xie = self._chong_xie_zimu_wenjian()
+        xie = self._chong_xie_zimu_wenjian("套槽位")
         self.shezhi_mianban.zhuangtai_shezhi(
             f"槽位{hao + 1:02d} 套到 {len(hang)} 条："
             f"说话人「{shuo or '（空）'}」样式「{yang}」"
@@ -6572,10 +8505,12 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._shezhi_bianji_zimu(
             self.zimu_mianban.zimu_liebiao(), self.bianji_mianban.dangqian_xu()
         )
+        # 整表重建会把多选冲掉，重新选回原来这一批
+        self.bianji_mianban.shezhi_xuan_zhong_duo(hang)
         self._zimu_hang_ji = None
         self._zimu_tiao_wen = None
         self._shuaxin_zimu_tiao()
-        xie = self._chong_xie_zimu_wenjian()
+        xie = self._chong_xie_zimu_wenjian("括号排除")
         self.shezhi_mianban.zhuangtai_shezhi(
             f"已给 {gai} 条套上「」"
             + ("，SRT / ASS 已重写" if xie else "")
@@ -6602,11 +8537,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._zimu_hang_ji = None
         self._zimu_tiao_wen = None
         self._shuaxin_zimu_tiao()
-        xie = self._chong_xie_zimu_wenjian()
+        xie = self._chong_xie_zimu_wenjian("改文字", "wenben")
         self.shezhi_mianban.zhuangtai_shezhi(
             "字幕已改" + ("，SRT / ASS 已重写" if xie else "")
             + "（Ctrl+S 保存字幕）"
         )
+
+    def _shoudao_xiayitiao(self):
+        """焦点在时间轴上按 Ins：换到下一条字幕（跟字幕列表回车一个走法）"""
+        self.bianji_mianban.xia_yi_tiao()
 
     def _tiao_xiayitiao(self):
         """工具栏那个 ✓：跳到下一条；已经是最后一条就在它后面接一条新的"""
@@ -6637,6 +8576,12 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if not (0 <= xu < len(zimu)):
             self.shezhi_mianban.zhuangtai_shezhi("先选一条字幕，再点编辑")
             return
+        jiu_chuang = getattr(self, "_yangshi_chuang", None)
+        if jiu_chuang is not None:
+            jiu_chuang.showNormal()
+            jiu_chuang.raise_()
+            jiu_chuang.activateWindow()
+            return
         fu_men = self._zimu_fu_ji
         if len(fu_men) != len(zimu):
             fu_men = self._zimu_fujia(zimu)
@@ -6653,11 +8598,18 @@ class VideoWorkDialog(QtWidgets.QDialog):
             # 下面「自动化脚本」里的槽位配置要拿样式名当候选
             yang_men=self._zimu_yangshi_ming_quan(),
         )
+        self._yangshi_chuang = dlg
         dlg.gaile.connect(lambda z: self._yulan_yangshi(z, yang))
         dlg.queren.connect(lambda z: self._luo_yangshi(z, yang))
-        dlg.exec_()
-        if dlg.result() != QtWidgets.QDialog.Accepted:
-            self._luo_yangshi(jiu, yang, tui=True)
+
+        def _guan_le(jieguo):
+            # 非模态窗口：确定之外（取消 / 点 X 关掉）都把这次改的样式退回去
+            self._yangshi_chuang = None
+            if jieguo != QtWidgets.QDialog.Accepted:
+                self._luo_yangshi(jiu, yang, tui=True)
+
+        dlg.finished.connect(_guan_le)
+        dlg.show()
 
     def _yulan_yangshi(self, zi, yang):
         """样式编辑器里改一下：先只改内存里的样式表，画面上立刻能看到"""
@@ -6669,6 +8621,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._ass_yuan["tou"] = tou
         self._zimu_hua_ji = None
         self._shuaxin_huamian_zimu()
+        self._shuaxin_kuai_yanse()   # 颜色实时改就实时换，时间轴上的块跟着变
 
     def _luo_yangshi(self, zi, yang, tui=False):
         """「确定 / 应用」或「取消」：写回 [V4+ Styles]，重画 + 重写文件"""
@@ -6684,30 +8637,43 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._zimu_hua_ji = None
         self._shuaxin_huamian_zimu()
         self._shuaxin_gongju()
-        xie = self._chong_xie_zimu_wenjian()
+        self._shuaxin_kuai_yanse()   # 样式颜色改了就换过去，时间轴上的块跟着变色
+        xie = self._chong_xie_zimu_wenjian("改样式")
         self.shezhi_mianban.zhuangtai_shezhi(
             (f"样式「{yang}」已还原" if tui else f"样式「{yang}」已改")
             + ("，SRT / ASS 已重写" if xie else "")
         )
 
     def _shoudao_zimu_zhengzai_gai(self, xu, wenben):
-        """字幕编辑区正在打字：只改这一条的字，不重建列表、不写盘
+        """字幕编辑区正在打字：把这一版文字落到选中的每一行，不重建列表、不写盘
 
-        每敲一个字就刷整个列表 + 重写一遍 SRT / ASS 会卡得没法打字，
-        所以这里只动内存里的那条和它画出来的样子；落盘留给编辑框失焦那次。
+        跟 AEG 一样：选了多行（或 Ctrl+A 全选）时，在编辑区里改这一版文字，
+        选中的每一行都跟着改成同一版；把文字全删了，选中的行就一起清空。
+        每敲一个字就刷整个列表 + 重写一遍 SRT / ASS 会卡得没法打字，所以这里
+        只动内存里的那几行和它们画出来的样子；落盘留给编辑框失焦那次。
         """
-        self.zimu_mianban.gai_zimu_wenben(xu, wenben)
-        self.shijianzhou.gai_zimu_wenben(xu, wenben)
-        self.bianji_mianban.gai_wenben_ji(xu, wenben)
+        mu = self.bianji_mianban.xuan_zhong_hang()
+        xu = int(xu)
+        if len(mu) <= 1 or xu not in mu:
+            mu = [xu]
+        for i in mu:
+            self.zimu_mianban.gai_zimu_wenben(i, wenben)
+            self.shijianzhou.gai_zimu_wenben(i, wenben)
+            self.bianji_mianban.gai_wenben_ji(i, wenben)
         self._zimu_hang_ji = None
         self._zimu_tiao_wen = None
         self._shuaxin_zimu_tiao()
 
     def _shoudao_zimu_bianji_wancheng(self, xu, _wenben):
-        """编辑框失焦：这一条改完了 —— 把 SRT / ASS 重写一遍"""
-        xie = self._chong_xie_zimu_wenjian()
+        """编辑框失焦：这一版文字改完了 —— 把 SRT / ASS 重写一遍
+
+        编辑区里的改动是整批落到选中行上的，这里报一下这次改了几行。
+        """
+        mu = self.bianji_mianban.xuan_zhong_hang()
+        ji = f"{len(mu)} 行" if len(mu) > 1 else f"第 {int(xu) + 1} 条"
+        xie = self._chong_xie_zimu_wenjian("改文字", "wenben")
         self.shezhi_mianban.zhuangtai_shezhi(
-            f"字幕已改 · 第 {int(xu) + 1} 条"
+            f"字幕已改 · {ji}"
             + ("，SRT / ASS 已重写" if xie else "")
             + "（Ctrl+S 保存字幕）"
         )
@@ -6721,7 +8687,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao(), int(xu))
         self._zimu_tiao_wen = None
         self._shuaxin_zimu_tiao()
-        xie = self._chong_xie_zimu_wenjian()
+        xie = self._chong_xie_zimu_wenjian("改文字", "wenben")
         self.shezhi_mianban.zhuangtai_shezhi(
             "字幕已改" + ("，SRT / ASS 已重写" if xie else "")
         )
@@ -6735,7 +8701,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao(), int(xu))
         self._zimu_tiao_wen = None
         self._shuaxin_zimu_tiao()
-        xie = self._chong_xie_zimu_wenjian()
+        xie = self._chong_xie_zimu_wenjian("改时间", "tuo")
         self.shezhi_mianban.zhuangtai_shezhi(
             f"字幕时间已改 · {self._shijian_wenben(qi_ms)} → "
             f"{self._shijian_wenben(zhi_ms)}"
@@ -6762,7 +8728,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         )
         self._zimu_tiao_wen = None
         self._shuaxin_zimu_tiao()
-        xie = self._chong_xie_zimu_wenjian()
+        xie = self._chong_xie_zimu_wenjian("改时间", "nuo")
         qi = min(x[1] for x in gai)
         zhi = max(x[2] for x in gai)
         self.shezhi_mianban.zhuangtai_shezhi(
@@ -6833,43 +8799,681 @@ class VideoWorkDialog(QtWidgets.QDialog):
         sheng = list(zimu)
         sheng[xu:xu + 1] = [(qi, dao, wenben), (dao, zhi, wenben)]
         # 切完就地留在切出来的前半段上（后半段不选）
-        xie = self._ying_yong_zimu(sheng, xu)
+        xie = self._ying_yong_zimu(sheng, xu, "切分", "qiefen")
         self.shezhi_mianban.zhuangtai_shezhi(
             f"已在 {self._shijian_wenben(dao)} 把这条字幕切成两块"
             + ("，SRT / ASS 已重写" if xie else "")
             + "（Ctrl+S 保存字幕）"
         )
 
-    def _shoudao_zimu_shanchu(self, xu_liebiao):
-        """删掉这几条：右侧列表、时间轴、SRT / ASS 一起改"""
+    # ---- 字幕列表右键：整行编辑（照 AEG 的网格右键菜单） ----
+    def _hang_mu(self, mu=None):
+        """这次动作处理哪几行：右键点过的用它，没有就用列表里当前选中的
+
+        返回 (整份字幕, 排好序的行号表)。
+        """
         zimu = self.zimu_mianban.zimu_liebiao()
-        shan = sorted(
-            {int(x) for x in (xu_liebiao or []) if 0 <= int(x) < len(zimu)}
+        if mu is None:
+            mu = getattr(self, "_youjian_mu", None)
+        if mu is None:
+            mu = self.bianji_mianban.xuan_zhong_hang()
+        return zimu, sorted(
+            {int(x) for x in (mu or []) if 0 <= int(x) < len(zimu)}
         )
+
+    def _hang_paixu(self, zimu):
+        """按时间重排一遍：整份列表是按时间排的，插完 / 粘完得摆回去"""
+        return sorted(zimu, key=lambda z: (int(z[0]), int(z[1])))
+
+    def _hang_shoudao(self, xin, xuan, shuo):
+        """整行编辑类动作统一收尾：刷三处 + 重写 SRT / ASS + 状态栏说一句"""
+        xie = self._ying_yong_zimu(
+            xin, int(xuan), str(shuo).lstrip("已"), "hang"
+        )
+        self.shezhi_mianban.zhuangtai_shezhi(
+            shuo
+            + ("，SRT / ASS 已重写" if xie else "")
+            + "（Ctrl+S 保存字幕）"
+        )
+
+    def _hang_mei_xuan(self, dongzuo):
+        """没选中行时的统一提示"""
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"{dongzuo}：先在字幕列表里点一行"
+        )
+
+    def _hang_charu(self, mu=None, zai_qian=True):
+        """插入(之前 / 之后)：在当前行前 / 后插一条空行（照 AEG）
+
+        新行紧贴着当前行，长 XINJIAN_ZIMU_MS。旁边那条已经占满整段（硬字幕
+        常常一段挨一段、中间一点空都没有）时，就让新行跟它叠一帧 —— 不能因为
+        旁边挤就插不进去（时间轴能摞好几行，叠着也看得见）。
+
+        但当前行本身已经顶到片头 / 片尾时，前面 / 后面是真没地方了：这一下
+        什么都不做，也不弹提示。
+        """
+        zimu, mu = self._hang_mu(mu)
+        if not mu:
+            self._hang_mei_xuan("插入行")
+            return
+        i = mu[0]
+        qi, zhi = int(zimu[i][0]), int(zimu[i][1])
+        pian_chang = int(self.shichang_ms)
+        # 让不开也得给一帧的长度，不然这条是零长、谁都看不见
+        yi_zhen = max(1, int(round(1000.0 / self.fps))) if self.fps > 0 else 40
+        if zai_qian:
+            if qi <= 0:
+                return              # 当前行就在片头第一帧，前面没地方：什么都不做
+            z = qi
+            q = max(0, z - XINJIAN_ZIMU_MS)
+            if i - 1 >= 0:
+                q = max(q, int(zimu[i - 1][1]))      # 前一条占到这里了
+            wei = i
+        else:
+            if pian_chang > 0 and zhi >= pian_chang:
+                return              # 当前行就在片尾最后一帧，后面没地方：什么都不做
+            q = zhi
+            z = q + XINJIAN_ZIMU_MS
+            if i + 1 < len(zimu):
+                z = min(z, int(zimu[i + 1][0]))      # 后一条从这儿开始
+            wei = i + 1
+        if z <= q:
+            # 被旁边那条顶死了（不是片头 / 片尾）就叠一帧上去，照样插
+            if zai_qian:
+                q = max(0, qi - yi_zhen)
+                z = qi
+            else:
+                q = zhi
+                z = zhi + yi_zhen
+                if pian_chang > 0:
+                    z = min(z, pian_chang)
+        tiao = (q, z, "")
+        xin = list(zimu)
+        xin.insert(wei, tiao)
+        xin = self._hang_paixu(xin)
+        xuan = xin.index(tiao) if tiao in xin else -1
+        self._hang_shoudao(
+            xin, xuan,
+            f"已{'前' if zai_qian else '后'}插一条空字幕（第 {xuan + 1} 条）",
+        )
+
+    def _hang_charu_shipin(self, mu=None, zai_qian=True):
+        """以视频时间插入(之前 / 之后)：新行从播放头那一帧开始（照 AEG）
+
+        播放头已经贴在片头第一帧（前插）/ 片尾最后一帧（后插）时，前面 /
+        后面真没地方：这一下什么都不做，也不弹提示。
+        """
+        zimu, mu = self._hang_mu(mu)
+        if not mu:
+            self._hang_mei_xuan("以视频时间插入")
+            return
+        chang = int(self.shichang_ms)
+        if chang <= 0:
+            self.shezhi_mianban.zhuangtai_shezhi("以视频时间插入：还没打开视频")
+            return
+        yi_zhen = max(1, int(round(1000.0 / self.fps))) if self.fps > 0 else 40
+        i = mu[0]
+        q = max(0, int(self.shijianzhou.bofangtou_ms()))
+        if zai_qian:
+            if q <= 0:
+                return          # 播放头就在片头第一帧，前面没地方：什么都不做
+        else:
+            if q >= chang - yi_zhen:
+                return          # 播放头就在片尾最后一帧，后面没地方：什么都不做
+        z = min(q + XINJIAN_ZIMU_MS, chang)
+        if z <= q:
+            return
+        wei = i if zai_qian else i + 1
+        tiao = (q, z, "")
+        xin = list(zimu)
+        xin.insert(wei, tiao)
+        # 不按时间重排：这两项的新行都是从播放头起、时间一模一样，重排一遍
+        # 前/后就分不出来了 —— 点"之前"和点"之后"会是一个结果
+        self._hang_shoudao(
+            xin, wei,
+            f"已从 {self._shijian_wenben(q)} 插一条空字幕"
+            f"（第 {wei + 1} 条）",
+        )
+
+    def _hang_fuzhi(self, mu=None):
+        """重复行：复制一份落在原块的**下面一行**（时间原样）
+
+        我们时间轴能摞好几行字幕块；副本要是跟原件时间一样、还摆同一行，两条
+        就完全压在一起，看着像没生效。所以副本沉到原件下面那一行。
+        """
+        zimu, mu = self._hang_mu(mu)
+        if not mu:
+            self._hang_mei_xuan("重复行")
+            return
+        self._xiayi_hang_tian(zimu, mu, [tuple(zimu[i]) for i in mu], "已重复")
+
+    def _xiayi_hang_tian(self, zimu, mu, kuai, shuo):
+        """把 kuai 这些块插在选中行后面，并让它们落到原块的下一行
+
+        索引那边插完就完事；行号得单独再喊时间轴摆一次 —— 整份 shezhi_zimu
+        是按"内容"认行号的，副本跟原件内容一样，认不到旧行号会掉回第一行。
+        """
+        mu = sorted({int(x) for x in (mu or []) if 0 <= int(x) < len(zimu)})
+        kuai = [tuple(k) for k in (kuai or [])]
+        if not mu or not kuai:
+            return
+        hang_jiu = [self.shijianzhou.zimu_hang(i) for i in mu]
+        # 每条副本落在它那条原件的下一行；条数对不上（粘贴来的）都跟着最后那条走
+        hang_xin = hang_jiu if len(kuai) == len(mu) else [hang_jiu[-1]] * len(kuai)
+        wei = mu[-1] + 1
+        xin = list(zimu)
+        # 不重排：副本跟原件时间一样，插在它后面本来就在对的时间位置上；
+        # 重排一遍的话副本索引会飘，行号对不上了（其它动作那边仍是重排的）。
+        xin[wei:wei] = kuai
+        # 选中还留在原件上（跟 AEG 一样：重复完不动选择）
+        self._hang_shoudao(xin, mu[0], shuo + f" {len(kuai)} 条，落在原块的下一行")
+        # 行号必须放在 shezhi_zimu 后面摆，不然会被挤回第一行
+        self.shijianzhou.shezhi_hang(
+            [
+                (
+                    wei + n,
+                    min(
+                        self.shijianzhou.ZIMU_HANG_ZUIDA - 1, hang_xin[n] + 1
+                    ),
+                )
+                for n in range(len(kuai))
+            ]
+        )
+
+    def _hang_qiege(self, mu=None, xiang_hou=False):
+        """以当前帧前 / 后分割行：在播放头那一帧把一条切成两条（照 AEG）
+
+        切出来两条文字一样、时间一分为二。播放头不在这条里就跳过这一条。
+        """
+        zimu, mu = self._hang_mu(mu)
+        if not mu:
+            self._hang_mei_xuan("分割行")
+            return
+        if self.fps <= 0:
+            self.shezhi_mianban.zhuangtai_shezhi("分割行：还没读到视频帧率")
+            return
+        dao = max(0, int(self.shijianzhou.bofangtou_ms()))
+        zhen = int(round(dao * self.fps / 1000.0))
+        # 前分割 = 切在当前帧起点，后分割 = 切在下一帧起点（都落在帧边界上）
+        dian = int(round((zhen + (1 if xiang_hou else 0)) * 1000.0 / self.fps))
+        xin = list(zimu)
+        tiao = None
+        qie = 0
+        for i in reversed(mu):
+            qi, zhi, wenben = int(zimu[i][0]), int(zimu[i][1]), zimu[i][2]
+            if not (qi < dian < zhi):
+                continue
+            xin[i:i + 1] = [(qi, dian, wenben), (dian, zhi, wenben)]
+            tiao = xin[i]
+            qie += 1
+        if not qie:
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "分割行：播放头不在选中的字幕行里"
+            )
+            return
+        xin = self._hang_paixu(xin)
+        xuan = xin.index(tiao) if tiao in xin else -1
+        self._hang_shoudao(
+            xin, xuan,
+            f"已在 {self._shijian_wenben(dian)} 把 {qie} 条切成两段",
+        )
+
+    def _hang_huhuan(self, mu=None):
+        """互换行：把选中的两条的内容对调（时间不动）
+
+        AEG 那个是交换两行在网格里的先后位置；我们这份列表是按时间排的，
+        位置由时间说了算，能对调的只有内容（点错行时用它换回来）。样式 /
+        说话人那套字段跟着一起换。
+        """
+        zimu, mu = self._hang_mu(mu)
+        if len(mu) != 2:
+            self.shezhi_mianban.zhuangtai_shezhi("互换行：先正好选中两条")
+            return
+        a, b = mu
+        xin = list(zimu)
+        xin[a] = (zimu[a][0], zimu[a][1], zimu[b][2])
+        xin[b] = (zimu[b][0], zimu[b][1], zimu[a][2])
+        # 字段是按"内容"存着的，内容一换就对不上了，得手动搬过去
+        fu_a = self.zimu_mianban.hang_fu(a)
+        fu_b = self.zimu_mianban.hang_fu(b)
+        self.zimu_mianban.shezhi_zimu(xin)
+        if fu_b:
+            self.zimu_mianban.shezhi_hang_fu(a, fu_b)
+        if fu_a:
+            self.zimu_mianban.shezhi_hang_fu(b, fu_a)
+        self._hang_shoudao(xin, a, "已把这两条的内容对调")
+
+    def _hang_shijian_lianxu(self, mu=None, gai_qi=True):
+        """使时间连续：本行的起点接到上一行的终点（改开始时间），
+        本行的终点接到下一行的起点（改结束时间）"""
+        zimu, mu = self._hang_mu(mu)
+        if not mu:
+            self._hang_mei_xuan("使时间连续")
+            return
+        xin = list(zimu)
+        gai = 0
+        for i in mu:
+            qi, zhi, wenben = (int(zimu[i][0]), int(zimu[i][1]), zimu[i][2])
+            if gai_qi:
+                if i - 1 < 0:
+                    continue
+                q = int(xin[i - 1][1])          # 前面那条刚改过就用新值
+                if q >= zhi:
+                    continue                    # 接上去会把行倒过来，跳过
+                xin[i] = (q, zhi, wenben)
+            else:
+                if i + 1 >= len(xin):
+                    continue
+                z = int(xin[i + 1][0])
+                if z <= qi:
+                    continue
+                xin[i] = (qi, z, wenben)
+            gai += 1
+        if not gai:
+            self.shezhi_mianban.zhuangtai_shezhi("使时间连续：这几行没有可接的邻居")
+            return
+        self._hang_shoudao(
+            xin, mu[0],
+            f"已让 {gai} 条的{'开始' if gai_qi else '结束'}时间跟邻居接上",
+        )
+
+    def _hang_chongzu(self, mu=None):
+        """重组行：把被拆开的相邻行按文本对回去（照 AEG 的 recombine）
+
+        硬字幕提取常把一句话拆成相邻两条、文字互相咬着一截。这条命令把选中
+        的行按时间捋一遍，文本完全相同、或一条是另一条的开头 / 结尾，就并
+        成一条（时间取并集）；对不上的原样留着不动。
+        """
+        zimu, mu = self._hang_mu(mu)
+        if len(mu) < 2:
+            self.shezhi_mianban.zhuangtai_shezhi("重组行：先选中两条以上")
+            return
+        xuan = sorted(
+            (zimu[i] for i in mu), key=lambda z: (int(z[0]), int(z[1]))
+        )
+        he = []
+        dang = xuan[0]
+        for hou in xuan[1:]:
+            a = str(dang[2] or "").strip()
+            b = str(hou[2] or "").strip()
+            wen = None
+            if a and b:
+                if a == b or b.startswith(a) or b.endswith(a):
+                    wen = b
+                elif a.startswith(b) or a.endswith(b):
+                    wen = a
+            elif a:
+                wen = a
+            elif b:
+                wen = b
+            if wen is None:                     # 咬不上：各留各的
+                he.append(dang)
+                dang = hou
+                continue
+            dang = (
+                min(int(dang[0]), int(hou[0])),
+                max(int(dang[1]), int(hou[1])),
+                wen,
+            )
+        he.append(dang)
+        if len(he) == len(xuan):
+            self.shezhi_mianban.zhuangtai_shezhi("重组行：这几条咬不上，没动")
+            return
+        pao = set(mu)
+        xin = self._hang_paixu(
+            [zimu[i] for i in range(len(zimu)) if i not in pao] + he
+        )
+        tiao = he[0]
+        xuan_hang = xin.index(tiao) if tiao in xin else -1
+        self._hang_shoudao(
+            xin, xuan_hang,
+            f"已把 {len(xuan)} 条重组回 {len(he)} 条",
+        )
+
+    def _ass_hang_wenben(self, zimu, fu_men, xu):
+        """第 xu 条拼成一行 ASS 文本（AEG 网格里复制出来的就是这个格式）
+
+        Dialogue: 层,起,止,样式,说话人,左边距,右边距,垂直边距,特效,文字
+
+        Text 优先沿用原 ASS 里那一串（\\pos 这些行内标签原样留着）；文字真改
+        过才用现在这份（换行换成 \\N）。认原来那一行的规矩跟写 ASS 时一样。
+        """
+        from anylabeling.views.labeling.utils.video import format_ass_time
+
+        qi, zhi, wenben = zimu[xu]
+        fu = dict(fu_men[xu]) if xu < len(fu_men) else {}
+        qing = self._ass_qing_hang()
+        chun = _ass_chun_wen(wenben)
+        yuan = next((y for c, _q, _z, _y, _s, y, _f in qing if c == chun), "")
+        if not yuan:
+            yuan = next(
+                (
+                    y for _c, q, z, _y, _s, y, _f in qing
+                    if q == int(qi) and z == int(zhi)
+                ),
+                "",
+            )
+        if yuan and _ass_yuan_wen(yuan) == _ass_yuan_wen(wenben):
+            wen = str(yuan)
+        else:
+            wen = str(wenben or "").replace("\n", "\\N")
+        return (
+            ("Comment" if fu.get("zhushi") else "Dialogue")
+            + ": "
+            + ",".join(
+                (
+                    str(max(0, int(fu.get("ceng") or 0))),
+                    format_ass_time(int(qi)),
+                    format_ass_time(int(zhi)),
+                    str(fu.get("yang") or "Default"),
+                    str(fu.get("shuo") or ""),
+                    f"{max(0, int(fu.get('zuo') or 0)):04d}",
+                    f"{max(0, int(fu.get('you') or 0)):04d}",
+                    f"{max(0, int(fu.get('shu') or 0)):04d}",
+                    str(fu.get("texiao") or ""),
+                    wen,
+                )
+            )
+        )
+
+    def _hang_jianqie(self, mu=None, shan=True):
+        """剪切行 / 复制行：写成 ASS 的 Dialogue 行，放**系统**剪贴板
+
+        AEG 网格里 Ctrl+C / Ctrl+X 出来的就是这一串（一段一行），所以粘到
+        AEG、记事本、剪贴板记录工具里都是现成能用的。
+        """
+        zimu, mu = self._hang_mu(mu)
+        if not mu:
+            self._hang_mei_xuan("剪切行" if shan else "复制行")
+            return
+        fu_men = self._zimu_fujia(zimu)
+        QtWidgets.QApplication.clipboard().setText(
+            "\n".join(self._ass_hang_wenben(zimu, fu_men, i) for i in mu)
+        )
+        if shan:
+            self._shoudao_zimu_shanchu(mu)
+            return
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"已复制 {len(mu)} 条到剪贴板（ASS 的 Dialogue 行）"
+        )
+
+    def _du_zhantie_hang(self, wen):
+        """剪贴板文本 -> [(起ms, 止ms, 文字, 字段表), ...]
+
+        只认 ASS 的 Dialogue / Comment 行（一段一行），别的内容跳过；一段都
+        没认出来就返回空表。认出来的行把样式 / 说话人 / 层 / 边距 / 特效 /
+        注释一起带上，粘进来不掉东西。
+        """
+        ming = list(_ASS_ZIDUAN)
+        chu = []
+        for hang in str(wen or "").splitlines():
+            tiao = hang.strip()
+            di = tiao.lower()
+            if not di.startswith(("dialogue:", "comment:")):
+                continue
+            # Text 是最后一个字段、里面可以有逗号：只切前面那几个
+            bu = tiao.split(":", 1)[1].strip().split(",", len(ming) - 1)
+            bu += [""] * (len(ming) - len(bu))
+            h = dict(zip(ming, bu))
+            qi = _ass_hao_ms(h.get("Start"))
+            zhi = _ass_hao_ms(h.get("End"))
+            if qi is None or zhi is None or int(zhi) <= int(qi):
+                continue
+            h["_lei"] = "Comment" if di.startswith("comment:") else "Dialogue"
+            fu = _ass_hang_fu(h)
+            fu["yang"] = str(h.get("Style") or "Default")
+            fu["shuo"] = str(h.get("Name") or "")
+            chu.append(
+                (
+                    int(qi),
+                    int(zhi),
+                    str(h.get("Text") or "")
+                    .replace("\\N", "\n")
+                    .replace("\\n", "\n"),
+                    fu,
+                )
+            )
+        return chu
+
+    def _hang_zhantie(self, mu=None):
+        """粘贴行：认系统剪贴板里的 ASS 行，插到当前行后面，再按时间摆回列表
+
+        AEG（或剪贴板记录工具）里复制出来的 Dialogue 行都能粘；粘进来的行
+        样式 / 说话人 / 层 / 边距 / 特效 / 注释一起带过来。
+        """
+        tiao = self._du_zhantie_hang(
+            QtWidgets.QApplication.clipboard().text()
+        )
+        if not tiao:
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "粘贴行：剪贴板里没有 ASS 行（「Dialogue: …」那种）"
+            )
+            return
+        zimu, mu = self._hang_mu(mu)
+        wei = (mu[-1] + 1) if mu else len(zimu)
+        xin = list(zimu)
+        xin[wei:wei] = [t[:3] for t in tiao]
+        xin = self._hang_paixu(xin)
+        # 带过来的字段记在 _fu_wai 上：算「每条字段」时按行内容认领
+        for qi, zhi, wb, fu in tiao:
+            self._fu_wai[(qi, zhi, wb)] = dict(fu)
+        xuan = xin.index(tiao[0][:3]) if tiao[0][:3] in xin else -1
+        self._hang_shoudao(xin, xuan, f"已粘贴 {len(tiao)} 条字幕")
+
+    def _shoudao_kuai_fuzhi(self):
+        """时间轴上按了 Ctrl+C：把选中的块写成 ASS 行放**系统**剪贴板
+
+        跟字幕列表里的 Ctrl+C 完全一条路 —— 剪贴板记录工具里能看到
+        「Dialogue: …」，粘到 AEG / 记事本里也是现成能用的。
+        """
+        self._hang_jianqie(
+            self.shijianzhou.xuan_zhong_liebiao() or None, shan=False
+        )
+
+    def _shoudao_kuai_zhantie(self):
+        """时间轴上按了 Ctrl+V：在选中块的**下面一行**造一条重复块
+
+        剪贴板里是 ASS 行就用它的时间（从别处复制来的也认）；剪贴板里没有
+        ASS 行，就当"把选中的这块复制一份到下面"，等于重复行。
+        """
+        zimu, mu = self._hang_mu(self.shijianzhou.xuan_zhong_liebiao() or None)
+        if not mu:
+            self._hang_mei_xuan("粘贴到下一行")
+            return
+        tiao = self._du_zhantie_hang(QtWidgets.QApplication.clipboard().text())
+        # 带过来的字段记在 _fu_wai 上：算「每条字段」时按行内容认领
+        for qi, zhi, wb, fu in tiao:
+            self._fu_wai[(qi, zhi, wb)] = dict(fu)
+        self._xiayi_hang_tian(
+            zimu,
+            mu,
+            [t[:3] for t in tiao] if tiao else [tuple(zimu[i]) for i in mu],
+            "已粘贴" if tiao else "已复制",
+        )
+
+    # --------------------------------------------------------------
+    # 查找 / 替换 / 选择（Ctrl+R / Ctrl+F / Ctrl+H 那三个窗口）
+    # --------------------------------------------------------------
+    def _kai_sousuo(self, na):
+        """打开（或叫回）选择 / 查找 / 替换窗口
+
+        na："xuan" 选择、"zhao" 查找、"huan" 替换。三个都是非模态窗口，
+        开着照样能操作工作台，而且可以同时开着：各留一个实例，互不顶掉。
+        收进最小化了再按一次快捷键就能叫回来。
+        """
+        ming = {"xuan": "_ss_xuan", "zhao": "_ss_zhao", "huan": "_ss_huan"}[na]
+        chuang = getattr(self, ming, None)
+        if chuang is None:
+            if na == "xuan":
+                chuang = XuanZeDialog(self)
+            else:
+                chuang = SuoSuoDialog(self, na == "huan")
+            setattr(self, ming, chuang)
+            # 头一回开：摆在窗口偏上居中的位置，三个依次往右下错开一点，
+            # 不然同时开着会全叠在一块儿，还得自己一个个拖
+            chuang.adjustSize()
+            cuo = {"xuan": 0, "zhao": 26, "huan": 52}[na]
+            wo = self.frameGeometry()
+            chuang.move(
+                wo.center().x() - chuang.width() // 2 + cuo,
+                wo.top() + 70 + cuo,
+            )
+        if chuang.isMinimized():
+            chuang.showNormal()          # 最小化收进去了：叫回来
+        chuang.show()
+        chuang.raise_()
+        chuang.activateWindow()
+        chuang.qing_jiaodian()
+
+    def ss_hang_men(self):
+        """给那三个窗口的整份字幕：一条一个字典（文字 / 样式 / 说话人 / 特效 / 注释）"""
+        zimu = self.zimu_mianban.zimu_liebiao()
+        fu_men = self._zimu_fujia(zimu)
+        men = []
+        for i, (_qi, _zhi, wen) in enumerate(zimu):
+            fu = dict(fu_men[i]) if i < len(fu_men) else {}
+            men.append({
+                "wenben": str(wen or ""),
+                "yang": str(fu.get("yang") or "Default"),
+                "shuo": str(fu.get("shuo") or ""),
+                "texiao": str(fu.get("texiao") or ""),
+                "zhushi": bool(fu.get("zhushi")),
+            })
+        return men
+
+    def ss_xuan_hang(self):
+        """列表里现在选中了哪几行"""
+        return [int(x) for x in self.bianji_mianban.xuan_zhong_hang()]
+
+    def ss_dangqian(self):
+        """现在编辑的是第几条（没选中给 -1）"""
+        return int(self.bianji_mianban.dangqian_xu())
+
+    def ss_she_xuan(self, hang):
+        """把选中的设成这几行（列表 + 时间轴一起高亮，不动播放头）"""
+        zimu = self.zimu_mianban.zimu_liebiao()
+        hang = sorted({int(x) for x in (hang or []) if 0 <= int(x) < len(zimu)})
+        if len(hang) == 1:
+            self._shoudao_xuan_zhong_zimu(hang[0])
+            return
+        if not hang:
+            self._shoudao_xuan_zhong_zimu(-1)
+            return
+        self.bianji_mianban.shezhi_xuan_zhong_duo(hang)
+        self.shijianzhou.shezhi_xuan_zhong_duo(hang)
+
+    def ss_dingwei(self, xu, qi=None, zhi=None):
+        """定位到第 xu 条（列表 / 时间轴 / 编辑区一起跟上）
+
+        文本栏给 qi / zhi 就在编辑框里把匹配的那一段圈出来。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        xu = int(xu)
+        if not (0 <= xu < len(zimu)):
+            return
+        self._shoudao_xuan_zhong_zimu(xu)
+        if qi is None or zhi is None:
+            return
+        kuang = getattr(self.bianji_mianban, "kuang", None)
+        if kuang is None:
+            return
+        wen = str(zimu[xu][2] or "")
+        qi = max(0, min(int(qi), len(wen)))
+        zhi = max(qi, min(int(zhi), len(wen)))
+        guang = QtGui.QTextCursor(kuang.document())
+        guang.setPosition(qi)
+        guang.setPosition(zhi, QtGui.QTextCursor.KeepAnchor)
+        kuang.setTextCursor(guang)
+
+    def ss_gai(self, jian, xiugai):
+        """批量改某一栏：jian 见那三个窗口里的 LAN_JIAN，xiugai = [(行号, 新内容)]
+
+        一次改完再刷列表 / 重写文件 —— 一条一条走全套流程会卡。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        if not xiugai or not zimu:
+            return 0
+        gai = 0
+        if jian == "wenben":
+            for xu, xin in xiugai:
+                xu = int(xu)
+                if not (0 <= xu < len(zimu)):
+                    continue
+                if str(zimu[xu][2]) == str(xin):
+                    continue
+                self.zimu_mianban.gai_zimu_wenben(xu, str(xin))
+                self.shijianzhou.gai_zimu_wenben(xu, str(xin))
+                gai += 1
+        else:
+            for xu, xin in xiugai:
+                xu = int(xu)
+                if not (0 <= xu < len(zimu)):
+                    continue
+                fu = dict(self.bianji_mianban.hang_fu(xu))
+                fu.update(self.zimu_mianban.hang_fu(xu))
+                if str(fu.get(jian) or "") == str(xin or ""):
+                    continue
+                fu[jian] = xin
+                self.zimu_mianban.shezhi_hang_fu(xu, fu)
+                gai += 1
+        if not gai:
+            return 0
+        self._shezhi_bianji_zimu(
+            self.zimu_mianban.zimu_liebiao(),
+            self.bianji_mianban.dangqian_xu(),
+        )
+        self._zimu_hang_ji = None
+        self._zimu_tiao_wen = None
+        self._shuaxin_zimu_tiao()
+        self._shuaxin_huamian_zimu()
+        xie = self._chong_xie_zimu_wenjian("批量改字幕")
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"改了 {gai} 条字幕" + ("，SRT / ASS 已重写" if xie else "")
+            + "（Ctrl+S 保存字幕）"
+        )
+        return gai
+
+    def ss_zhuangtai(self, wen):
+        """底部状态栏说一句"""
+        self.shezhi_mianban.zhuangtai_shezhi(str(wen))
+
+    def ss_tishi(self, biaoti, wen):
+        """弹个提示框（只有"一条都没匹配上"这种才弹，照 AEG）"""
+        QtWidgets.QMessageBox.information(self, str(biaoti), str(wen))
+
+    def _shoudao_zimu_shanchu(self, xu_liebiao=None):
+        """删掉这几条：右侧列表、时间轴、SRT / ASS 一起改"""
+        zimu, shan = self._hang_mu(xu_liebiao)
         if not shan:
+            self._hang_mei_xuan("删除行")
             return
         pao = set(shan)
         sheng = [z for i, z in enumerate(zimu) if i not in pao]
-        xie = self._ying_yong_zimu(sheng, -1)
+        xie = self._ying_yong_zimu(sheng, -1, f"删除 {len(shan)} 行", "shan")
         self.shezhi_mianban.zhuangtai_shezhi(
             f"已删除 {len(shan)} 段字幕"
             + ("，SRT / ASS 已重写" if xie else "")
             + "（Ctrl+S 保存字幕）"
         )
 
-    def _shoudao_zimu_hebing(self, xu_liebiao):
-        """并成一条：起 = 最早那条的起，止 = 最晚那条的止，文字按顺序换行接上"""
-        zimu = self.zimu_mianban.zimu_liebiao()
-        bing = sorted(
-            {int(x) for x in (xu_liebiao or []) if 0 <= int(x) < len(zimu)}
-        )
+    def _shoudao_zimu_hebing(self, xu_liebiao=None, liu_shou_hang=False):
+        """并成一条：起 = 最早那条的起，止 = 最晚那条的止
+
+        文字默认按顺序换行接上；liu_shou_hang=True（AEG 的"合并（保留首
+        行）"）就只留第一条的文字。
+        """
+        zimu, bing = self._hang_mu(xu_liebiao)
         if len(bing) < 2:
+            self.shezhi_mianban.zhuangtai_shezhi("合并：先选中两条以上")
             return
         pao = set(bing)
         xuan = [zimu[i] for i in bing]
         qi = min(int(x[0]) for x in xuan)
         zhi = max(int(x[1]) for x in xuan)
-        wenben = "\n".join(t for t in (str(x[2]).strip() for x in xuan) if t)
+        if liu_shou_hang:
+            wenben = str(xuan[0][2] or "").strip()
+        else:
+            wenben = "\n".join(t for t in (str(x[2]).strip() for x in xuan) if t)
         # 没选中的照旧 + 合并出来的那一条，按时间重新排一遍：
         # 隔着几段合并时，并出来的那条可能不在原来的位置
         dai = [(i, zimu[i]) for i in range(len(zimu)) if i not in pao]
@@ -6877,7 +9481,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         dai.sort(key=lambda p: (int(p[1][0]), int(p[1][1])))
         xhao = next(i for i, (biao, _z) in enumerate(dai) if biao == -1)
         sheng = [z for _biao, z in dai]
-        xie = self._ying_yong_zimu(sheng, xhao)
+        xie = self._ying_yong_zimu(sheng, xhao, "合并", "hebing")
         self.shezhi_mianban.zhuangtai_shezhi(
             f"已合并 {len(bing)} 段字幕（{self._shijian_wenben(qi)} → "
             f"{self._shijian_wenben(zhi)}）"
@@ -6885,7 +9489,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
             + "（Ctrl+S 保存字幕）"
         )
 
-    def _ying_yong_zimu(self, zimu, xuan=-1):
+    def _ying_yong_zimu(self, zimu, xuan=-1, shuo=None, lei=None):
         """改完字幕统一收尾：右侧列表 / 迷你轴 / 底部时间轴一起刷，
         再重写提取目录里的 SRT / ASS。返回写出的文件列表（空 = 没写）。
         """
@@ -6896,13 +9500,27 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._shezhi_bianji_zimu(zimu, int(xuan))
         self._zimu_tiao_wen = None
         self._shuaxin_zimu_tiao()
-        return self._chong_xie_zimu_wenjian()
+        return self._chong_xie_zimu_wenjian(shuo, lei)
 
-    def _shuaxin_zimu_tiao(self):
-        """画面下方那条 + 画面里叠的那层字幕（都跟着播放头走）"""
-        self._shuaxin_huamian_zimu()
+    def _shuaxin_zimu_tiao(self, hua=True):
+        """画面下方那条 + 画面里叠的那层字幕（都跟着播放头走）
+
+        hua=False（点击 / 拖播放头那一路）时不去碰画面里叠的那层：那会儿 mpv
+        的 time-pos 已经跳到目标了，可画面还得等解码 —— 跟着它换就是"字幕先
+        切、画面后到"。那层由 paintGL 在"mpv 真出新视频帧"那一刻换。
+        """
+        if hua:
+            self._shuaxin_huamian_zimu()
         # 字幕列表里"正播到"的那一行跟着上色 / 滚动（跟手动选中的行互不干扰）
-        self.bianji_mianban.shezhi_bofang_ms(self._bofang_ms)
+        # 拖播放头的时候不刷它：几千条要扫一遍、还要滚动列表，一卡播放头就
+        # 跟不上鼠标；松手那一下会补刷（见 _tuo_bofangtou_wancheng）。
+        if not self._tuo_bt_zhong:
+            # 正播着才让列表跟着播放行滚；暂停着只涂色不滚 —— 打注释 / 改字段
+            # 会整表重建，紧接着这次刷新拿的是还没动的播放头位置，一滚列表就
+            # "啪"跳回最顶上，等定位回来再滚下去，看着就是闪
+            self.bianji_mianban.shezhi_bofang_ms(
+                self._bofang_ms, self.zhengzai_bofang
+            )
         zai = self.zimu_mianban.zimu_zai_ms(self._bofang_ms)
         wenben = _ass_chun_wen(zai[2]) if zai else ""
         if wenben == self._zimu_tiao_wen:
@@ -6990,12 +9608,17 @@ class VideoWorkDialog(QtWidgets.QDialog):
         logger.info(f"视频工作台：已自动保存 {shuo}")
         return shuo
 
-    def _chong_xie_zimu_wenjian(self):
-        """改完字幕把 SRT / ASS 重写一遍（规矩跟跑完时一样，写在输出文件夹同级）"""
+    def _chong_xie_zimu_wenjian(self, shuo=None, lei=None):
+        """改完字幕把 SRT / ASS 重写一遍（规矩跟跑完时一样，写在输出文件夹同级）
+
+        shuo / lei：这一下算哪门子动作（撤销栈里显示的名字 / 合并用的类别）。
+        改完刷完就顺手记一笔快照，Ctrl+Z 能退回来。
+        """
         # 标记放最前：改没改过跟"这次有没有写出去"没关系。
         # 输出目录没设好时下面会直接返回，标记要是放在它后面就永远置不上，
         # 自动保存一次都不会触发。
         self._zidong_gai_dong = True    # 字幕变过了：下一轮到点就自动存一份
+        self._ji_chexiao(shuo or "改字幕", lei)
         zimu = self.zimu_mianban.zimu_liebiao()
         shuchu = self.shezhi_mianban.shuchu_shuru.text().strip()
         if not zimu or not shuchu or not osp.isdir(shuchu):
@@ -7028,6 +9651,116 @@ class VideoWorkDialog(QtWidgets.QDialog):
         except Exception as cuowu:  # noqa
             logger.error(f"视频工作台：重写 ASS 失败 {cuowu}")
         return xie
+
+    # ---- 撤销 / 重做（照 AEG 的 SubsController：一步一整版快照） ----
+    def _chexiao_kuazhao(self):
+        """把当前这一版字幕整个拷一份（撤销 / 重做都拿它当存档）"""
+        return (
+            self.zimu_mianban.zimu_liebiao(),
+            self.zimu_mianban.fujia_biao(),
+            int(self.bianji_mianban.dangqian_xu()),
+        )
+
+    def _ji_chexiao(self, shuo, lei=None):
+        """一个动作做完了：把现在这一版记一笔，供 Ctrl+Z 回退
+
+        lei 是动作类别：同一类动作在 CHEXIAO_HEBING_MIAO 秒内连着做算一笔
+        （长按方向键挪块、连着敲字不该刷出几十笔撤销）。跟上一笔一模一样
+        也不重复记。
+        """
+        if self._chexiao_zhong:
+            return
+        kuai = self._chexiao_kuazhao()
+        shike = time.monotonic()
+        if self._chexiao_zhan:
+            jshuo, jkuai, jlei, jshike = self._chexiao_zhan[-1]
+            if jkuai == kuai:
+                return
+            if lei and lei == jlei and shike - jshike <= CHEXIAO_HEBING_MIAO:
+                self._chexiao_zhan[-1] = (jshuo, kuai, lei, shike)
+                self._chongzuo_zhan.clear()
+                return
+        self._chexiao_zhan.append((str(shuo), kuai, lei, shike))
+        while len(self._chexiao_zhan) > CHEXIAO_ZUIDA:
+            self._chexiao_zhan.pop(0)
+        self._chongzuo_zhan.clear()
+
+    def _chexiao_qingkong(self, shuo="载入字幕"):
+        """换了一份字幕：撤销栈从头来（照 AEG：打开文件就把撤销栈清空）"""
+        self._chexiao_zhan = []
+        self._chongzuo_zhan = []
+        self._chexiao_zhong = False
+        if self.zimu_mianban.zimu_liebiao():
+            self._ji_chexiao(shuo, "zairu")
+
+    def _chexiao_huifu(self, kuai):
+        """把存档里的那一版字幕整个摆回来（列表 / 时间轴 / 文件一起回去）"""
+        zimu, fu_biao, xuan = kuai
+        self._chexiao_zhong = True
+        try:
+            # 字段表得先摆好：_ying_yong_zimu 一路会把「样式 / 说话人」重算出来
+            self.zimu_mianban.shezhi_fujia_biao(fu_biao)
+            self._ying_yong_zimu(
+                [(int(q), int(z), str(w)) for q, z, w in zimu], int(xuan)
+            )
+        finally:
+            self._chexiao_zhong = False
+
+    def _shuru_chexiao(self, dong):
+        """这一下 Ctrl+Z / Ctrl+Y 该不该交给本窗口的输入框自己办
+
+        只有焦点落在**本窗口内**的输入框里、且那框里确实有得撤（重做）时
+        才让它办，返回 True 表示已经办完了。焦点在别处 —— 时间轴上、或者
+        查找 / 替换 / 选择那三个窗口里 —— 一律走字幕的撤销栈。
+        """
+        zhu = QtWidgets.QApplication.focusWidget()
+        if zhu is None or not self.isAncestorOf(zhu):
+            return False
+        if not isinstance(
+            zhu,
+            (QtWidgets.QLineEdit, QtWidgets.QTextEdit,
+             QtWidgets.QPlainTextEdit),
+        ):
+            return False
+        you = (zhu.isRedoAvailable() if dong == "redo"
+               else zhu.isUndoAvailable())
+        if not you:
+            return False
+        zhu.redo() if dong == "redo" else zhu.undo()
+        return True
+
+    def _chexiao(self):
+        """Ctrl+Z：退回到上一版
+
+        焦点在本窗口的输入框里、那框里又有字可撤时，这一次撤那一行文字
+        （输入框自己的撤销）；其余情况一律撤字幕 —— 跟 AEG 一个规矩，
+        撤销栈是整个字幕的，不分窗口。
+        """
+        if self._shuru_chexiao("undo"):
+            return
+        if len(self._chexiao_zhan) <= 1:
+            self.ss_zhuangtai("没有可撤销的了")
+            return
+        # 栈里每笔存的是「那个动作做完之后的整版字幕」，所以栈顶就是现在这一版。
+        # 撤销 = 把栈顶（现在这版）挪进重做栈，再退回新的栈顶（上一版）。
+        shuo, kuai, _lei, _shike = self._chexiao_zhan.pop()
+        self._chongzuo_zhan.append((shuo, kuai, "", 0.0))
+        self._chexiao_huifu(self._chexiao_zhan[-1][1])
+        self.ss_zhuangtai(f"已撤销：{shuo}")
+
+    def _chongzuo(self):
+        """Ctrl+Y：把撤销掉的那一步再做回来（输入框里有得重做就是重做那行文字）"""
+        if self._shuru_chexiao("redo"):
+            return
+        if not self._chongzuo_zhan:
+            self.ss_zhuangtai("没有可重做的了")
+            return
+        # 重做栈里那笔就是要回去的那一版：放回撤销栈顶（栈顶=现在这一版），
+        # 再把它摆回来。
+        shuo, kuai, _lei, _shike = self._chongzuo_zhan.pop()
+        self._chexiao_zhan.append((shuo, kuai, "", 0.0))
+        self._chexiao_huifu(kuai)
+        self.ss_zhuangtai(f"已重做：{shuo}")
 
     # ---- 拖放：把 .srt / .ass 拖进工作台就直接载入 ----
     def _tuo_de_zimu(self, event):
@@ -7117,6 +9850,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
             + (f"（替换原有 {jiu} 条）" if jiu else "")
         )
         logger.info(f"视频工作台：载入字幕 {lu}，{len(zimu)} 条")
+        self._chexiao_qingkong(f"载入 {osp.basename(lu)}")
         return True
 
     def _cun_zimu(self):
@@ -7189,8 +9923,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
             # 线程真停了才丢引用：还在跑就被回收，Qt 会直接崩
             if not self.yunsuan.isRunning():
                 self.yunsuan = None
-        if self.duqu is not None:
-            self.duqu.zhen_hook = None
+        self._tingzhi_tuili_qu()
+        # 扫描时画面是一帧帧贴上去的（老路）；停了交还给 mpv
+        self.huamian.qingkong()
 
         # 跟随播放这一路的最后一段要在停止时补收尾
         if self.chuliqi is not None and self.yunsuan_moshi == "gensui":
@@ -7226,8 +9961,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
     def _saomiao_jieshu(self, chenggong, shuoming, wenjian):
         """全片扫描跑完了"""
         self.shezhi_mianban._suoding(False)
-        if self.duqu is not None:
-            self.duqu.zhen_hook = None
+        self._tingzhi_tuili_qu()
+        # 扫描时画面是一帧帧贴上去的（老路）；扫完交还给 mpv
+        self.huamian.qingkong()
         yi_cun = self.chuliqi.yi_cun if self.chuliqi is not None else 0
         zimu = self.zimu_mianban.zimu_shu()
         chu = f"{shuoming} · 已存 {yi_cun} 张 · 字幕 {zimu} 条"
@@ -7358,14 +10094,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
         """
         if shijian.type() != QtCore.QEvent.KeyPress or not self.isVisible():
             return super().eventFilter(duixiang, shijian)
-        # 只拦本窗口里的按键：别去抢主界面或别处的 Tab / 波浪号
-        if isinstance(duixiang, QtWidgets.QWidget) and not (
-            duixiang is self
-            or self.isAncestorOf(duixiang)
-            or duixiang.window() is self
-            or self.isActiveWindow()
-        ):
-            return super().eventFilter(duixiang, shijian)
+        # 只拦本窗口里的按键：别去抢主界面或别处的 Tab / 波浪号。
+        # 查找 / 替换 / 选择那几个小窗口是独立的顶层窗口（它们自己要用 Tab
+        # 切焦点、要能正常打字），所以按"顶层窗口是不是自己"来判，
+        # 不能按血缘关系 —— 它们挂在工作台底下，血缘上一路都是自己人。
+        if isinstance(duixiang, QtWidgets.QWidget):
+            if duixiang is not self and duixiang.window() is not self:
+                return super().eventFilter(duixiang, shijian)
         if shijian.modifiers() & (
             Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
         ):
@@ -7380,6 +10115,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
         return super().eventFilter(duixiang, shijian)
 
     def closeEvent(self, event):
+        # 查找 / 替换 / 选择那几个小窗口跟着一起收掉（样式编辑器连同它上面
+        # 打开的那两个自动化配置窗口一并收掉）
+        for na in ("_ss_zhao", "_ss_huan", "_ss_xuan", "_yangshi_chuang"):
+            chuang = getattr(self, na, None)
+            if chuang is not None:
+                chuang.close()
+                setattr(self, na, None)
         if self._yingyong_lan_jian is not None:
             self._yingyong_lan_jian.removeEventFilter(self)
             self._yingyong_lan_jian = None
@@ -7387,6 +10129,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._cun_jiemian_buju()          # 记下窗口位置 / 标签页 / 分栏 / 缩放
         self._huanyuan_zhujiemian_kuangjie()
         self._guanbi_video()
+        # 先松开 mpv 的渲染上下文，再把内核整个关掉（顺序反了会崩）
+        self.huamian.shifang()
+        self.mpv.guan()
         super().closeEvent(event)
 
     def keyPressEvent(self, event):
