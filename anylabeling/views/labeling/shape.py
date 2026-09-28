@@ -1418,6 +1418,28 @@ class Shape:
         """Clear the highlighted point"""
         self._highlight_index = None
 
+    def __deepcopy__(self, memo):
+        """
+        支持 deepcopy：_path_cache 里存的是 QPainterPath，属于 Qt 的 C++ 对象，
+        Python 的 deepcopy 无法拷贝它（TypeError: cannot pickle 'QPainterPath' object）。
+        这里在拷贝时临时清空路径缓存，拷贝完成后恢复原对象，副本的缓存保持为空，
+        需要时由 make_path() 按新坐标重新计算。
+        """
+        cache_key = self._path_cache_key
+        cache_path = self._path_cache
+        self._path_cache_key = None
+        self._path_cache = None
+        try:
+            cls = self.__class__
+            new_shape = cls.__new__(cls)
+            memo[id(self)] = new_shape
+            for name, value in self.__dict__.items():
+                setattr(new_shape, name, copy.deepcopy(value, memo))
+            return new_shape
+        finally:
+            self._path_cache_key = cache_key
+            self._path_cache = cache_path
+
     def copy(self) -> "Shape":
         """
         Create a deep copy of the shape.
