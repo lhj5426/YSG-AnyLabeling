@@ -3971,7 +3971,7 @@ class LabelingWidget(QtWidgets.QWidget):
         # Reset Views action for dock layout
         reset_views = action(
             self.tr("重置布局"),
-            self.reset_dock_layout,
+            lambda *_: self.reset_dock_layout(yong_hu_dian=True),
             "Ctrl+Shift+V",
             "refresh",
             self.tr("Reset dock widgets layout to default"),
@@ -4295,7 +4295,7 @@ class LabelingWidget(QtWidgets.QWidget):
                         child.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
                         child.setMinimumContentsLength(1)
 
-        # Install event filters on docks for auto-collapse (drawer behavior)
+        # Install event filters on docks (double-click on title bar)
         for dock in [self.shape_text_dock, self.shape_translation_dock, self.flag_dock,
                      self.label_dock, self.shape_dock, self.file_dock,
                      self.thumbnail_dock, self.navigator_dock]:
@@ -4307,7 +4307,6 @@ class LabelingWidget(QtWidgets.QWidget):
                      self.file_dock, self.thumbnail_dock, self.navigator_dock]:
             dock.dockLocationChanged.connect(self._schedule_dock_save)
             dock.visibilityChanged.connect(self._schedule_dock_save)
-            dock.visibilityChanged.connect(self._restore_dock_size)
 
         # Sync show_navigator action when navigator dock is closed via its
         # own close button (not via the menu action).
@@ -4330,7 +4329,19 @@ class LabelingWidget(QtWidgets.QWidget):
 
         # --- Load dock state with delay to ensure UI is ready ---
         self._dock_state_loaded = False
-        QtCore.QTimer.singleShot(500, self.load_dock_state)
+        # 这一枪到底有没有把布局从文件读进来。没读进来就绝对不许写盘，
+        # 否则一次恢复失败就会把用户摆好的布局永久覆盖成出厂默认。
+        self._dock_hui_fu_hao = False
+        # 恢复布局必须等"窗口真的上屏了、而且尺寸定下来了"。
+        # 固定 500ms 那一枪经常打在窗口还没 showMaximized 完 / 图片还没把窗口
+        # 撑到最终尺寸的时刻，这时候 restoreState 会一声不响地按错的尺寸摆，
+        # 摆出来的是默认样；关软件时再把这个默认样存回文件，从此每次启动都是
+        # 默认布局 —— "开关十几次突然变样"就是这么来的。
+        self._dock_deng_chong = 0
+        self._dock_shang_ci_w = -1
+        self._dock_deng_timer = QtCore.QTimer(self)
+        self._dock_deng_timer.timeout.connect(self._dock_shi_fou_ke_load)
+        self._dock_deng_timer.start(200)
 
         if output_file is not None and self._config["auto_save"]:
             logger.warning(
@@ -17289,27 +17300,97 @@ class LabelingWidget(QtWidgets.QWidget):
         try:
             if not hasattr(self, 'main_window'):
                 return
+            # 这一枪没把布局从文件读进来的话，绝不许把"当前界面"写回去。
+            # 这条闸就是防止"恢复失败 → 摆默认 → 存默认"把好文件永久覆盖掉。
+            if not getattr(self, '_dock_hui_fu_hao', False):
+                return
+            # 主窗口还没上屏的时候，布局是临时摆的样，不算数。
+            # （用 BAT 带文件夹启动时，加载图片会先触发一次存盘，那一枪必须挡住）
+            if not force and not self.main_window.isVisible():
+                return
             self._remove_orphan_docks()
             byte_state = self.main_window.saveState()
             if byte_state.isEmpty():
                 return
+            # 一个面板都不显示时存下来的 state 是废数据（软件还没上屏、dock 还
+            # 没显示出来的时候就是这种）。这种 state 存进去，下次恢复就是一片
+            # 塌掉的布局 —— 全被压扁、位置全错。宁可这一枪不存。
+            dous_ke_jian = [
+                self.thumbnail_dock, self.shape_text_dock,
+                self.shape_translation_dock, self.flag_dock,
+                self.label_dock, self.shape_dock, self.file_dock,
+                self.navigator_dock, self.tools_dock,
+            ]
+            if not any(d.isVisible() for d in dous_ke_jian):
+                return
             settings = self._dock_settings()
             settings.setValue("dock/state", byte_state)
-            # Also save per-dock sizes explicitly.
-            # saveState()/restoreState() preserves positions and tabbing well,
-            # but internal splitter proportions between vertically stacked docks
-            # can drift on restore (especially when a dock is collapsed to near
-            # minimum). Saving explicit heights and restoring them after
-            # restoreState() fixes this.
+            # 存每个面板的宽和高。存它是为了下次恢复完能拿它来"对账" ——
+            # restoreState 返回 True 只说明它能解析这份 state，不代表摆对了，
+            # 所以不能拿它当"恢复成功"的证据。
             dock_sizes = {}
             for dock in [self.thumbnail_dock, self.shape_text_dock, self.shape_translation_dock,
                          self.flag_dock, self.label_dock, self.shape_dock, self.file_dock,
                          self.navigator_dock]:
-                if dock.isVisible():
-                    dock_sizes[dock.objectName()] = dock.height()
+                if not dock.isVisible():
+                    continue
+                # 跟别的面板 tab 在一起（共用同一块位置）的面板不单独存：
+                # 它们本来共享一份尺寸，各存各的会存出两个对不上的数（实测一个
+                # 392、一个 158），下次照着对账就全是假警报。
+                try:
+                    if self.main_window.tabifiedDockWidgets(dock):
+                        continue
+                except Exception:
+                    pass
+                dock_sizes[dock.objectName()] = [dock.width(), dock.height()]
             settings.setValue("dock/sizes", json.dumps(dock_sizes))
+            # 记下存这份尺寸时窗口有多大。面板尺寸是绝对像素，窗口大小一变就对
+            # 不上 —— 对账时按窗口尺寸折算，才知道"差"是因为窗口变了还是真摆错了。
+            settings.setValue("dock/sizes_winw", int(self.window().width()))
+            settings.setValue("dock/sizes_winh", int(self.window().height()))
         except Exception as e:
             logger.error(f"Error saving dock state: {e}")
+
+    def _dock_shi_fou_ke_load(self):
+        """每 200ms 看一次窗口，够格了才去恢复布局：
+        - 窗口得先上屏；
+        - window.ini 说该最大化的，得等真最大化了（showMaximized 是异步的，
+          没生效完窗口还停在上一次的尺寸，这时候恢复等于按错尺寸摆）；
+        - 宽度得连着两次没变（窗口彻底定下来了）。
+        一直不满足就 3 秒后强行来一枪，不能永远不恢复。
+        """
+        self._dock_deng_chong += 1
+        win = self.window()
+        w = win.width()
+        ying_zui_da = self._window_settings().value("window/maximized", True)
+        if isinstance(ying_zui_da, str):
+            ying_zui_da = ying_zui_da.strip().lower() in ("true", "1")
+        dao_wei = win.isVisible() and (not ying_zui_da or win.isMaximized())
+        ke_yi = dao_wei and w == self._dock_shang_ci_w
+        self._dock_shang_ci_w = w
+        if ke_yi or self._dock_deng_chong >= 15:
+            self._dock_deng_timer.stop()
+            self.load_dock_state()
+
+    def _dock_chi_cun_bian_le_chong_bai(self):
+        """恢复完布局之后窗口尺寸又变了（showMaximized 迟到、图片把窗口撑大），
+        那就按新尺寸再摆一次。最多补 3 次，之后不再动。"""
+        if not getattr(self, "_dock_hui_fu_hao", False):
+            return
+        if getattr(self, "_dock_chong_bai_ci_shu", 0) >= 7:
+            return
+        byte_state = getattr(self, "_dock_byte_state", None)
+        if byte_state is None:
+            return
+        w = self.window().width()
+        h = self.window().height()
+        if abs(w - self._dock_hui_fu_w) < 20 and abs(h - self._dock_hui_fu_h) < 20:
+            return
+        self._dock_chong_bai_ci_shu += 1
+        self._dock_hui_fu_w = w
+        self._dock_hui_fu_h = h
+        self.main_window.restoreState(byte_state)
+        QtCore.QTimer.singleShot(700, self._dock_chi_cun_bian_le_chong_bai)
 
     def load_dock_state(self):
         """Load dock state from local file (not registry)."""
@@ -17322,84 +17403,51 @@ class LabelingWidget(QtWidgets.QWidget):
             settings = self._dock_settings()
             byte_state = settings.value("dock/state", QtCore.QByteArray())
             if not byte_state or (isinstance(byte_state, QtCore.QByteArray) and byte_state.isEmpty()):
+                # 文件里还没有布局（第一次用），不是失败 —— 之后照常存
+                self._dock_hui_fu_hao = True
                 return
             if self.main_window.restoreState(byte_state):
+                self._dock_hui_fu_hao = True
+                self._dock_byte_state = byte_state
+                self._dock_chong_bai_ci_shu = 0
+                self._dock_hui_fu_w = self.window().width()
+                self._dock_hui_fu_h = self.window().height()
                 # Explicitly restore per-dock heights that saveState() may not
                 # perfectly preserve (especially collapsed docks).
                 # _dock_state_loaded is set inside the deferred callback to
                 # prevent resizeEvent from saving wrong sizes before apply.
                 self._apply_saved_dock_sizes(settings)
+                # 恢复的这一枪要是打在"窗口还没到最终尺寸"的时刻，摆出来就是错的。
+                # 过 700ms 检查一次尺寸，真变了就重摆 —— 只认尺寸这个事实，不靠猜。
+                QtCore.QTimer.singleShot(700, self._dock_chi_cun_bian_le_chong_bai)
             else:
                 self.reset_dock_layout()
             # 清理 restoreState 创建的没有 objectName 的临时 dock
             self._remove_orphan_docks()
         except Exception as e:
+            # 读坏了也不删键、不写盘 —— 留着原文件，下次还能试
             logger.warning(f"Error restoring dock state: {e}")
-            try:
-                self._dock_settings().remove("dock/state")
-            except Exception:
-                pass
         finally:
             if was_maximized:
                 QtCore.QTimer.singleShot(0, lambda: self.window().showMaximized())
 
     def _apply_saved_dock_sizes(self, settings):
-        """Apply per-dock heights saved alongside saveState().
+        """等布局稳定，然后打开"可以存盘"的开关。
 
-        Qt's internal QDockAreaLayout uses QSplitter to manage dock sizes.
-        After restoreState(), subsequent layout passes recalculate splitter
-        positions based on sizeHint(), overriding any resizeDocks() call.
-        To work around this, we temporarily lock each dock's height (min=max)
-        so the splitter cannot move them, then release the lock after the
-        layout stabilizes. The splitter positions stay locked in place.
+        高度和位置全部交给 Qt 自己的 restoreState（实测恢复得很准）。
+        以前这里会按存下来的像素高度把每个面板锁死（min = max），窗口一变就被
+        压扁、tab 在一起的面板还会被拆开 —— "开关几次按钮被压没"就是这么来的。
         """
-        try:
-            sizes_json = settings.value("dock/sizes")
-            if not sizes_json:
-                self._dock_state_loaded = True
-                self.save_dock_state(force=True)
-                return
-            dock_sizes = json.loads(sizes_json)
-            right_docks = [self.thumbnail_dock, self.shape_text_dock,
-                           self.shape_translation_dock, self.flag_dock,
-                           self.label_dock, self.shape_dock, self.file_dock,
-                           self.navigator_dock]
-            locked_docks = []
-            for dock in right_docks:
-                if dock.isVisible() and dock.objectName() in dock_sizes:
-                    h = dock_sizes[dock.objectName()]
-                    # Lock height so Qt's layout pass cannot resize this dock.
-                    dock.setMinimumHeight(h)
-                    dock.setMaximumHeight(h)
-                    locked_docks.append(dock)
-            if not locked_docks:
-                self._dock_state_loaded = True
-                self.save_dock_state(force=True)
-                return
-            # 这些面板被锁成"最小高度 = 上次保存的高度"，加起来可能超过屏幕可用
-            # 高度，主窗口的最小尺寸就会被顶到比屏幕还高 —— 启动最大化时 Windows
-            # 装不下，就报 QWindowsWindow::setGeometry 警告。
-            # 锁期间把主窗口的最小尺寸临时放开，_unlock 时恢复。
-            _zhuchuangkou = self.window()
-            _zhuchuangkou.setMinimumSize(1, 1)
-            # Release the height lock after layout has fully settled.
-            # At this point the splitter has accepted the forced positions
-            # and subsequent layout passes will respect them.
-            def _unlock():
-                try:
-                    for dock in locked_docks:
-                        if dock.isVisible():
-                            dock.setMinimumHeight(0)
-                            dock.setMaximumHeight(16777215)
-                except Exception:
-                    pass
-                finally:
-                    _zhuchuangkou.setMinimumSize(0, 0)
-                    self._dock_state_loaded = True
-                    self.save_dock_state(force=True)
-            QtCore.QTimer.singleShot(800, _unlock)
-        except Exception:
-            pass
+        QtCore.QTimer.singleShot(800, self._dock_deng_wen)
+
+    def _dock_deng_wen(self):
+        """布局稳定之后：只放开"可以存盘"的开关，绝不在这里存盘。
+
+        开软件时界面还在陆续加载（图片、缩略图、导航器都在改布局），这一枪要是
+        存下去，存的是个"半成品"，下次照着它恢复就更扁，开关几次越来越歪。
+        文件只在用户真动了布局（拖拽面板、翻页、关软件）的时候才写。
+        """
+        self._dock_state_loaded = True
 
     def _remove_orphan_docks(self):
         """删除 restoreState 产生的没有 objectName 的临时 QDockWidget"""
@@ -17411,7 +17459,7 @@ class LabelingWidget(QtWidgets.QWidget):
                 self.main_window.removeDockWidget(dock)
                 dock.close()
 
-    def reset_dock_layout(self):
+    def reset_dock_layout(self, yong_hu_dian=False):
         """Reset dock widget layout to default positions."""
         # removeDockWidget fully removes dock from layout (unlike close() which
         # only hides). This properly clears tab/nested configurations so
@@ -17452,7 +17500,11 @@ class LabelingWidget(QtWidgets.QWidget):
             Qt.Horizontal,
         )
 
-        QtCore.QTimer.singleShot(100, self.save_dock_state)
+        # 只有用户自己点「重置布局」才算认可这套摆法、之后允许正常保存。
+        # 启动时"读不上来"被动摆的默认不算 —— 那种情况必须保持"不许写盘"，
+        # 否则一次读取失败就会把你的布局永久覆盖成出厂默认。
+        if yong_hu_dian:
+            self._dock_hui_fu_hao = True
         try:
             self.parent.parent.statusBar().showMessage(self.tr("Dock layout reset to default"), 5000)
         except Exception:
@@ -17693,86 +17745,13 @@ class LabelingWidget(QtWidgets.QWidget):
         # self.settings.setValue('window/geometry', self.saveGeometry())
 
     def eventFilter(self, obj, event):
-        """Filter events for double-click on dock title and dock auto-collapse."""
-        # Dock auto-collapse: detect resize, debounce check
-        if isinstance(obj, QtWidgets.QDockWidget) and event.type() == QtCore.QEvent.Resize:
-            if not hasattr(self, '_dock_collapse_timer'):
-                self._dock_collapse_timer = QtCore.QTimer()
-                self._dock_collapse_timer.setSingleShot(True)
-                self._dock_collapse_timer.timeout.connect(self._check_dock_collapse)
-            self._dock_collapse_timer.start(500)
+        """Filter events for double-click on dock title."""
         # Double-click on shape_dock title bar → open object manager
         if hasattr(self, "shape_dock") and self.shape_dock and obj is self.shape_dock.titleBarWidget():
             if event.type() == QtCore.QEvent.MouseButtonDblClick:
                 self.object_manager()
                 return True
         return super(LabelingWidget, self).eventFilter(obj, event)
-
-    def _check_dock_collapse(self):
-        """Auto-hide docks resized too small (drawer behavior).
-        Drag a dock to the very edge → it hides.
-        Reopen from View menu or click its toggleViewAction.
-        """
-        # Don't auto-collapse while user is actively dragging (mouse button pressed).
-        # This prevents crash when nesting two docks side by side — one dock
-        # temporarily gets very small during the drag, and collapsing it mid-drag
-        # then calling resizeDocks causes a Qt C++ segfault.
-        if QtWidgets.QApplication.mouseButtons() & (Qt.LeftButton | Qt.RightButton):
-            return
-        THRESHOLD = 8
-        collapsible = [self.shape_text_dock, self.shape_translation_dock, self.flag_dock, self.label_dock,
-                       self.shape_dock, self.file_dock, self.thumbnail_dock]
-        for dock in collapsible:
-            if not dock.isVisible():
-                continue
-            area = self.main_window.dockWidgetArea(dock)
-            if area in (Qt.LeftDockWidgetArea, Qt.RightDockWidgetArea):
-                if 0 < dock.width() <= THRESHOLD:
-                    if not hasattr(dock, '_prev_width'):
-                        dock._prev_width = max(dock.width(), 200)
-                    dock.hide()
-            elif area in (Qt.TopDockWidgetArea, Qt.BottomDockWidgetArea):
-                if 0 < dock.height() <= THRESHOLD:
-                    if not hasattr(dock, '_prev_height'):
-                        dock._prev_height = max(dock.height(), 200)
-                    dock.hide()
-
-    def _restore_dock_size(self, visible):
-        """Restore dock size when re-shown after auto-collapse (drawer pull-out)."""
-        if not visible:
-            return
-        # Find which dock triggered this signal
-        sender = self.sender()
-        if not sender or not isinstance(sender, QtWidgets.QDockWidget):
-            return
-        # Only restore if this dock was previously auto-collapsed
-        prev_w = getattr(sender, '_prev_width', None)
-        prev_h = getattr(sender, '_prev_height', None)
-        if not prev_w and not prev_h:
-            return
-        # Defer resizeDocks to next event loop to avoid segfault when
-        # the dock is in a nested/split configuration. Calling resizeDocks
-        # synchronously during visibilityChanged can crash Qt's layout engine.
-        def _do_resize():
-            try:
-                if not sender.isVisible():
-                    return
-                area = self.main_window.dockWidgetArea(sender)
-                if area in (Qt.LeftDockWidgetArea, Qt.RightDockWidgetArea) and prev_w and prev_w > 8:
-                    self.main_window.resizeDocks([sender], [prev_w], Qt.Horizontal)
-                    if hasattr(sender, '_prev_width'):
-                        delattr(sender, '_prev_width')
-                elif area in (Qt.TopDockWidgetArea, Qt.BottomDockWidgetArea) and prev_h and prev_h > 8:
-                    self.main_window.resizeDocks([sender], [prev_h], Qt.Vertical)
-                    if hasattr(sender, '_prev_height'):
-                        delattr(sender, '_prev_height')
-            except Exception as e:
-                logger.warning(f"Error restoring dock size: {e}")
-                if hasattr(sender, '_prev_width'):
-                    delattr(sender, '_prev_width')
-                if hasattr(sender, '_prev_height'):
-                    delattr(sender, '_prev_height')
-        QtCore.QTimer.singleShot(0, _do_resize)
 
     # QT Overload
     def dragEnterEvent(self, event):

@@ -104,6 +104,25 @@ def _find_main_window():
     return _enum_match(lambda title: title == APP_TITLE)
 
 
+def _shi_qt_zhu_chuangkou(hwnd):
+    """兜底认窗时用：必须是可见的 Qt 主窗口（类名以 Qt 开头、不是 Dialog）。
+
+    FindWindowW 只比标题、根本不看窗口类，别的软件标题撞名就会中招
+    （比如 SourceGit 把仓库文件夹名当标题，正好就叫 YSG-AnyLabeling）。
+    """
+    if not hwnd:
+        return False
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    GWL_STYLE = -16
+    WS_VISIBLE = 0x10000000
+    if not (u32.GetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE):
+        return False
+    lei_buf = ctypes.create_unicode_buffer(256)
+    u32.GetClassNameW(hwnd, lei_buf, 256)
+    lei_ming = lei_buf.value or ""
+    return lei_ming.startswith("Qt") and "Dialog" not in lei_ming
+
+
 if len(sys.argv) < 2:
     sys.exit(2)
 
@@ -114,11 +133,14 @@ titles = _load_active_titles()
 hwnd = _find_main_window()
 if not hwnd:
     for t in titles:
-        hwnd = user32.FindWindowW(None, t)
-        if hwnd:
+        hou_xuan = user32.FindWindowW(None, t)
+        if _shi_qt_zhu_chuangkou(hou_xuan):
+            hwnd = hou_xuan
             break
 if not hwnd:
-    hwnd = user32.FindWindowW(None, APP_TITLE)
+    hou_xuan = user32.FindWindowW(None, APP_TITLE)
+    if _shi_qt_zhu_chuangkou(hou_xuan):
+        hwnd = hou_xuan
 if not hwnd:
     sys.exit(2)
 

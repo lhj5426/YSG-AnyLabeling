@@ -155,6 +155,15 @@ class HorizontalThumbnailItem(QtWidgets.QGraphicsPixmapItem):
         self.show_annotations = False
         self.fill_annotations = False
         self.image_category = category_badge_text(path)
+        # 占位符就用真实宽高比（QImageReader 只读文件头，不解码，开销极小）。
+        # 之前默认 0.75，图加载完后宽度一变就触发整体重排，旁边的图被推得
+        # 移位 —— 反向滚动时"卡片撞过来"的观感就是这么来的。
+        try:
+            _size = QtGui.QImageReader(path).size()
+            if _size.isValid() and _size.height() > 0:
+                self.aspect_ratio = _size.width() / float(_size.height())
+        except Exception:
+            pass
         self.update_placeholder()
 
     def set_image_category(self, category):
@@ -1153,14 +1162,22 @@ class HorizontalViewerDialog(QtWidgets.QDialog):
         right = scene_rect.right()
         
         # 找到当前可见的图片索引范围
+        # 注意：反向模式下 items 是从右往左摆的（索引越大 x 越小），
+        # "越右界就 break"只在正向成立；反向要把 continue/break 对调，
+        # 否则循环一进来碰到索引0（最右侧）就 break，一张图都不加载
+        # —— 反向滚动有时候加载不出来图片就是这个。
         visible_indices = []
         for i, item in enumerate(self.items_list):
             try:
                 ix = item.pos().x()
                 iw = item.boundingRect().width()
-                if ix + iw < left: continue 
-                if ix > right: break 
-                
+                if self.reverse_mode:
+                    if ix > right: continue
+                    if ix + iw < left: break
+                else:
+                    if ix + iw < left: continue
+                    if ix > right: break
+
                 visible_indices.append(i)
                 if not item.loaded and not item.loading:
                     self.load_image(item, priority=10)
