@@ -32,6 +32,7 @@ import shutil
 import struct
 import subprocess
 import time
+import unicodedata
 from collections import OrderedDict
 
 import cv2
@@ -40,6 +41,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, pyqtSignal
 
 from anylabeling.views.labeling.logger import logger
+from anylabeling.views.labeling.widgets.color_dialog import YsgColorDialog
 from anylabeling.views.labeling.widgets.video_infer_panel import (
     CAOWEI_SHU,
     YANSE_KUANG,
@@ -117,6 +119,15 @@ BO_FANGDA_MOREN = 1.0             # 波形振幅缩放：1 = 原样，越大波�
 BO_FANGDA_ZUI_XIAO = 0.2          # 波形振幅缩放最小倍数
 BO_FANGDA_ZUIDA = 50.0            # 波形振幅缩放最大倍数
 YANSE_QUYU = "#00E5FF"            # 检测区域框颜色（在视频画面上框选时）
+YANSE_ZHEMO = "#FF8A00"           # 字幕遮罩（\clip）框颜色，跟检测区域区分开
+YANSE_DINGWEI = "#FFC800"         # 拖放模式：锚点方块的颜色（选中的那条）
+# 拖放模式：画面上别的行（没选中的）锚点方块的颜色，照 AEG 的
+# Lines Primary rgb(187,0,0)（src/libresrc/default_config.json 的 Visual Tools）
+YANSE_DINGWEI_TA = "#BB0000"
+DINGWEI_KUAI_BAN = 8              # 锚点方块半边长（像素）
+YANSE_SHILIANG = "#00C8FF"        # 遮盖矢量图：选中时的框和 8 个手柄的颜色
+SHILIANG_SHOU_BAN = 3             # 手柄方块半边长（像素）
+SHILIANG_SHOU_BAN_JIA = 3         # 认手柄时再放宽几个像素（太小不好按）
 YANSE_CHONGDIE = "#FFC107"        # 字幕块摞在一起时，时间轴顶端那个 L 形标记的颜色
 CHONGDIE_L_GAO = 26               # 那个 L 形标记的竖线往上竖多高（竖到时间轴的刻度条里）
 CHONGDIE_SHEN_ALPHA = 75          # 摞在一起的那一段压深多少（0-255，越大越深）
@@ -141,7 +152,8 @@ CHEXIAO_HEBING_MIAO = 1.5         # 同一类动作连着做，隔这么近就�
 ZIMU_HOUZHUI = (".srt", ".ass", ".ssa")   # 认得的字幕文件后缀（拖进窗口就载入）
 ZIMU_TIAO_GAO = 34                # 画面下方那条字幕对照条的高度
 ZIMU_TIAO_ZIHAO = 15              # 字幕对照条的字号
-XINJIAN_ZIMU_MS = 1000            # 没选中字幕块时按回车：以播放头为起点新建的字幕块多长（毫秒）
+XINJIAN_ZIMU_MS = 3000            # 新建字幕块多长（毫秒）：按回车建空白块、插入行都用它
+#                                  （AEG 那边 Default Duration 默认也是 3000）
 ZIDONG_BAOCUN_MIAO = 60           # 自动保存间隔（秒）：隔这么久、字幕又变过，就存一份带时间戳的进「自动保存」
 ZIDONG_BAOCUN_JIA = "自动保存"     # 自动保存文件夹名（跟字幕文件建在同一层）
 ZIDONG_BEIFEN_JIA = "自动备份"     # 自动备份文件夹名（跟字幕文件建在同一层）
@@ -1869,8 +1881,19 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
 
     chicun_bian = pyqtSignal()      # 控件尺寸变了 -> 外面重算该把帧缩到多大
     quyu_bian = pyqtSignal(object)  # 框选完了 -> (x,y,w,h) 原始像素；没框成 -> None
+    zhemo_bian = pyqtSignal(object)  # 字幕遮罩画完了 -> (左,上,右,下) 脚本坐标；没画成 -> None
+    shiliang_bian = pyqtSignal(object)  # 遮盖矢量图框完了 -> (左,上,右,下) 脚本坐标；没框成 -> None
     xin_zhen_dao = pyqtSignal(bool)  # mpv 那边说该重画了（真出新帧 -> True）
     youjian = pyqtSignal(object)    # 画面里点了右键 -> 控件坐标 QPoint（菜单归外面弹）
+    shuangji = pyqtSignal(object)   # 标准模式双击画面 -> 控件坐标 QPoint
+    pos_tuo_qi = pyqtSignal(object)  # 拖放模式按下锚点方块 -> (第几条, 脚本坐标 (x,y))
+    pos_tuo = pyqtSignal(object)    # 拖放模式正拖着 -> 脚本坐标 (x,y)（实时）
+    pos_tuo_wan = pyqtSignal(object)  # 拖放模式松手 -> 脚本坐标 (x,y)（这一下要落盘）
+    kuang_dian = pyqtSignal(int)      # 点在某个遮盖矢量图的框里 -> 第几条（选中它）
+    kuang_tuo_qi = pyqtSignal(object)  # 按住矢量图的框/手柄 -> (第几条, 哪个手柄, 脚本坐标)
+    kuang_tuo = pyqtSignal(object)    # 正拖着矢量图 -> (脚本 x, 脚本 y, 修饰键)
+    kuang_tuo_wan = pyqtSignal(object)  # 松手 -> 同上（这一下要落盘）
+    zimu_chong_hua = pyqtSignal()   # 画面里那层字幕重画过了（拖放方块按它校准）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1886,8 +1909,28 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         self._zimu = []              # 现在要叠在画面上的字幕（外面算好塞进来）
         self._zimu_jizhun = HUA_ZIMU_JIZHUN   # 字幕坐标的基准分辨率
         self._zai_kuang_xuan = False  # 是否正处于框选状态
+        self._kuang_xuan_yong = "quyu"  # 这次框选干什么用："quyu" 检测区域 / "zhemo" 字幕遮罩
+        # 鼠标模式：标准的（双击画面 = 把选中的字幕搬过去）/ 拖放的（拖锚点方块
+        # 移动字幕）。照 AEG 那两种 visual tool（src/visual_tool_cross.cpp /
+        # visual_tool_drag.cpp），右键菜单里切换。
+        self._shu_biao_mo = "biaozhun"
+        self._dingwei_kuai = None    # 拖放模式：选中字幕的锚点方块（控件坐标 QPoint）
+        self._dingwei_kuai_xu = None  # 那个方块是第几条字幕的（别的行方块靠它让位）
+        self._zai_tuo_pos = False    # 正按着锚点方块拖
+        # 上一次画字幕层时，各条字幕的锚点落在哪（脚本坐标）：{第几条: (x, y)}
+        self._maodian_ji = {}
+        # 遮盖矢量图：上一笔真画出来的框（脚本坐标）+ 对齐 + \pN
+        # {第几条: (左, 上, 右, 下, \an, \pN)}；拖角/拖边算的就是这个框
+        self._kuang_ji = {}
+        self._shiliang_kuang = None   # 选中的那条矢量图在画面上的框（控件坐标 QRectF）
+        self._shiliang_xu = None      # 那是第几条
+        self._zai_tuo_kuang = False   # 正按着矢量图的框/手柄拖
+        self._kuang_shou = None       # 拖的是哪个手柄（"nw"…"w" / "nei" = 框里）
         self._tuo_qi = None          # 拖拽起点（原始像素）
         self._tuo_dao = None         # 拖拽终点（原始像素）
+        # 画面上方飘的小提示（保存完给个明确反馈，不然按了 Ctrl+S 心里没底）
+        self._tishi = ""
+        self._tishi_dao = 0.0
         # mpv 渲染上下文（建一次，关窗口时释放）
         self._mpv = None             # MpvBofang
         self._render = None
@@ -1917,8 +1960,10 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
     def zai_kuang_xuan(self):
         return self._zai_kuang_xuan
 
-    def kaishi_kuang_xuan(self):
+    def kaishi_kuang_xuan(self, yong="quyu"):
+        """进框选状态。yong：\"quyu\" 框检测区域 / \"zhemo\" 画字幕遮罩 / \"shiliang\" 画遮盖矢量图"""
         self._zai_kuang_xuan = True
+        self._kuang_xuan_yong = yong
         self._tuo_qi = None
         self._tuo_dao = None
         self.setCursor(Qt.CrossCursor)
@@ -1928,8 +1973,212 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         self._zai_kuang_xuan = False
         self._tuo_qi = None
         self._tuo_dao = None
-        self.unsetCursor()
+        # 松手后光标照 AEG：就是系统箭头，不搞小手（两种鼠标模式都一样）
+        self.setCursor(Qt.ArrowCursor)
         self.update()
+
+    # ---- 鼠标模式：标准（双击定位）/ 拖放（拖锚点方块移动），照 AEG 的两种工具 ----
+    def shu_biao_mo(self):
+        return self._shu_biao_mo
+
+    def shezhi_shu_biao_mo(self, mo):
+        """切鼠标模式。拖放模式才在画面上摆锚点方块，标准模式把它收掉"""
+        self._shu_biao_mo = "tuofang" if mo == "tuofang" else "biaozhun"
+        if self._shu_biao_mo != "tuofang":
+            self._zai_tuo_pos = False
+            self._dingwei_kuai = None
+            self._dingwei_kuai_xu = None
+            self._zai_tuo_kuang = False
+            self._kuang_shou = None
+            self._shiliang_kuang = None
+            self._shiliang_xu = None
+        if not self._zai_kuang_xuan:
+            self.setCursor(Qt.ArrowCursor)   # 照 AEG：拖放模式也是系统箭头
+        self.update()
+
+    def shezhi_dingwei_kuai(self, dian, xu=None):
+        """拖放模式选中那条的锚点方块摆在哪（控件坐标 QPoint）；None = 收起来不画
+
+        xu 是这条是第几条（画别的行方块时给它让位、按它走选中色）。
+        """
+        xin = (
+            QtCore.QPoint(int(dian.x()), int(dian.y())) if dian is not None else None
+        )
+        if xin is None:
+            self._dingwei_kuai_xu = None
+        if xin == self._dingwei_kuai and xu == self._dingwei_kuai_xu:
+            return          # 没挪就别重画（字幕层每次重画都会来问一遍）
+        self._dingwei_kuai = xin
+        self._dingwei_kuai_xu = None if xu is None else int(xu)
+        self.update()
+
+    def tiao_maodian(self, xu):
+        """第 xu 条字幕锚在控件哪个点 —— 拿画面真画那一笔算出来的值
+
+        画面里那层字幕是逐条画上去的，画的时候顺手把锚点记在了那条身上
+        （见 _hua_ass_tiao 末尾）。拖放方块直接用这个，跟画面显示必然一致，
+        不会出现"方块和字幕差了十万八千里"。这条此刻不在画面上（播放头没压
+        着它）就给 None。
+        """
+        jd = self._maodian_ji.get(int(xu))
+        if jd is None:
+            return None
+        return self.kongjian_zuobiao(jd[0], jd[1])
+
+    # ---- 遮盖矢量图：框住的那块能拖角改长宽 / 拖里面挪位置 ----
+    def tiao_kuang_juben(self, xu):
+        """第 xu 条矢量图画出来的框（脚本坐标）+ 它对的对齐 + \\pN
+
+        跟锚点一个道理：这是画面真画那一笔量出来的，手柄照它摆、拖完也算回
+        \\fscx/\\fscy/\\pos，两边永远对得上。这条此刻不在画面上就给 None。
+        """
+        ju = self._kuang_ji.get(int(xu))
+        return tuple(ju) if ju else None
+
+    def tiao_kuang(self, xu):
+        """第 xu 条矢量图画在控件哪个框里（QRectF）；没这条给 None"""
+        ju = self._kuang_ji.get(int(xu))
+        if not ju:
+            return None
+        q = self.kongjian_zuobiao(ju[0], ju[1])
+        r = self.kongjian_zuobiao(ju[2], ju[3])
+        if q is None or r is None:
+            return None
+        return QtCore.QRectF(
+            QtCore.QPointF(q), QtCore.QPointF(r)
+        ).normalized()
+
+    def shezhi_shiliang_kuang(self, kuang, xu=None):
+        """拖放模式：选中的那条矢量图的框摆在哪（控件坐标 QRectF）；None = 收起来
+
+        xu = 那是第几条（画框的时候按它认是哪条；拖别的东西拖到一半时也不认错）。
+        """
+        xin = None
+        if kuang is not None:
+            xin = QtCore.QRectF(kuang).normalized()
+        xu = None if xu is None else int(xu)
+        if xin == self._shiliang_kuang and xu == self._shiliang_xu:
+            return
+        self._shiliang_kuang = xin
+        self._shiliang_xu = xu
+        self.update()
+
+    def _shou_wei_zhi(self):
+        """矢量图那 8 个手柄在控件坐标里各在哪（四角 + 四边中点）"""
+        r = self._shiliang_kuang
+        if r is None:
+            return {}
+        cx = (r.left() + r.right()) / 2.0
+        cy = (r.top() + r.bottom()) / 2.0
+        return {
+            "nw": (r.left(), r.top()), "n": (cx, r.top()),
+            "ne": (r.right(), r.top()), "w": (r.left(), cy),
+            "e": (r.right(), cy), "sw": (r.left(), r.bottom()),
+            "s": (cx, r.bottom()), "se": (r.right(), r.bottom()),
+        }
+
+    def _shou_bing(self, dian):
+        """鼠标压在选中矢量图的哪个手柄上；在框里给 "nei"；没压着给 None"""
+        r = self._shiliang_kuang
+        if r is None or self._shiliang_xu is None:
+            return None
+        b = float(SHILIANG_SHOU_BAN + SHILIANG_SHOU_BAN_JIA)
+        for shou, (x, y) in self._shou_wei_zhi().items():
+            if abs(dian.x() - x) <= b and abs(dian.y() - y) <= b:
+                return shou
+        if r.contains(QtCore.QPointF(dian)):
+            return "nei"
+        return None
+
+    def _shiliang_zai(self, dian):
+        """点在哪个遮盖矢量图的框里 -> 第几条（选中的那条先认；都认不到给 None）"""
+        for xu in sorted(
+            self._kuang_ji, key=lambda x: (x != self._shiliang_xu, x)
+        ):
+            ju = self._kuang_ji[xu]
+            q = self.kongjian_zuobiao(ju[0], ju[1])
+            r = self.kongjian_zuobiao(ju[2], ju[3])
+            if q is None or r is None:
+                continue
+            kuang = QtCore.QRectF(
+                QtCore.QPointF(q), QtCore.QPointF(r)
+            ).normalized()
+            if kuang.contains(QtCore.QPointF(dian)):
+                return int(xu)
+        return None
+
+    # ---- 画面上飘的小提示（保存完给人一个明确的反馈） ----
+    def xianshi_tishi(self, wen, miao=1.6):
+        """在画面上方飘一条小提示，过一会儿自己消失
+
+        保存字幕这类动作做完必须让人看得见 —— 不然会反复按 Ctrl+S 试探。
+        """
+        self._tishi = str(wen or "")
+        self._tishi_dao = time.time() + float(miao)
+        self.update()
+        QtCore.QTimer.singleShot(
+            int(float(miao) * 1000) + 40, self._tishi_gai_mei
+        )
+
+    def _tishi_gai_mei(self):
+        """到点了就把提示收掉（期间又飘了新的一条就不动它）"""
+        if not self._tishi or time.time() < self._tishi_dao:
+            return
+        self._tishi = ""
+        self.update()
+
+    def _hua_tishi(self, huabi):
+        """把这条提示画在画面上方正中（盖在字幕层上面）"""
+        if not self._tishi:
+            return
+        huabi.save()
+        huabi.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        ziti = QtGui.QFont(huabi.font())
+        ziti.setPointSize(max(11, int(self.height() / 46)))
+        ziti.setBold(True)
+        huabi.setFont(ziti)
+        kuang = huabi.fontMetrics().boundingRect(self._tishi).adjusted(
+            -18, -10, 18, 10
+        )
+        kuang.moveCenter(
+            QtCore.QPoint(self.width() // 2, max(34, int(self.height() * 0.07)))
+        )
+        huabi.setPen(Qt.NoPen)
+        huabi.setBrush(QtGui.QColor(0, 0, 0, 180))
+        huabi.drawRoundedRect(kuang, 8, 8)
+        huabi.setPen(QtGui.QColor(255, 255, 255))
+        huabi.drawText(kuang, Qt.AlignCenter, self._tishi)
+        huabi.restore()
+
+    def _zai_dingwei_kuai(self, dian):
+        """鼠标是不是压在这个锚点方块上（留了点富余，好按）"""
+        if self._dingwei_kuai is None:
+            return False
+        return (
+            abs(dian.x() - self._dingwei_kuai.x()) <= DINGWEI_KUAI_BAN + 2
+            and abs(dian.y() - self._dingwei_kuai.y()) <= DINGWEI_KUAI_BAN + 2
+        )
+
+    def _an_xia_de_kuai(self, dian):
+        """拖放模式按下时压在第几条的方块上；没压到给 None
+
+        选中那条的方块先认（拖着的时候它跟鼠标走），再认别的行的
+        （照 AEG 的 GetFeatureAt：压住谁就是谁的）。
+        """
+        if self._shu_biao_mo != "tuofang":
+            return None
+        if self._zai_dingwei_kuai(dian):
+            return self._dingwei_kuai_xu
+        for xu, jd in self._maodian_ji.items():
+            d = self.kongjian_zuobiao(jd[0], jd[1])
+            if d is None:
+                continue
+            if (
+                abs(dian.x() - d.x()) <= DINGWEI_KUAI_BAN + 2
+                and abs(dian.y() - d.y()) <= DINGWEI_KUAI_BAN + 2
+            ):
+                return int(xu)
+        return None
 
     # ---- 坐标换算：控件像素 <-> 视频原始像素 ----
     def _suofang_bi(self):
@@ -1972,13 +2221,60 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
             return None
         return (int(round(x1)), int(round(y1)), w, h)
 
-    # ---- 鼠标：框选 ----
+    def _qu_zhuan_juben(self, qu):
+        """拖出来的 (x,y,w,h) 视频原始像素 -> 脚本坐标 (左,上,右,下)
+
+        ASS 的 \\clip 写在脚本坐标系里（PlayRes），不是视频像素。AEG 的
+        ToScriptCoords 也是这么换算的（脚本坐标 = 视频像素 × 脚本分辨率 / 视频尺寸）。
+        """
+        yuan = self.yuan_chicun()
+        if not qu or yuan is None:
+            return None
+        jw, jh = self._zimu_jizhun
+        bi_x = float(jw) / float(yuan[0])
+        bi_y = float(jh) / float(yuan[1])
+        return (
+            int(round(qu[0] * bi_x)),
+            int(round(qu[1] * bi_y)),
+            int(round((qu[0] + qu[2]) * bi_x)),
+            int(round((qu[1] + qu[3]) * bi_y)),
+        )
+
+    # ---- 鼠标：框选 / 拖放 ----
     def mousePressEvent(self, event):
         if self._zai_kuang_xuan and event.button() == Qt.LeftButton:
             dian = self._dao_yuanshi(event.pos())
             if dian is not None:
                 self._tuo_qi = dian
                 self._tuo_dao = dian
+                event.accept()
+                return
+        if self._shu_biao_mo == "tuofang" and event.button() == Qt.LeftButton:
+            # 遮盖矢量图：先认选中那条的手柄 / 框里（拖长宽 / 挪位置），
+            # 再认锚点方块（老一套），最后认别的矢量图的框（点一下 = 选中它）
+            shou = self._shou_bing(event.pos())
+            if shou is not None:
+                self._zai_tuo_kuang = True
+                self._kuang_shou = shou
+                zu = self.juben_zuobiao(event.pos())
+                if zu is not None:
+                    self.kuang_tuo_qi.emit((self._shiliang_xu, shou, zu))
+                event.accept()
+                return
+            xu = self._an_xia_de_kuai(event.pos())
+            if xu is not None:
+                # 按住了画面上某一行的锚点方块：开始拖（位置由外面记，这里只管报坐标）
+                # 照 AEG：拖着的时候光标还是系统箭头，不变小手
+                self._zai_tuo_pos = True
+                zu = self.juben_zuobiao(event.pos())
+                if zu is not None:
+                    self.pos_tuo_qi.emit((xu, zu))
+                event.accept()
+                return
+            xu = self._shiliang_zai(event.pos())
+            if xu is not None:
+                # 点在一条矢量图的框里（还不是选中的那条）：把它选中，框就出来了
+                self.kuang_dian.emit(int(xu))
                 event.accept()
                 return
         super().mousePressEvent(event)
@@ -1991,9 +2287,74 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
                 self.update()
             event.accept()
             return
+        if self._zai_tuo_kuang:
+            zu = self.juben_zuobiao(event.pos())
+            if zu is not None:
+                # 框摆到哪儿由外面按 AEG 那套数值算（1 像素 = 1.25 个点），算完
+                # 直接 shezhi_shiliang_kuang 摆回来；这儿只管报坐标
+                self.kuang_tuo.emit((zu[0], zu[1], self._xiu_shi_ming(event)))
+            event.accept()
+            return
+        if self._zai_tuo_pos:
+            zu = self.juben_zuobiao(event.pos())
+            if zu is not None:
+                self._dingwei_kuai = event.pos()    # 方块跟着鼠标走，别等外面回话
+                self.pos_tuo.emit(zu)
+                self.update()
+            event.accept()
+            return
         super().mouseMoveEvent(event)
 
+    @staticmethod
+    def _xiu_shi_ming(event):
+        """拖的时候按着的修饰键：shift 保长宽比 / alt 以中心缩放"""
+        xiu = []
+        m = event.modifiers() if event is not None else Qt.NoModifier
+        if m & Qt.ShiftModifier:
+            xiu.append("shift")
+        if m & Qt.AltModifier:
+            xiu.append("alt")
+        return tuple(xiu)
+
+    def mouseDoubleClickEvent(self, event):
+        """标准模式：双击画面 = 把选中的字幕搬到这个点（照 AEG 的 cross 工具）
+
+        拖放模式不认双击 —— 那会儿鼠标是拿来拖锚点的；框选期间也不认。
+        """
+        if (
+            self._shu_biao_mo == "biaozhun"
+            and not self._zai_kuang_xuan
+            and event.button() == Qt.LeftButton
+        ):
+            self.shuangji.emit(event.pos())
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def mouseReleaseEvent(self, event):
+        if self._zai_tuo_kuang and event.button() == Qt.LeftButton:
+            self._zai_tuo_kuang = False
+            self.setCursor(Qt.ArrowCursor)   # 照 AEG：松手也是系统箭头
+            zu = self.juben_zuobiao(event.pos())
+            if zu is not None:
+                self.kuang_tuo_wan.emit(
+                    (zu[0], zu[1], self._xiu_shi_ming(event))
+                )
+            else:
+                self.kuang_tuo_wan.emit(None)
+            self.update()
+            event.accept()
+            return
+        if self._zai_tuo_pos and event.button() == Qt.LeftButton:
+            self._zai_tuo_pos = False
+            self.setCursor(Qt.ArrowCursor)   # 照 AEG：松手也是系统箭头
+            zu = self.juben_zuobiao(event.pos())
+            if zu is not None:
+                self._dingwei_kuai = event.pos()
+            self.pos_tuo_wan.emit(zu)      # 松手这一下才真写进字幕文件
+            self.update()
+            event.accept()
+            return
         if (
             self._zai_kuang_xuan
             and event.button() == Qt.LeftButton
@@ -2003,8 +2364,15 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
             if dian is not None:
                 self._tuo_dao = dian
             qu = self._tuo_chu_de_qu()
+            yong = self._kuang_xuan_yong
             self.tingzhi_kuang_xuan()
-            if qu:
+            if yong == "zhemo":
+                # 画字幕遮罩：报脚本坐标出去，外面写进那条字幕的 \clip
+                self.zhemo_bian.emit(self._qu_zhuan_juben(qu) if qu else None)
+            elif yong == "shiliang":
+                # 画遮盖矢量图：报脚本坐标出去，外面新建一条 \p1 的方块盖住那儿
+                self.shiliang_bian.emit(self._qu_zhuan_juben(qu) if qu else None)
+            elif qu:
                 self._quyu = qu
                 self.quyu_bian.emit(qu)
             else:
@@ -2046,6 +2414,25 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         return (
             float(d[0]) * float(jw) / float(yuan[0]),
             float(d[1]) * float(jh) / float(yuan[1]),
+        )
+
+    def kongjian_zuobiao(self, jx, jy):
+        """脚本坐标 (x,y) -> 控件坐标 QPoint（juben_zuobiao 的反过程）
+
+        拖放模式拿它算锚点方块该画在哪；没视频给 None。
+        """
+        yuan = self.yuan_chicun()
+        if yuan is None:
+            return None
+        bi, mubiao = self._suofang_bi()
+        if bi <= 0:
+            return None
+        jw, jh = self._zimu_jizhun
+        ix = float(jx) * float(yuan[0]) / float(jw)
+        iy = float(jy) * float(yuan[1]) / float(jh)
+        return QtCore.QPoint(
+            int(round(mubiao.left() + ix * bi)),
+            int(round(mubiao.top() + iy * bi)),
         )
 
     def shezhi_kuang(self, kuang):
@@ -2093,6 +2480,15 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         if tiao == self._zimu:
             return
         self._zimu = tiao
+        # 锚点底账马上算好：光看格式就定，跟字体排版无关。不能等真画那一笔
+        # 再记 —— 那一笔有缓存，指纹没变就不画、账就一直空着，画面上别的行
+        # 的拖放方块会一个都出不来。
+        self._maodian_ji = {
+            int(t.get("xu", -1)): _zimu_maodian_zhi(
+                t.get("gs") or {}, self._zimu_jizhun
+            )
+            for t in tiao
+        }
         self.update()
 
     def qingkong(self):
@@ -2376,7 +2772,63 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         tu = self._zimu_ceng(mubiao)
         if tu is not None:
             huabi.drawImage(mubiao.topLeft(), tu)
+        self._hua_dingwei_kuai(huabi)
+        self._hua_shiliang_kuang(huabi)
+        self._hua_tishi(huabi)
         huabi.end()
+
+    def _hua_dingwei_kuai(self, huabi):
+        """拖放模式：画面上每一行字幕的锚点都画一个可拖的小方块
+
+        照 AEG 的拖放工具（src/visual_tool_drag.cpp 的 OnFileChanged /
+        OnFrameChanged 对每一行 IsDisplayed 的都 MakeFeatures，
+        Draw 里 DrawAllFeatures 全画出来）：选中的那条用黄色（拖着的时候
+        跟鼠标走），别的行用深红（AEG 的 Lines Primary）。
+        """
+        if self._shu_biao_mo != "tuofang":
+            return
+        b = float(DINGWEI_KUAI_BAN)
+        huabi.save()
+        huabi.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        for xu, jd in self._maodian_ji.items():
+            dian = self.kongjian_zuobiao(jd[0], jd[1])
+            if dian is None:
+                continue
+            if xu == self._dingwei_kuai_xu:
+                continue    # 选中的那条单独画（拖着的时候它跟鼠标走）
+            huabi.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 1))
+            huabi.setBrush(QtGui.QColor(YANSE_DINGWEI_TA))
+            huabi.drawRect(QtCore.QRectF(dian.x() - b, dian.y() - b, b * 2.0, b * 2.0))
+        if self._dingwei_kuai is not None:
+            c = self._dingwei_kuai
+            huabi.setPen(QtGui.QPen(QtGui.QColor("#FFFFFF"), 1))
+            huabi.setBrush(QtGui.QColor(YANSE_DINGWEI))
+            huabi.drawRect(QtCore.QRectF(c.x() - b, c.y() - b, b * 2.0, b * 2.0))
+        huabi.restore()
+
+    def _hua_shiliang_kuang(self, huabi):
+        """拖放模式：选中的那条遮盖矢量图画成一圈框 + 8 个手柄
+
+        AEG 里这种方块只能回样式编辑器拖 \fscx / \fscy 两颗滑块（还是整行一起
+        缩放，跟画面看不见关系）；这儿直接在画面上拖角改长宽、拖里面挪位置 ——
+        手柄摆在哪用的是这条真画出来的框（_kuang_ji），跟画面必然重合。
+        """
+        if self._shu_biao_mo != "tuofang" or self._shiliang_kuang is None:
+            return
+        r = self._shiliang_kuang
+        b = float(SHILIANG_SHOU_BAN)
+        huabi.save()
+        huabi.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        bi_hu = QtGui.QPen(QtGui.QColor(YANSE_SHILIANG), 1)
+        bi_hu.setStyle(Qt.DashLine)
+        huabi.setPen(bi_hu)
+        huabi.setBrush(Qt.NoBrush)
+        huabi.drawRect(r)
+        huabi.setPen(QtGui.QPen(QtGui.QColor("#202020"), 1))
+        huabi.setBrush(QtGui.QColor(YANSE_SHILIANG))
+        for _shou, (x, y) in self._shou_wei_zhi().items():
+            huabi.drawRect(QtCore.QRectF(x - b, y - b, b * 2.0, b * 2.0))
+        huabi.restore()
 
     def _zimu_ceng(self, mubiao):
         """画面上那层字幕：整层合成一张图缓存着，每帧只贴这张图
@@ -2400,17 +2852,45 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         tu.fill(Qt.transparent)
         huabi = QtGui.QPainter(tu)
         qu = QtCore.QRect(0, 0, mubiao.width(), mubiao.height())
+        # 锚点底账以 shezhi_zimu 算的那份打底（这一笔没画到的行——比如
+        # 渐隐到全透明的——账也留着），真画出来的再盖一遍，两边一个算法
+        maodian = dict(self._maodian_ji)
+        kuang_ji = {}
         for tiao in self._zimu:
             _hua_ass_tiao(huabi, qu, tiao, self._zimu_jizhun)
+            # 画的时候顺手记下的锚点挪到控件自己身上存着，并把它从这条上摘掉：
+            # 留在 tiao 上会进字幕层的指纹，每帧都变，那层就得每帧重画一遍
+            ax = tiao.pop("_ax", None)
+            ay = tiao.pop("_ay", None)
+            if ax is not None and ay is not None:
+                maodian[int(tiao.get("xu", -1))] = (ax, ay)
+            # 遮盖矢量图那一笔画出来的框也一样挪走：拖角/拖边算的就是它
+            kuang = tiao.pop("_kuang", None)
+            kuang_an = tiao.pop("_kuang_an", 2)
+            kuang_p = tiao.pop("_kuang_p", 1)
+            kuang_frz = tiao.pop("_kuang_frz", 0.0)
+            if kuang is not None:
+                kuang_ji[int(tiao.get("xu", -1))] = tuple(kuang) + (
+                    int(kuang_an), int(kuang_p), float(kuang_frz),
+                )
         huabi.end()
+        self._maodian_ji = maodian
+        self._kuang_ji = kuang_ji
         self._zimu_tu = (qian, tu)
+        # 这一笔刚把各条的锚点记好（_hua_ass_tiao 写的），叫外面把拖放方块校准
+        self.zimu_chong_hua.emit()
         return tu
 
     def _hua_quyu(self, huabi, mubiao):
         """画检测区域：只有一圈虚线框，不动画面；正在拖的时候显示拖出来的框"""
         qu = self._quyu
+        se = YANSE_QUYU
         if self._zai_kuang_xuan and self._tuo_qi is not None:
             qu = self._tuo_chu_de_qu()
+            if self._kuang_xuan_yong == "zhemo":
+                se = YANSE_ZHEMO     # 画字幕遮罩时用橙框，跟检测区域分得清
+            elif self._kuang_xuan_yong == "shiliang":
+                se = YANSE_SHILIANG  # 画遮盖矢量图时用青框
         if not qu or mubiao.width() <= 0:
             return
         iw = self._shipin_kuan
@@ -2423,7 +2903,7 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         y1 = mubiao.top() + qu[1] * bi
         w = qu[2] * bi
         h = qu[3] * bi
-        bi_hu = QtGui.QPen(QtGui.QColor(YANSE_QUYU), 2)
+        bi_hu = QtGui.QPen(QtGui.QColor(se), 2)
         bi_hu.setStyle(Qt.DashLine)
         huabi.setPen(bi_hu)
         huabi.setBrush(Qt.NoBrush)
@@ -2877,11 +3357,480 @@ def _ass_yuan_wen(wenben):
     return str(wenben or "").replace("\\N", "\n").replace("\\n", "\n").strip()
 
 
+def _zhemo_xie_ru(wenben, ju):
+    """把 \\clip(左,上,右,下) 遮罩写进这一行文字
+
+    已经有 \\clip / \\iclip 的就地换掉（画一次改一次，不会越描越多）；
+    没有就塞进开头那对花括号里；连花括号都没有就在最前面开一个。
+    """
+    jia = "\\clip(%d,%d,%d,%d)" % (
+        int(ju[0]), int(ju[1]), int(ju[2]), int(ju[3]),
+    )
+    wen = str(wenben or "")
+    xin, ci = re.subn(r"\\i?clip\([^)]*\)", lambda m: jia, wen, count=1)
+    if ci:
+        return xin
+    pi = re.match(r"^(\{[^}]*\})", wen)
+    if pi:
+        return "{" + pi.group(1)[1:-1] + jia + "}" + wen[pi.end():]
+    return "{" + jia + "}" + wen
+
+
+# ---- 遮盖矢量图（\p1 的白块盖住漫画气泡里的原文）-------------------------
+#
+# 这类行在原文件里都长一个样（照抄一条）：
+#   Dialogue: 0,0:01:26.93,0:01:37.62,旁白-黑字白边垂直,,0,0,0,,
+#   {\fad(300,400)\p1\blur4\c&HFFFFFF&\1a&H00&\fscx185\fscy120\pos(604,14.668)}m 0 0 l 100 0 100 100 0 100
+#
+# 规矩：绘图永远是那个 100×100 的单位方块，长宽交给 \fscx / \fscy，位置交给
+# \pos 加样式的对齐（那套样式 an=7，\pos 就是方块的一个角）。这么写 AEG 打开
+# 还是"两个滑块能拖"，我们额外让它能在画面上直接拖角 / 拖边 —— 拖完改的就是
+# 这两个数，文件格式一个字没变。
+# \fad（渐入渐出）不写：那个看情况手动加，模板里不带。
+SHILIANG_KUAI = 100.0                      # 单位方块边长（\p1 下就是脚本像素）
+SHILIANG_HUATU = "m 0 0 l 100 0 100 100 0 100"
+SHILIANG_TOU = "\\p1\\blur4"               # 颜色标签照选的颜色拼（见 _shiliang_yanse_biao）
+
+
+def _shiliang_yanse_biao(yanse=None):
+    """遮块的颜色标签：\\c 管填充、\\3c 管描边
+
+    样式里那支描边是白的（Outline=10 + \\blur4），光改 \\c 的话彩色块外圈会糊一圈
+    白 —— 所以给颜色的时候连 \\3c / \\3a 一起写。没给颜色（老样子白块）就一个
+    字都不多写，跟以前生成的一模一样。
+    ASS 的颜色是 &HBBGGRR&（蓝绿红倒着排），alpha 是 &HAA&（00 = 不透明）。
+    """
+    if yanse is None:
+        return "\\c&HFFFFFF&\\1a&H00&"
+    try:
+        hong, lv, lan = int(yanse.red()), int(yanse.green()), int(yanse.blue())
+        tou = int(yanse.alpha())
+    except (AttributeError, TypeError, ValueError):      # noqa
+        return "\\c&HFFFFFF&\\1a&H00&"
+    a = max(0, min(255, 255 - tou))
+    biao = "\\c&H%02X%02X%02X&\\1a&H%02X&" % (lan, lv, hong, a)
+    if (hong, lv, lan, tou) != (255, 255, 255, 255):
+        biao += "\\3c&H%02X%02X%02X&\\3a&H%02X&" % (lan, lv, hong, a)
+    return biao
+
+
+def _shiliang_shuzi(wen, jian, moren=0.0):
+    """从这一行里读某个标签的数（\fscx185 / \fscy120 / \p1 这种），读不出来给 moren"""
+    m = re.search(r"\\%s\s*(-?\d+(?:\.\d+)?)" % re.escape(str(jian or "")), str(wen or ""))
+    if not m:
+        return moren
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return moren
+
+
+def _shiliang_p(wen):
+    """这一行眼下开着的 \\pN（0 = 没开绘图）
+
+    只认最后一个就够了 —— 我们自己写的是纯绘图行（一个 \p1 管到底），手工
+    写的那些也是一样；真要一行里 \p1 关开关开好几回，那是矢量绘图的老写法，
+    跟遮盖块不是一回事。
+    """
+    return int(_shiliang_shuzi(wen, "p", 0.0))
+
+
+def _shi_chun_huitu_wen(wen):
+    """这一行是不是"整行只有矢量绘图"（\\pN 开着、花括号外面只剩绘图命令）
+
+    判法跟画面里那条路（_hua_ass_tiao 的 chun_huitu）一个意思：把 {...} 全抠掉，
+    剩下的得是绘图命令（字母数字加逗号点号加减号），一个真字都不许有。
+    """
+    wen = str(wen or "")
+    if _shiliang_p(wen) <= 0:
+        return False
+    chun = _ASS_HUA_KUO.sub("", wen).strip()
+    if not chun:
+        return False
+    return re.fullmatch(r"[\s0-9A-Za-z.,+\-]*", chun) is not None
+
+
+def _shiliang_wen(kuan, gao, x, y, yanse=None):
+    """拼一整行遮盖矢量图
+
+    \fscx / \fscy 给整数（跟 AEG 那两颗滑块一个脾气）。新建那条给 0 —— 用户那套
+    写法新建就是 {\p1\blur4\c&HFFFFFF&\1a&H00&\fscx0\fscy0\pos(x,y)} 这么个占位，
+    尺寸靠在画面上拖出来，拖完这两个数才变成实数（AEG 打开才有数，接得上）。
+    yanse 给一个 QColor 就用那个颜色画（不给就是白的）。
+    """
+    return "{%s%s\\fscx%d\\fscy%d\\pos(%d,%d)}%s" % (
+        SHILIANG_TOU,
+        _shiliang_yanse_biao(yanse),
+        max(0, int(round(float(kuan)))),
+        max(0, int(round(float(gao)))),
+        int(round(float(x))),
+        int(round(float(y))),
+        SHILIANG_HUATU,
+    )
+
+
+def _shiliang_huan_biao(wen, jian, xin_biao):
+    """把 \\fscx185 这种标签换成新的（没有就补一个进开头那对花括号里）"""
+    xin, ci = re.subn(
+        r"\\%s\s*-?\d+(?:\.\d+)?" % re.escape(str(jian or "")),
+        lambda m: xin_biao,
+        str(wen or ""),
+        count=1,
+    )
+    if ci:
+        return xin
+    return _jia_biaoqian(xin, xin_biao)
+
+
+def _shiliang_xie_ru(wen, kuan=None, gao=None, x=None, y=None):
+    """改这一行矢量图的长宽 / 位置：\\fscx \\fscy \\pos 就地换，别的标签一个字不动
+
+    跟 _zhemo_xie_ru 一个套路：有就换、没有就补。给 None 的那个不动。
+    长宽给的是拖出来的值，照 AEG 那样 (int) 截断（AEG 就是 (int)scale.X()）。
+    """
+    xin = str(wen or "")
+    if kuan is not None:
+        xin = _shiliang_huan_biao(xin, "fscx", "\\fscx%d" % max(0, int(kuan)))
+    if gao is not None:
+        xin = _shiliang_huan_biao(xin, "fscy", "\\fscy%d" % max(0, int(gao)))
+    if x is not None and y is not None:
+        xin = _pos_luo_dao(xin, x, y)
+    return xin
+
+
+def _shiliang_zhuan_huan(x, y, frz, ni=False):
+    """绕 (x,y) 转那么一下（照 _hua_ass_tiao：translate(x,y); rotate(-frz); translate(-x,-y)）
+
+    ni=True 给反着转的那一下（把画面上的框转回"没被整块转过"的那一版）。
+    竖排样式 Angle=-90 就是这么来的：方块自己也跟着整块转 90°，用户画面上拖出来
+    的那个长方形，在 ASS 里 \fscx 管的是**竖着**那一边。
+    """
+    z = QtGui.QTransform()
+    z.translate(x, y)
+    z.rotate(float(frz or 0.0) if ni else -float(frz or 0.0))
+    z.translate(-x, -y)
+    return z
+
+
+def _shiliang_kuang_zhuan(kuang, x, y, frz, ni=False):
+    """框绕 (x,y) 转一下之后占的外接框（四个角转完取外接）"""
+    z = _shiliang_zhuan_huan(x, y, frz, ni)
+    x0, y0, x1, y1 = [float(v) for v in kuang]
+    dian = [
+        z.map(QtCore.QPointF(px, py))
+        for px, py in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+    ]
+    xs = [p.x() for p in dian]
+    ys = [p.y() for p in dian]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _shiliang_kuang_dao_zi(kuang, an, p_bi=1.0, frz=0.0):
+    """画面上的框 + 对齐 + 整块角度 -> 这一行该写的 (\\fscx, \\fscy, x, y)
+
+    跟画面里那条路是同一套：画笔先把画出来的框按 \\an 贴到锚点上
+    （_bai_dao_maodian：7/8/9 拿框顶、4/5/6 拿框中、1/2/3 拿框底），再整块
+    rotate(-frz) 绕锚点转。这儿就是把它反过来算：
+
+      1. 先把画面上的框按 +frz 转回去 —— 转回来的那一版尺寸就是 \\fscx / \\fscy；
+      2. 锚点在那一版里是"按 \\an 该落的那个点"，再转回来就是画面上的锚点。
+
+    p_bi 是 \\pN 那个 2^(N-1)（我们自己写的都是 \\p1 = 1）。
+    """
+    x0, y0, x1, y1 = [float(v) for v in kuang]
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+    # 反过来转（绕原点就够：要的是形状和相对锚点的偏移）
+    z_ni = QtGui.QTransform()
+    z_ni.rotate(float(frz or 0.0))
+    hui = [
+        z_ni.map(QtCore.QPointF(px, py))
+        for px, py in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+    ]
+    xs = [p.x() for p in hui]
+    ys = [p.y() for p in hui]
+    kuan = max(1.0, max(xs) - min(xs))
+    gao = max(1.0, max(ys) - min(ys))
+    an = int(an or 7)
+    an = an if 1 <= an <= 9 else 2
+    lie = (an - 1) % 3               # 0 左 / 1 中 / 2 右
+    pai = (an - 1) // 3              # 0 底 / 1 中 / 2 顶
+    if lie == 0:
+        ox = 0.0
+    elif lie == 1:
+        ox = kuan / 2.0
+    else:
+        ox = kuan
+    if pai == 0:
+        oy = gao
+    elif pai == 1:
+        oy = gao / 2.0
+    else:
+        oy = 0.0
+    jiao = QtCore.QPointF(min(xs) + ox, min(ys) + oy)
+    z = QtGui.QTransform()
+    z.rotate(-float(frz or 0.0))
+    hui_jiao = z.map(jiao)
+    dan = SHILIANG_KUAI * max(1e-6, float(p_bi or 1.0))
+    fscx = kuan / dan * 100.0
+    fscy = gao / dan * 100.0
+    return (fscx, fscy, hui_jiao.x(), hui_jiao.y())
+
+
+# 拖手柄时每个手柄"朝外"的方向（画面坐标：x 向右、y 向下）—— 往外拖 = 变大
+_SHILIANG_SHOU_FANG = {
+    "nw": (-0.70711, -0.70711), "n": (0.0, -1.0), "ne": (0.70711, -0.70711),
+    "w": (-1.0, 0.0), "e": (1.0, 0.0),
+    "sw": (-0.70711, 0.70711), "s": (0.0, 1.0), "se": (0.70711, 0.70711),
+}
+
+
+def _shiliang_zhou_xiang(frz):
+    """\\fscx / \\fscy 变大时，框往画面哪个方向长（两个单位方向）
+
+    照 _hua_ass_tiao 的 rotate(-frz)：整块转过之后，画面上看到的宽高跟
+    \\fscx / \\fscy 是对着来的（竖排 Angle=-90 正好 swap）。
+    """
+    z = QtGui.QTransform()
+    z.rotate(-float(frz or 0.0))
+    a = z.map(QtCore.QPointF(1.0, 0.0))
+    b = z.map(QtCore.QPointF(0.0, 1.0))
+    return ((a.x(), a.y()), (b.x(), b.y()))
+
+
+def _shiliang_tuo_zhi(init_x, init_y, m, frz, shou, xiu=()):
+    """拖手柄 -> 新的 (\\fscx, \\fscy)；数值这一套照 AEG 的缩放工具来
+
+    AEG 那边是 src/visual_tool_scale.cpp 的 UpdateHold：
+
+        scale = max(0, 鼠标位移 * 1.25 + 按下去时的 scale)   ← 1 像素 = 1.25 个点
+        shift -> delta.SingleAxis()                        ← 只留变化大的那根轴
+        alt   -> 按按下去时的长宽比把另一根轴推出来
+        ctrl  -> 结果取 25 的整数倍（vector2d.cpp 的 Round：floor(x/25+.5)*25）
+        写进字幕是 (int) 截断（AEG 也是 (int)scale.X()）
+
+    方向跟着你抓的那个手柄走（往外拖 = 变大）。AEG 没有手柄，是拿屏幕的 x/y 直接
+    加：竖排样式（Angle=-90）整块转了 90°，照它那样加就成了"鼠标横着走、块竖着
+    长"，所以我们把位移投到"框真正伸长的方向"上去 —— 平排样式（Angle=0）算出来
+    跟 AEG 一模一样。
+    m 是画面像素（控件像素）的位移。
+    """
+    (rx, ry), (sx, sy) = _shiliang_zhou_xiang(frz)
+    ux, uy = _SHILIANG_SHOU_FANG.get(str(shou or ""), (0.0, 0.0))
+    tou_x = ux * rx + uy * ry
+    tou_y = ux * sx + uy * sy
+    biao_x = 1.0 if tou_x > 0.0 else (-1.0 if tou_x < 0.0 else 0.0)
+    biao_y = 1.0 if tou_y > 0.0 else (-1.0 if tou_y < 0.0 else 0.0)
+    dx, dy = float(m[0]), float(m[1])
+    jia_x = 1.25 * biao_x * (dx * rx + dy * ry)
+    jia_y = 1.25 * biao_y * (dx * sx + dy * sy)
+    xiu = tuple(xiu or ())
+    if "shift" in xiu:
+        if abs(jia_x) < abs(jia_y):      # AEG 的 delta.SingleAxis()
+            jia_x = 0.0
+        else:
+            jia_y = 0.0
+    if "alt" in xiu and init_x > 0.0 and init_y > 0.0:
+        if abs(jia_x) > abs(jia_y):
+            jia_y = jia_x * (init_y / init_x)
+        else:
+            jia_x = jia_y * (init_x / init_y)
+    xin_x = init_x + jia_x
+    xin_y = init_y + jia_y
+    if "ctrl" in xiu:
+        xin_x = math.floor(xin_x / 25.0 + 0.5) * 25.0
+        xin_y = math.floor(xin_y / 25.0 + 0.5) * 25.0
+    return (max(0.0, xin_x), max(0.0, xin_y))
+
+
+def _shiliang_kuang_zi_zhi(kuang, p_bi, frz, fscx, fscy, shou):
+    """按新算出来的 \\fscx / \\fscy 把框重新摆一下
+
+    你抓的那条边跟着走，对面那条边钉住（AEG 的缩放是整块绕 \\pos 转，那样手柄会
+    跟鼠标脱节；我们顺手把 \\pos 一起挪，边跟手）。返回新的画面框（脚本坐标）。
+    """
+    x0, y0, x1, y1 = [float(v) for v in kuang]
+    dan = SHILIANG_KUAI * max(1e-6, float(p_bi or 1.0))
+    kuan_pre = max(0.0, float(fscx)) * dan / 100.0
+    gao_pre = max(0.0, float(fscy)) * dan / 100.0
+    zhuan = _shiliang_kuang_zhuan((0.0, 0.0, kuan_pre, gao_pre), 0.0, 0.0, frz)
+    kuan = max(0.0, zhuan[2] - zhuan[0])
+    gao = max(0.0, zhuan[3] - zhuan[1])
+    shou = str(shou or "nei")
+    if "w" in shou:
+        x0 = x1 - kuan
+    elif "e" in shou:
+        x1 = x0 + kuan
+    if "n" in shou:
+        y0 = y1 - gao
+    elif "s" in shou:
+        y1 = y0 + gao
+    return (x0, y0, x1, y1)
+
+
+def _daziji(jiu, chi_xu, she):
+    """一行文字 -> 加好逐字淡入标签（照 AEG 那个打字机 Lua 脚本）
+
+    每个字前面插一个 {\\alphaFF\\t(N,N,1,\\alpha0}：这个字先全透明，播到第 N 毫秒
+    才冒出来。N 怎么排看模式（she 就是样式编辑器那个参数窗给出的那份）：
+      模式1 每个字固定隔多少毫秒
+      模式2 全部字加起来占这行时长的百分之多少
+      模式3 全部字加起来固定多少毫秒
+
+    行里现成的 {...} 标签、\\N 换行原样留着，不占时间也不算字 —— 写好了
+    \\pos \\clip 的行照样能加（Lua 那个脚本碰到这种行会做坏，我们不做坏）。
+    没字 / 参数不对给空串，外面当作没加成。
+    """
+    wen = str(jiu or "")
+    if not wen:
+        return ""
+    she = dict(she or {})
+    suan_kong = bool(she.get("kongge", True))
+    try:
+        mo = int(she.get("moshi", 1))
+    except (TypeError, ValueError):
+        mo = 1
+    # 要计时的字有几个（空格算不算看选项；标签和换行都不算字）
+    chun = re.sub(r"\\[Nn]", "", _ASS_HUA_KUO.sub("", wen))
+    shu = sum(1 for ch in chun if suan_kong or ch not in (" ", "　"))
+    if shu <= 0:
+        return ""
+    if mo == 2:
+        jian = (
+            max(0.0, float(chi_xu or 0.0))
+            * _ass_shuzi(she.get("m2"), 0.0) / 100.0 / shu
+        )
+    elif mo == 3:
+        jian = _ass_shuzi(she.get("m3"), 0.0) / shu
+    else:
+        jian = _ass_shuzi(she.get("m1"), 0.0)
+    jian = max(1.0, jian)
+
+    chu = []
+    acc = 0.0
+    wei = 0
+    for pi in list(_ASS_HUA_KUO.finditer(wen)) + [None]:
+        pian = wen[wei:] if pi is None else wen[wei:pi.start()]
+        for zi in re.split(r"(\\[Nn])", pian):
+            if not zi:
+                continue
+            if re.fullmatch(r"\\[Nn]", zi):
+                chu.append(zi)          # 换行原样留着，不占时间
+                continue
+            for ch in zi:
+                if ch in (" ", "　") and not suan_kong:
+                    chu.append(ch)      # 空格不算字：照原样贴在那儿
+                    continue
+                hao = int(acc) + 50
+                chu.append("{\\alphaFF\\t(%d,%d,1,\\alpha0}" % (hao, hao) + ch)
+                acc += jian
+        if pi is None:
+            break
+        chu.append(pi.group(0))         # 现成的标签原样带过去
+        wei = pi.end()
+    return "".join(chu)
+
+
+def _zhemo_chun_wen(wenben):
+    """去掉所有 {...} 行内标签，只剩文字本身
+
+    用来认"同一句话的那两层"：AEG 里双色是两条 Dialogue，文字一模一样，
+    只有一层多了 \\clip 和颜色。
+    """
+    return _ASS_HUA_KUO.sub("", str(wenben or "")).strip()
+
+
+def _zhemo_jia_yanse(wenben, se):
+    """给这一行加 \\c&HBBGGRR&（ASS 的颜色是蓝绿红倒着排的）
+
+    行里已经写死过 \\c / \\1c 的就不动 —— 那是已经配好的变色层。
+    """
+    wen = str(wenben or "")
+    if re.search(r"\\[1-4]?c&", wen):
+        return wen
+    jia = "\\c&H%02X%02X%02X&" % (se.blue(), se.green(), se.red())
+    pi = re.match(r"^(\{[^}]*\})", wen)
+    if pi:
+        return "{" + pi.group(1)[1:-1] + jia + "}" + wen[pi.end():]
+    return "{" + jia + "}" + wen
+
+
+def _pos_du(wenben):
+    """这一行现在锚在哪：\\pos(x,y) / \\move 的起点；都没有给 None
+
+    锚点就是 Aegisub 的 GetLinePosition 那个意思（src/visual_tool.cpp:599）——
+    双击定位 / 拖放都是拿它当基准算位移的。
+
+    \\pos 和 \\move 谁写在前面认谁：Aegisub 实装的 xy-vsfilter 里这俩共用同一个
+    槽位（RTS.cpp 的 CMD_pos / CMD_move 都带 !m_effects[EF_MOVE]），先出现的那
+    个生效、后面的一律忽略。所以不能固定先找 \\move。
+    """
+    wen = str(wenben or "")
+    hou = []
+    for yang in (r"\\move\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)",
+                 r"\\pos\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)"):
+        m = re.search(yang, wen)
+        if m:
+            hou.append((m.start(), float(m.group(1)), float(m.group(2))))
+    if not hou:
+        return None
+    hou.sort(key=lambda t: t[0])
+    return (hou[0][1], hou[0][2])
+
+
+def _pos_xie_ru(wenben, x, y):
+    """把 \\pos(x,y) 写进这一行：已经有 \\pos 的就地换，没有就塞进开头那对花括号"""
+    jia = "\\pos(%d,%d)" % (int(round(x)), int(round(y)))
+    wen = str(wenben or "")
+    xin, ci = re.subn(r"\\pos\([^)]*\)", lambda m: jia, wen, count=1)
+    if ci:
+        return xin
+    pi = re.match(r"^(\{[^}]*\})", wen)
+    if pi:
+        return "{" + pi.group(1)[1:-1] + jia + "}" + wen[pi.end():]
+    return "{" + jia + "}" + wen
+
+
+def _pos_luo_dao(wenben, x, y):
+    """让这一行的锚点挪到脚本坐标 (x,y)
+
+    一行里只有**第一个** \\pos / \\move 是活的（VSFilter 先到先得，见 _pos_du），
+    所以改的就是它：第一个是 \\move 就把那四个数整体平移（Aegisub 双击 / 拖放
+    也是平移 move，src/visual_tool_cross.cpp:58）；第一个是 \\pos 就地换掉。
+    """
+    wen = str(wenben or "")
+    hou = []
+    m = re.search(r"\\move\(([^)]*)\)", wen)
+    if m:
+        hou.append((m.start(), "move", m))
+    m = re.search(r"\\pos\([^)]*\)", wen)
+    if m:
+        hou.append((m.start(), "pos", m))
+    hou.sort(key=lambda t: t[0])
+    if hou and hou[0][1] == "move":
+        m = hou[0][2]
+        shu = re.findall(r"-?\d+(?:\.\d+)?", m.group(1))
+        jiu = _pos_du(wen)
+        if len(shu) >= 4 and jiu is not None:
+            dx = float(x) - jiu[0]
+            dy = float(y) - jiu[1]
+            xin = (
+                float(shu[0]) + dx, float(shu[1]) + dy,
+                float(shu[2]) + dx, float(shu[3]) + dy,
+            )
+            jia = "\\move(%d,%d,%d,%d)" % tuple(int(round(v)) for v in xin)
+            return wen[:m.start()] + jia + wen[m.end():]
+    return _pos_xie_ru(wen, x, y)
+
+
 # ---------------------------------------------------------------------
 # 画面里叠字幕（照 ASS 的样式画）
 # ---------------------------------------------------------------------
 # 认不出来的标签直接扔掉，不影响文字：
-#   \t 渐变动画 / \clip \iclip 裁剪 / \p 图形绘制 / \k \K \kf \ko 卡拉OK
+#   \t 渐变动画 / \p 图形绘制 / \k \K \kf \ko 卡拉OK
+#   （\clip \iclip 的矩形写法已经支持，矢量写法还不认）
 _ASS_HUA_KUO = re.compile(r"\{[^}]*\}")
 
 _ASS_MOREN_YANGSHI = {
@@ -3139,10 +4088,14 @@ def _hui_yangshi_tou(tou, yang_ming, zi, ke_jian=False):
                 b = int(se[4:6], 16)
             except ValueError:
                 continue
+            # 不透明度：0（全透）也得原样写出去 —— 别写 `or 255`，那样 0 会被
+            # 当成"没填"顶成 255，全透的样式色一存就变不透明
+            zhi_tou = zi.get(tou_jian)
             try:
-                a = max(0, min(255, int(zi.get(tou_jian) or 255)))
+                a = 255 if zhi_tou is None or str(zhi_tou).strip() == "" else int(zhi_tou)
             except (TypeError, ValueError):
                 a = 255
+            a = max(0, min(255, a))
             bu[k] = f"&H{255 - a:02X}{b:02X}{g:02X}{r:02X}"
             continue
         jian = _YANGSHI_LIE_MING.get(lie)
@@ -3319,7 +4272,15 @@ def _jia_wenben(hang, wen, geshi):
     if not wen:
         return
     gs = dict(geshi or {})
-    bu = re.split(r"\\[Nn]", wen)
+    if int(_ass_shuzi(gs.get("p"), 0) or 0) > 0:
+        # \p1 之后这段是"矢量绘图命令"（m 0 0 l 100 0 …），整段原样留着 ——
+        # 里面的空格、\N 都不是文字，不能拆（拆了就画不出东西）
+        hang[-1].append((str(wen), gs))
+        return
+    # \N / \n 拆行；列表和编辑框里存的是真实换行（读进来时 \N 就转好了，
+    # 见 _du_ass_hang），拖拽改完 \pos 后画的就是列表这份 —— 所以真实换行
+    # 也得当成换行拆，不然一拖就整条挤成一竖行
+    bu = re.split(r"\\[Nn]|\r?\n", wen)
     zhi = bu[0].replace("\\h", " ")
     if zhi:
         hang[-1].append((zhi, gs))
@@ -3330,6 +4291,98 @@ def _jia_wenben(hang, wen, geshi):
 
 # 老 SSA 的 \a 对齐写法 -> 现在的 \an
 _ASS_JIU_DUIQI = {1: 1, 2: 2, 3: 3, 5: 7, 6: 8, 7: 9, 9: 4, 10: 5, 11: 6}
+
+
+def _chai_biaoqian_ming(m, zhi):
+    """把标签名和值拆开：\\alphaFF / \\1aFF 这种"值直接黏在名字后面"的简写
+
+    名字全是字母，正则会把值一起吞进名字里去（alphabet 里的 FF 也是字母），
+    拆回来才认得出来。打字机脚本生成的就是这个写法（没有 & 也没括号），不拆
+    的话整条动画都不生效。
+    """
+    for qian in ("alpha", "1a", "3a", "4a"):
+        if m.startswith(qian) and len(m) > len(qian):
+            return qian, m[len(qian):] + zhi
+    return m, zhi
+
+
+def _jia_t_dong(g, zhi):
+    """\\t(t1,t2,加速,标签) -> 记成"会随时间变的项"
+
+    打字机效果就靠这个：{\\alphaFF\\t(50,50,1,\\alpha0}字 —— 这个字先全透明，
+    播到第 50 毫秒一下子变成不透明（t1 == t2 就是到点突变）；t1 != t2 则是在这
+    段时间里慢慢变过去。
+
+    记下来的是"从多少变到多少"，这一刻到底是多少等画的时候按画面时刻现算
+    （见 _dong_jia）—— 跟 \\fad 一个路子，不然画面上看不出动。
+    """
+    nei = str(zhi or "").strip()
+    # 括号可能只写了左半边：{\alphaFF\t(50,50,1,\alpha0} 这种（打字机脚本
+    # 生成的就是这样，靠 } 收尾），libass 认，我们也得认
+    if nei.startswith("("):
+        nei = nei[1:]
+    if nei.endswith(")"):
+        nei = nei[:-1]
+    bu = nei.split(",", 3)
+    if len(bu) < 4:
+        return                      # 至少要 t1,t2,加速 加一个标签
+    try:
+        t1 = max(0, int(float(bu[0].strip() or 0)))
+        t2 = max(t1, int(float(bu[1].strip() or 0)))
+        jia = float(bu[2].strip() or 1)
+    except ValueError:
+        return
+    if jia <= 0:
+        jia = 1.0
+    # 这里的列表要自己拷一份：每段的格式是浅拷贝来的，往别人的列表上追加，
+    # 前面那些段会跟着一起多出这条动画
+    dong = list(g.get("dong") or [])
+    for pian in _qie_biaoqian(bu[3]):
+        pi = re.match(r"^\s*(\d?[a-zA-Z]+)\s*(.*)$", pian)
+        if not pi:
+            continue
+        m, zhi_d = _chai_biaoqian_ming(
+            pi.group(1).lower(), pi.group(2).strip()
+        )
+        dao = _ass_touming(zhi_d)
+        if dao is None:
+            continue
+        if m == "alpha":
+            # \alpha 一次管主色 / 描边 / 阴影三样（跟上面 \alpha 那个分支一致）
+            for jian in ("a1", "a3", "a4"):
+                dong.append((t1, t2, jia, jian, int(g.get(jian, 255)), dao))
+        elif m in ("1a", "3a", "4a"):
+            jian = "a" + m[0]
+            dong.append((t1, t2, jia, jian, int(g.get(jian, 255)), dao))
+    if dong:
+        g["dong"] = dong
+
+
+def _dong_zhi(cong, dao, t1, t2, jia, hao_miao):
+    """一个 \\t 动画、播到第 hao_miao 毫秒时该是多少"""
+    if hao_miao <= t1:
+        return cong
+    if t2 <= t1 or hao_miao >= t2:
+        return dao
+    jin = (hao_miao - t1) / float(t2 - t1)
+    if abs(jia - 1.0) > 0.001:
+        jin = jin ** jia            # 加速档（照 libass：进度取幂次）
+    return int(round(cong + (dao - cong) * jin))
+
+
+def _dong_jia(gs, hao_miao):
+    """按"这一行播到第几毫秒"把 \\t 的动画算到格式上
+
+    只动透明度那三个键（打字机就是透明度），字号 / 位置 / 颜色这些 \\t 里没写
+    的键原样不动 —— 量字宽那一步还用原来那份格式，不用重算。
+    """
+    dong = (gs or {}).get("dong")
+    if not dong:
+        return gs
+    gs = dict(gs)
+    for t1, t2, jia, jian, cong, dao in dong:
+        gs[jian] = _dong_zhi(cong, dao, t1, t2, jia, hao_miao)
+    return gs
 
 
 def _yi_ge_biaoqian(pian, g, jichu, yangshi_biao):
@@ -3354,10 +4407,30 @@ def _yi_ge_biaoqian(pian, g, jichu, yangshi_biao):
         return
     m = pi.group(1).lower()
     zhi = pi.group(2).strip()
+    m, zhi = _chai_biaoqian_ming(m, zhi)
     if m == "pos" or m == "move":
+        # 一行里只认**第一个** \pos / \move，后面的全当没写 —— Aegisub 实装的
+        # xy-vsfilter 就是这样：\pos 和 \move 共用同一个槽位 m_effects[EF_MOVE]，
+        # 解析时带 !m_effects[EF_MOVE] 判断，先到先得（RTS.cpp 的 CMD_pos /
+        # CMD_move）。水印那种 {\\pos(20,155)}…{\\r…\\pos(50,154)} 两条 \pos 的
+        # 写法，AEG 里落在 20，过去我们取后面那条，于是整体偏了 30 像素。
         shu = re.findall(r"-?\d+(?:\.\d+)?", zhi)
-        if len(shu) >= 2:
+        if len(shu) >= 2 and g.get("pos") is None:
             g["pos"] = (float(shu[0]), float(shu[1]))
+    elif m in ("clip", "iclip"):
+        # \clip(左,上,右,下) / \iclip(...)：矩形裁剪，坐标就是脚本坐标，
+        # 跟 \pos 没关系（Aegisub 里 AssParameterClass 就是 ABSOLUTE_POS）。
+        # 矢量写法 \clip(1,m 0 0 l ...) 带字母，这里先不认，照旧当没写。
+        if not re.search(r"[A-Za-z]", zhi):
+            shu = re.findall(r"-?\d+(?:\.\d+)?", zhi)
+            if len(shu) == 4:
+                ju = tuple(float(x) for x in shu)
+                if m == "clip":
+                    g["clip"] = ju
+                    g.pop("iclip", None)
+                else:
+                    g["iclip"] = ju
+                    g.pop("clip", None)
     elif m == "an":
         shu = re.search(r"\d+", zhi)
         if shu:
@@ -3427,6 +4500,14 @@ def _yi_ge_biaoqian(pian, g, jichu, yangshi_biao):
     elif m in ("shad", "xshad", "yshad"):
         if zhi:
             g["shad"] = max(0.0, _ass_shuzi(zhi, g["shad"]))
+    elif m == "p":
+        # \pN：N>=1 时后面那段文字是"矢量绘图命令"不是文字（N 决定坐标倍数，
+        # 尺度 = 2^(N-1)，跟 libass 一样）；\p0 关掉，后面又当普通文字。
+        shu = re.search(r"\d+", zhi)
+        g["p"] = int(shu.group(0)) if shu else 1
+    elif m == "blur":
+        if zhi:
+            g["blur"] = max(0.0, _ass_shuzi(zhi, 0.0))
     elif m == "fad":
         # \fad(渐入ms, 渐出ms)：两个数就是起 / 收各花多少毫秒
         shu = re.findall(r"-?\d+(?:\.\d+)?", zhi)
@@ -3442,6 +4523,8 @@ def _yi_ge_biaoqian(pian, g, jichu, yangshi_biao):
                 max(0, int(float(shu[3]))),
                 max(0, int(float(shu[6]) - float(shu[5]))),
             )
+    elif m == "t":
+        _jia_t_dong(g, zhi)
 
 
 def _jie_ass_tiao(yuan_wen, yangshi, yangshi_biao=None):
@@ -3459,6 +4542,11 @@ def _jie_ass_tiao(yuan_wen, yangshi, yangshi_biao=None):
     for pi in _ASS_HUA_KUO.finditer(wen):
         _jia_wenben(hang, wen[wei:pi.start()], g)
         gs_kuo = pi.group(0)[1:-1]
+        if re.search(r"\\t\s*\(", gs_kuo):
+            # 这一块自己写了 \t：上一块留下的动画作废，只认这一块的
+            # （打字机每字一个块，靠的就是这个 —— 不然第 2 个字会连第 1 个字
+            #  那条动画一起继承，两个字会同时冒出来）
+            g.pop("dong", None)
         for pian in _qie_biaoqian(gs_kuo):
             _yi_ge_biaoqian(pian, g, jichu, yangshi_biao)
         wei = pi.end()
@@ -3647,10 +4735,26 @@ def _ziti_ming_men():
 #
 # 也就是把字形原地转 90°；排的时候一个字往前推"竖排前进量"（汉字就是 1 个 em），
 # 所以看着还是横着排、但每个字都躺倒了 —— 跟 Aegisub 画面里一模一样。
-_SHENG_SHU = 0x02f1     # 码点 >= 这个才躺倒（拉丁字母不躺）—— libass 的 VERTICAL_LOWER_BOUND
+#
+# "哪些字躺倒"这一步，Aegisub（实际用的渲染器是 xy-vsfilter，走 GDI 那一套）
+# 有两层：
+#
+#   1) 这一段字体名带不带 @（样式里写的 @字体，或者行内 {\fn@字体} 切过来的）。
+#      不带 @ 的段压根不走这条路径，正着排。
+#   2) 带 @ 了，里面的字符躺不躺还是 GDI 按字体自己定的 —— 同一个省略号在
+#      @DFPLiHei-Bd 里躺、在 @新兰圆-B 里就不躺。没规律可套，直接问 GDI，
+#      见 _yao_tang_dao。
+#
+# 结果：汉字躺 90° 再被竖排样式的整块角度转回来 = 看着正立；省略号本来横排，
+# 该躺的那支躺完也正好是 Aegisub 里那个朝向。
+_SHENG_SHU = 0x0000     # 所有字符都进躺倒判定（0 = 不按码点先筛掉拉丁字母）
 
 _SHU_DULIANG = {}       # 字体名 -> (em 方框, 字身下伸, vmtx 表, 竖排度量条数, QRawFont)
 _SHU_ADV = {}           # (字体名, 字) -> 竖排前进量（字体单位）
+_SHU_LIUBAI = {}        # (字体名, 字) -> 顶边留白（字体单位；vmtx 的 tsb，没 vmtx 是横排 lsb）
+_SHU_YIBIAO = {}        # 字体名 -> {原字形号: 竖排专用字形号}（GSUB 的 vert / vkna）
+_SHU_RAW = {}           # (字体名, 字号) -> QRawFont（按真字号取，用来取字形轮廓）
+_SHU_ZIXING = {}        # (字体名, 字号, 字) -> 竖排专用字形轮廓（没这字形就是 None）
 
 
 def _shi_shu(ming):
@@ -3661,6 +4765,139 @@ def _shi_shu(ming):
 def _qu_shu(ming):
     """竖排名字去掉 @ 才是系统里那支字体（Qt 只认不带 @ 的）"""
     return str(ming or "").strip().lstrip("@")
+
+
+# Aegisub 底下是 GDI（xy-vsfilter），"哪些字躺倒"这一下是 GDI 自己定的，
+# 而且跟字符本身没关系 —— 是看这个字形在字体里怎么来的。同一个省略号：
+#
+#     @DFPLiHei-Bd 里躺着（画出来是竖三点）    → AEG 里就是竖的
+#     @新兰圆-B   里不躺（画出来还是横三点）  → AEG 里就是横的
+#     A（拉丁字母）两个字体里都不躺
+#
+# 没规律可套（东亚宽度、代码页、区块都对不上），所以直接问 GDI：拿 @字体
+# 和不带 @ 的同一支各量一次字形黑框，宽高互换了就是躺倒。结果按 (字体, 字)
+# 存着，每个字只问一次。
+
+
+class _GDI_MAT2(ctypes.Structure):
+    """GDI 的 MAT2（字形变换矩阵）"""
+
+    _fields_ = [
+        ("eM11", ctypes.c_byte * 4), ("eM12", ctypes.c_byte * 4),
+        ("eM21", ctypes.c_byte * 4), ("eM22", ctypes.c_byte * 4),
+    ]
+
+
+class _GDI_ZIXING(ctypes.Structure):
+    """GDI 的 GLYPHMETRICS（一个字形的度量）"""
+
+    _fields_ = [
+        ("gmBlackBoxX", ctypes.c_uint), ("gmBlackBoxY", ctypes.c_uint),
+        ("gmptGlyphOrigin", ctypes.c_long * 2),
+        ("gmCellIncX", ctypes.c_short), ("gmCellIncY", ctypes.c_short),
+    ]
+
+
+_GDI_TANGDAO = {}       # (字体名, 字) -> 躺不躺（问一次存着）
+_GDI_DC = None          # 复用的内存 DC
+_GDI_ZHUNBEI = None     # GDI 那几个调用有没有设过参数类型
+
+
+def _gdi_zhunbei(gdi32):
+    """给 GDI 这几个调用设好参数类型（64 位下不设会把句柄截断）"""
+    global _GDI_ZHUNBEI
+    if _GDI_ZHUNBEI is gdi32:
+        return
+    gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+    gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    gdi32.CreateFontW.restype = ctypes.c_void_p
+    gdi32.CreateFontW.argtypes = (
+        [ctypes.c_int] * 5 + [ctypes.c_uint] * 8 + [ctypes.c_wchar_p]
+    )
+    gdi32.SelectObject.restype = ctypes.c_void_p
+    gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+    gdi32.GetGlyphOutlineW.restype = ctypes.c_uint
+    gdi32.GetGlyphOutlineW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+        ctypes.POINTER(_GDI_ZIXING), ctypes.c_uint, ctypes.c_void_p,
+        ctypes.POINTER(_GDI_MAT2),
+    ]
+    _GDI_ZHUNBEI = gdi32
+
+
+def _gdi_heiku(ming, zi):
+    """问 GDI 要这个字的字形黑框（宽, 高）；问不出来给 None"""
+    global _GDI_DC
+    try:
+        gdi32 = ctypes.windll.gdi32
+    except Exception:       # noqa
+        return None
+    try:
+        _gdi_zhunbei(gdi32)
+        if _GDI_DC is None:
+            _GDI_DC = gdi32.CreateCompatibleDC(None)
+        if not _GDI_DC:
+            return None
+        ziti = gdi32.CreateFontW(
+            -96, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, str(ming),
+        )
+        if not ziti:
+            return None
+        jiu = gdi32.SelectObject(_GDI_DC, ziti)
+        try:
+            # MAT2 得给单位矩阵；给全 0 的 GDI 会甩 GDI_ERROR 回来
+            ju = _GDI_MAT2(
+                (ctypes.c_byte * 4)(0, 0, 1, 0), (ctypes.c_byte * 4)(0, 0, 0, 0),
+                (ctypes.c_byte * 4)(0, 0, 0, 0), (ctypes.c_byte * 4)(0, 0, 1, 0),
+            )
+            gm = _GDI_ZIXING()
+            n = gdi32.GetGlyphOutlineW(
+                _GDI_DC, ord(zi), 0, ctypes.byref(gm), 0, None, ctypes.byref(ju)
+            )
+        finally:
+            gdi32.SelectObject(_GDI_DC, jiu)
+            gdi32.DeleteObject(ziti)
+    except Exception:       # noqa
+        return None
+    if n == 0xFFFFFFFF or not gm.gmBlackBoxX or not gm.gmBlackBoxY:
+        return None
+    return (int(gm.gmBlackBoxX), int(gm.gmBlackBoxY))
+
+
+def _yao_tang_dao(ming, zi):
+    """这个字在竖排的 @ 字体里要不要躺倒 90°
+
+    Aegisub（xy-vsfilter / GDI 那一套）里躺不躺是 GDI 按字体定的：@字体 和
+    不带 @ 的同一支各量一次字形黑框，宽高互换了就是躺倒。方方正正的字
+    （汉字那种）互换看不出 —— 那按"东亚字躺、拉丁单字节不躺"补一下。
+    """
+    ming = str(ming or "").strip()
+    if not _shi_shu(ming):
+        return False
+    jian = (ming, zi)
+    if jian in _GDI_TANGDAO:
+        return _GDI_TANGDAO[jian]
+    jieguo = None
+    a = _gdi_heiku(ming, zi)                # 躺着的那一支
+    b = _gdi_heiku(_qu_shu(ming), zi)       # 同一支不带 @
+    if a and b:
+        aw, ah = a
+        bw, bh = b
+        if abs(aw - ah) <= 6 and abs(bw - bh) <= 6:
+            # 方字：拉丁单字节（A / © 这种）不躺，其余（汉字、假名、标点）躺
+            jieguo = not ord(zi) < 0x0250
+        else:
+            jieguo = abs(aw - bh) <= 6 and abs(ah - bw) <= 6
+    if jieguo is None:
+        # 问不到（不是 Windows、字体取不出来）：照全角就躺的老规矩
+        try:
+            jieguo = _shu_adv(ming, zi) >= _shu_duliang(ming)[0] * 0.9
+        except Exception:       # noqa
+            jieguo = True
+    _GDI_TANGDAO[jian] = jieguo
+    return jieguo
 
 
 def _ziti_xiangsu(ziti):
@@ -3708,26 +4945,232 @@ def _shu_duliang(ming):
     return jieguo
 
 
+def _du_u16(shu, wei):
+    """从字节串里读一个 2 字节大端无符号数（越界给 0，省得到处判断）"""
+    if wei < 0 or wei + 2 > len(shu):
+        return 0
+    return struct.unpack_from(">H", shu, wei)[0]
+
+
+def _du_i16(shu, wei):
+    """2 字节大端有符号数"""
+    if wei < 0 or wei + 2 > len(shu):
+        return 0
+    return struct.unpack_from(">h", shu, wei)[0]
+
+
+def _fu_gai_biao(shu, wei):
+    """GSUB 的覆盖表 -> 字形号列表（次序就是覆盖索引）"""
+    ge = []
+    xing = _du_u16(shu, wei)
+    n = _du_u16(shu, wei + 2)
+    if xing == 1:
+        for i in range(n):
+            ge.append(_du_u16(shu, wei + 4 + i * 2))
+    elif xing == 2:
+        for i in range(n):
+            qi = _du_u16(shu, wei + 4 + i * 6)
+            mo = _du_u16(shu, wei + 6 + i * 6)
+            if mo >= qi:
+                ge.extend(range(qi, mo + 1))
+    return ge
+
+
+def _chai_zihuan(shu, wei, lei):
+    """一张替换子表 -> {原字形号: 换成的字形号}
+
+    lei=1 是单字形替换（vert / vkna 基本都是这种），lei=3 是备用字形、取第一个。
+    """
+    biao = {}
+    ge = _du_u16(shu, wei)
+    if lei == 1:
+        fu = wei + _du_u16(shu, wei + 2)
+        if ge == 1:
+            pian = _du_i16(shu, wei + 4)
+            for g in _fu_gai_biao(shu, fu):
+                biao[g] = max(0, min(65535, g + pian))
+        elif ge == 2:
+            n = _du_u16(shu, wei + 4)
+            for i, g in enumerate(_fu_gai_biao(shu, fu)):
+                if i < n:
+                    biao[g] = _du_u16(shu, wei + 6 + i * 2)
+    elif lei == 3 and ge == 1:
+        n = _du_u16(shu, wei + 4)
+        for i, g in enumerate(_fu_gai_biao(shu, wei + _du_u16(shu, wei + 2))):
+            if i >= n:
+                break
+            ge_biao = wei + _du_u16(shu, wei + 6 + i * 2)
+            if _du_u16(shu, ge_biao) > 0:
+                biao[g] = _du_u16(shu, ge_biao + 2)
+    return biao
+
+
+def _chai_gsub(shu, texing=("vert", "vkna")):
+    """从 GSUB 里抠出指定特性的单字形替换表
+
+    libass 对 @ 竖排字体开了 HarfBuzz 的 vert / vkna，标点（…、—、（）这些）
+    会被换成竖排专用的那一版，画出来才是竖着的。这儿把那两条特性的查表抄出来。
+    """
+    biao = {}
+    if len(shu) < 10:
+        return biao
+    fu_lie = _du_u16(shu, 6)        # 特性表（FeatureList）
+    deng_lie = _du_u16(shu, 8)      # 查表列表（LookupList）
+    if not fu_lie or not deng_lie:
+        return biao
+    hao = []
+    for i in range(_du_u16(shu, fu_lie)):
+        ji = fu_lie + 2 + i * 6
+        if ji + 6 > len(shu):
+            break
+        if shu[ji:ji + 4].decode("latin-1", "replace") not in texing:
+            continue
+        ce = fu_lie + _du_u16(shu, ji + 4)
+        for j in range(_du_u16(shu, ce + 2)):
+            p = ce + 4 + j * 2
+            if p + 2 > len(shu):
+                break
+            hao.append(_du_u16(shu, p))
+    zong = _du_u16(shu, deng_lie)
+    for h in hao:
+        if h >= zong:
+            continue
+        z = deng_lie + _du_u16(shu, deng_lie + 2 + h * 2)
+        lei = _du_u16(shu, z)
+        if lei not in (1, 3):
+            continue        # 别的类型（连字、上下文）跟竖排标点无关，不认
+        for k in range(_du_u16(shu, z + 4)):
+            biao.update(_chai_zihuan(shu, z + _du_u16(shu, z + 6 + k * 2), lei))
+    return biao
+
+
+def _shu_yibiao(ming):
+    """这个字体里带竖排专用字形的那些字：{原字形号: 竖排字形号}"""
+    ming = _qu_shu(ming)
+    if ming in _SHU_YIBIAO:
+        return _SHU_YIBIAO[ming]
+    biao = {}
+    try:
+        yuan = _shu_duliang(ming)[4]
+        if yuan is not None:
+            biao = _chai_gsub(bytes(yuan.fontTable("GSUB")))
+    except Exception as cuowu:      # noqa
+        logger.error(f"视频工作台：读竖排字形替换表失败 {cuowu}")
+    _SHU_YIBIAO[ming] = biao
+    return biao
+
+
+def _shu_raw(ziti, ming):
+    """按这一段的真字号取一支 QRawFont（要取竖排专用字形轮廓得用它）"""
+    jian = (_qu_shu(ming), int(round(_ziti_xiangsu(ziti))))
+    if jian in _SHU_RAW:
+        return _SHU_RAW[jian]
+    yuan = None
+    try:
+        z = QtGui.QFont(ziti)
+        z.setFamily(_qu_shu(ming))
+        z.setPixelSize(jian[1])
+        yuan = QtGui.QRawFont.fromFont(z)
+        if not yuan.isValid():
+            yuan = None
+    except Exception as cuowu:      # noqa
+        logger.error(f"视频工作台：取竖排字形轮廓的字体失败 {cuowu}")
+    _SHU_RAW[jian] = yuan
+    return yuan
+
+
+def _shu_zixing(ming, ziti, yuan, biao, zi):
+    """这个字有竖排专用字形就取它的轮廓（像素单位），没有就给 None
+
+    Qt 画字只能按字符画，画不出"换成另一个字形"这回事，只能自己取轮廓再拼。
+    """
+    if yuan is None or not biao:
+        return None
+    jian = (_qu_shu(ming), int(round(_ziti_xiangsu(ziti))), zi)
+    if jian in _SHU_ZIXING:
+        return _SHU_ZIXING[jian]
+    lu = None
+    try:
+        hao = yuan.glyphIndexesForString(zi)
+        huan = biao.get(int(hao[0])) if hao else None
+        if huan is not None:
+            lu = yuan.pathForGlyph(huan)
+            if lu.isEmpty():
+                lu = None
+    except Exception as cuowu:      # noqa
+        logger.error(f"视频工作台：取竖排专用字形失败 {cuowu}")
+    _SHU_ZIXING[jian] = lu
+    return lu
+
+
 def _shu_adv(ming, zi):
-    """一个字躺倒后往前推多少（字体单位）；表里没有就按一个 em"""
+    """一个字躺倒后往前推多少（字体单位）
+
+    字体里有 vmtx（竖排度量表）就按它的前进量来（GDI 的 @ 竖排就是这么干的，
+    标点在竖排里占的格子跟横排不一样）；没有 vmtx 就退回横排前进量 —— GDI 对
+    没有竖排度量的字体也是拿横排的前进量当竖排用的，不是死按一个 em。
+    """
     jian = (_qu_shu(ming), zi)
     if jian in _SHU_ADV:
         return _SHU_ADV[jian]
     em, _xia, vmtx, tiao, yuan = _shu_duliang(ming)
-    adv = em
+    adv = 0.0
     try:
         if yuan is not None and tiao > 0:
             zong = yuan.glyphIndexesForString(zi)
             if zong:
-                hao = min(int(zong[0]), tiao - 1)
+                # 标点会被换成竖排字形，libass 是拿换过之后那个字形去 load 的，
+                # 前进量自然也是它那一格，所以这儿也得按换过之后的查
+                hao = _shu_yibiao(ming).get(int(zong[0]), int(zong[0]))
+                hao = min(hao, tiao - 1)
                 if (hao + 1) * 4 <= len(vmtx):
-                    adv = struct.unpack_from(">H", vmtx, hao * 4)[0]
+                    adv = float(struct.unpack_from(">H", vmtx, hao * 4)[0])
+        if adv <= 0 and yuan is not None:
+            # 没有 vmtx（或者这字不在表里）：拿横排前进量换算成字体单位
+            zong = yuan.glyphIndexesForString(zi)
+            if zong:
+                px = float(yuan.advancesForGlyphIndexes(zong[:1])[0].x())
+                yuan_px = float(yuan.pixelSize())
+                if px > 0 and yuan_px > 0:
+                    adv = px * em / yuan_px
     except Exception as cuowu:      # noqa
         logger.error(f"视频工作台：读竖排前进量失败 {cuowu}")
     if adv <= 0:
         adv = em
     _SHU_ADV[jian] = adv
     return adv
+
+
+def _shu_liubai(ming, zi):
+    """躺倒的字离格口顶上留多少（字体单位）
+
+    GDI 的 @ 竖排：有 vmtx 用它的 tsb（顶边距），没有 vmtx 用横排的 lsb
+    （左边距）—— 跟它合成的竖排度量一个算法。读不出来给 None。
+    """
+    jian = (_qu_shu(ming), zi)
+    if jian in _SHU_LIUBAI:
+        return _SHU_LIUBAI[jian]
+    _em, _xia, vmtx, tiao, yuan = _shu_duliang(ming)
+    zhi = None
+    try:
+        if yuan is not None:
+            zong = yuan.glyphIndexesForString(zi)
+            if zong:
+                hao = _shu_yibiao(ming).get(int(zong[0]), int(zong[0]))
+                if tiao > 0 and (hao + 1) * 4 <= len(vmtx):
+                    # vmtx 每条是（前进量, 顶边距）一对，顶边距是带符号的
+                    zhi = struct.unpack_from(">h", vmtx, hao * 4 + 2)[0]
+                else:
+                    # 横排 lsb：hmtx 每条也是（前进量, 左边距）一对
+                    hh = bytes(yuan.fontTable("hhea"))
+                    hm = bytes(yuan.fontTable("hmtx"))
+                    duo = struct.unpack_from(">H", hh, 34)[0] if len(hh) >= 36 else 0
+                    if duo > 0 and (hao + 1) * 4 <= len(hm):
+                        zhi = struct.unpack_from(">h", hm, hao * 4 + 2)[0]
+    except Exception as cuowu:      # noqa
+        logger.error(f"视频工作台：读竖排顶边留白失败 {cuowu}")
+    _SHU_LIUBAI[jian] = zhi
+    return zhi
 
 
 def _shu_kuan(ziti, ming, wen):
@@ -3745,31 +5188,175 @@ def _shu_kuan(ziti, ming, wen):
 
 
 def _shu_lu(ziti, ming, wen, x, di):
-    """竖排文字 -> 路径：每个字躺倒、横向一个个排（算法跟 libass 一样）
+    """竖排文字 -> 路径：宽字躺倒、横向一个个排（算法跟 libass 一样）
 
     x / di 是这一段的起笔位置和基线（当前坐标）；返回拼好的路径。
+    不躺倒的字（省略号 / 破折号这类）照原样摆在这一格正中，靠样式角度转。
     """
     em, xia_zi, _v, _t, _r = _shu_duliang(ming)
     bi = _ziti_xiangsu(ziti) / float(em)
     xia = xia_zi * bi                     # 字身下伸（像素，负的）
     fm = QtGui.QFontMetricsF(ziti)
+    # 标点这些字体里备了竖排专用字形（libass 的 vert / vkna 换的那一套）
+    biao = _shu_yibiao(ming)
+    yuan = _shu_raw(ziti, ming) if biao else None
     lu = QtGui.QPainterPath()
     x_dang = float(x)
     for zi in str(wen):
         if ord(zi) >= _SHENG_SHU:
             adv = _shu_adv(ming, zi) * bi
-            yi = QtGui.QPainterPath()
-            yi.addText(0.0, 0.0, ziti, zi)
-            # 横坐标 = 前进量 + 下伸 + 字形纵坐标；纵坐标 = -下伸 - 字形横坐标
-            yi = QtGui.QTransform(
-                0.0, -1.0, 1.0, 0.0, adv + xia, -xia
-            ).map(yi)
-            yi.translate(x_dang, di)
+            if _yao_tang_dao(ming, zi):
+                yi = _shu_zixing(ming, ziti, yuan, biao, zi)
+                if yi is None:
+                    yi = QtGui.QPainterPath()
+                    yi.addText(0.0, 0.0, ziti, zi)
+                # 横坐标 = 前进量 + 下伸 + 字形纵坐标；纵坐标 = -下伸 - 字形横坐标
+                yi = QtGui.QTransform(
+                    0.0, -1.0, 1.0, 0.0, adv + xia, -xia
+                ).map(yi)
+                yi.translate(x_dang, di)
+                # 躺倒的字离格口顶上留多少，GDI 的 @ 竖排是按字体的顶边距来
+                # 的（vmtx 的 tsb，没 vmtx 用横排 lsb）—— ！、。这类标点的墨
+                # 顶格贴着前字，靠的就是这个；按基线对齐的话标点会多空一截。
+                liu = _shu_liubai(ming, zi)
+                if liu is not None:
+                    kuang = yi.boundingRect()
+                    yi.translate(x_dang + liu * bi - kuang.left(), 0.0)
+            else:
+                # 不躺倒的那种（省略号、破折号）：字形照原样，摆在这一格的
+                # 正中 —— 之后整块按样式角度一转，它就顺着文字方向了
+                # （竖排里省略号就是竖着的三点）。这儿不取竖排专用字形：
+                # 那套字形本身已经是竖的了，再被整块转一次又变成横的。
+                yi = QtGui.QPainterPath()
+                yi.addText(0.0, 0.0, ziti, zi)
+                kuang = yi.boundingRect()
+                yi.translate(
+                    x_dang + adv / 2.0 - kuang.center().x(),
+                    di - fm.ascent() + _ziti_xiangsu(ziti) / 2.0
+                    - kuang.center().y(),
+                )
             lu.addPath(yi)
             x_dang += adv
         else:
-            lu.addText(x_dang, di, ziti, zi)
+            # 拉丁字母不躺倒；字体要是连它也备了竖排形，就用那一个
+            yi = _shu_zixing(ming, ziti, yuan, biao, zi)
+            if yi is not None:
+                lu.addPath(yi.translated(x_dang, di))
+            else:
+                lu.addText(x_dang, di, ziti, zi)
             x_dang += fm.horizontalAdvance(zi)
+    return lu
+
+
+def _huitu_ci(wen):
+    """矢量绘图命令切成记号：命令字母一个、数字一个（空格 / 逗号都算分隔）"""
+    ci = []
+    for pi in re.finditer(r"[a-zA-Z]|[-+]?(?:\d+\.?\d*|\.\d+)", str(wen or "")):
+        t = pi.group(0)
+        ci.append(t.lower() if t.isalpha() else float(t))
+    return ci
+
+
+def _huitu_lu(zhi, bei=1.0):
+    """ASS 的矢量绘图（\\p 后面那段）-> QPainterPath
+
+    命令照 libass：m / n 起新子路径、l 连线、b 三次贝塞尔、c 闭合；s / p 这两
+    种样条少见，按折线近似。坐标 y 向下（跟 ASS 一样），bei 是 \\pN 的坐标倍数
+    （2^(N-1)）再乘上 \\fscx / \\fscy。
+    """
+    dian = []
+    for t in _huitu_ci(zhi):
+        if isinstance(t, str):
+            dian.append((t, []))
+        elif dian:
+            dian[-1][1].append(t)
+        else:
+            dian.append(("m", [t]))
+    lu = QtGui.QPainterPath()
+    lu.setFillRule(Qt.WindingFill)   # libass 也是非零环绕（回形的洞才挖得对）
+    for ming, shu in dian:
+        if ming in ("m", "n"):
+            for i in range(0, len(shu) - 1, 2):
+                lu.moveTo(shu[i] * bei, shu[i + 1] * bei)
+        elif ming == "l":
+            for i in range(0, len(shu) - 1, 2):
+                lu.lineTo(shu[i] * bei, shu[i + 1] * bei)
+        elif ming == "b":
+            for i in range(0, len(shu) - 5, 6):
+                lu.cubicTo(
+                    shu[i] * bei, shu[i + 1] * bei,
+                    shu[i + 2] * bei, shu[i + 3] * bei,
+                    shu[i + 4] * bei, shu[i + 5] * bei,
+                )
+        elif ming in ("s", "p"):
+            # 样条（B 样条 / 扩展 B 样条）：AEG 很少生成，按折线近似
+            for i in range(0, len(shu) - 1, 2):
+                lu.lineTo(shu[i] * bei, shu[i + 1] * bei)
+        elif ming == "c":
+            lu.closeSubpath()
+    return lu
+
+
+def _tian_huitu(huabi, lu, gs, bei=1.0):
+    """把矢量绘图填上主色（\\c / \\1c），\\blur 用柔边近似"""
+    yan = _gs_yanse(gs, "c1", "a1", bei)
+    if yan.alpha() <= 0 or lu.isEmpty():
+        return
+    huabi.save()
+    huabi.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    mo = max(0.0, _ass_shuzi(gs.get("blur"), 0.0))
+    if mo > 0.4:
+        # \blur：libass 是真高斯模糊；这儿拿几层往外扩的半透明描边糊出柔边，
+        # 肉眼看差不多
+        for ceng in (3, 2, 1):
+            bi = QtGui.QPainterPathStroker()
+            bi.setWidth(mo * 2.0 * ceng / 3.0)
+            ruan = QtGui.QColor(yan)
+            ruan.setAlpha(max(0, int(round(yan.alpha() * 0.22))))
+            huabi.fillPath(bi.createStroke(lu), ruan)
+    huabi.fillPath(lu, yan)
+    huabi.restore()
+
+
+def _chun_huitu_lu(xing, fscx, fscy):
+    """一行只有矢量绘图时：几段绘图拼成一条路径（行内 x 依次排开，已按 \\fscx / \\fscy 缩放）"""
+    lu = QtGui.QPainterPath()
+    x_dang = 0.0
+    for yi in xing:
+        for wen_d, gs_d in yi:
+            p = max(1, min(20, int(_ass_shuzi(gs_d.get("p"), 1) or 1)))
+            yi_lu = _huitu_lu(wen_d, float(1 << (p - 1)))
+            if yi_lu.isEmpty():
+                continue
+            kuang = yi_lu.boundingRect()
+            yi_lu.translate(x_dang - kuang.left(), -kuang.top())
+            x_dang += kuang.width()
+            lu.addPath(yi_lu)
+    if lu.isEmpty():
+        return lu
+    zhuan = QtGui.QTransform()
+    zhuan.scale(max(0.01, fscx), max(0.01, fscy))
+    return zhuan.map(lu)
+
+
+def _bai_dao_maodian(lu, ax, ay, an):
+    """把画出来的框按 \\an 摆到锚点 (ax, ay) 上（7/8/9 顶、4/5/6 中、1/2/3 底）"""
+    kuang = lu.boundingRect()
+    lie = (an - 1) % 3          # 0 左 / 1 中 / 2 右
+    pai = (an - 1) // 3         # 0 下 / 1 中 / 2 上
+    if lie == 0:
+        dx = ax - kuang.left()
+    elif lie == 1:
+        dx = ax - kuang.center().x()
+    else:
+        dx = ax - kuang.right()
+    if pai == 0:
+        dy = ay - kuang.bottom()
+    elif pai == 1:
+        dy = ay - kuang.center().y()
+    else:
+        dy = ay - kuang.top()
+    lu.translate(dx, dy)
     return lu
 
 
@@ -3777,6 +5364,12 @@ def _ziti_kuan_biao(fangda, yi_hang):
     """一段文字 -> [(字, 格式, 宽度), ...]（宽度是当前坐标的像素，竖排按竖排算）"""
     jieguo = []
     for wen, gs in yi_hang:
+        if int(_ass_shuzi(gs.get("p"), 0) or 0) > 0:
+            # 矢量绘图：整段当一个物件，宽度按画出来的框算（同行文字要靠它排）
+            p = max(1, min(20, int(_ass_shuzi(gs.get("p"), 1) or 1)))
+            kuang = _huitu_lu(wen, float(1 << (p - 1))).boundingRect()
+            jieguo.append((str(wen), gs, max(0.0, kuang.width())))
+            continue
         ziti = _hua_ziti(gs, fangda)
         fm = QtGui.QFontMetricsF(ziti)
         ming = str(gs.get("font") or "").strip()
@@ -3895,9 +5488,14 @@ def _gs_yanse(gs, jian, a_jian, bei=1.0):
     return y
 
 
-def _hua_yi_hang(huabi, lu, gs, bi, fscx, zhong_x, di_y, bei=1.0):
-    """画一行：先阴影、再描边、最后填字（跟 ASS 的层次一样）
+def _hua_yi_hang_nei(huabi, lu, gs, bi, fscx, zhong_x, bei=1.0, ceng="quan"):
+    """画一段：先阴影、再描边、最后填字（跟 ASS 的层次一样）
 
+    ceng="quan" 全画；"kuang" 只画阴影+描边；"zi" 只画填充 —— xy-VSFilter 把
+    整行的描边光栅化成一整层、填充另成一整层（RTS.cpp 的两个 overlay），填充
+    永远压在**所有**描边上面。这里也得拆成两遍画，不然竖排里 \fn 换字体的那
+    段（比如省略号）的白描边会把上一段字的黑色底部糊掉（用户看到的"省略号
+    把奈盖住"就是这个）。
     bei 是这一刻的不透明度倍数（\\fad 渐入渐出用），1 = 原样。
     """
     huabi.save()
@@ -3906,24 +5504,88 @@ def _hua_yi_hang(huabi, lu, gs, bi, fscx, zhong_x, di_y, bei=1.0):
         huabi.translate(zhong_x, 0.0)
         huabi.scale(fscx, 1.0)
         huabi.translate(-zhong_x, 0.0)
-    if abs(_ass_shuzi(gs.get("frz"), 0.0)) > 0.01:
-        huabi.translate(zhong_x, di_y)
-        huabi.rotate(_ass_shuzi(gs["frz"], 0.0))
-        huabi.translate(-zhong_x, -di_y)
-    shad = max(0.0, _ass_shuzi(gs.get("shad"), 0.0)) * bi
-    if shad > 0.05:
-        yin = QtGui.QPainterPath(lu)
-        yin.translate(shad, shad)
-        huabi.fillPath(yin, _gs_yanse(gs, "c4", "a4", bei))
+    if ceng in ("quan", "kuang"):
+        shad = max(0.0, _ass_shuzi(gs.get("shad"), 0.0)) * bi
+        if shad > 0.05:
+            yin = QtGui.QPainterPath(lu)
+            yin.translate(shad, shad)
+            huabi.fillPath(yin, _gs_yanse(gs, "c4", "a4", bei))
+        bord = max(0.0, _ass_shuzi(gs.get("bord"), 0.0)) * bi
+        if bord > 0.05:
+            bi_bi = QtGui.QPen(_gs_yanse(gs, "c3", "a3", bei))
+            bi_bi.setWidthF(bord * 2.0)
+            bi_bi.setJoinStyle(Qt.RoundJoin)
+            bi_bi.setCapStyle(Qt.RoundCap)
+            huabi.strokePath(lu, bi_bi)
+    if ceng in ("quan", "zi"):
+        huabi.fillPath(lu, _gs_yanse(gs, "c1", "a1", bei))
+    huabi.restore()
+
+
+def _fang_kuang(tu, ban, shu):
+    """方框模糊一遍（沿一轴）。cuSum 前后各减一次，跟像素数无关，快。
+
+    tu 是 (高, 宽, 4) 的 float32，shu=1 表示横着糊。
+    """
+    if ban < 1:
+        return tu
+    if shu:
+        tu = np.swapaxes(tu, 0, 1)
+    k = 2 * ban + 1
+    pad = np.concatenate(
+        [np.repeat(tu[:1], ban, 0), tu, np.repeat(tu[-1:], ban, 0)], 0
+    )
+    ji = np.cumsum(pad, axis=0, dtype=np.float32)
+    ji = np.concatenate([np.zeros((1,) + tu.shape[1:], np.float32), ji], 0)
+    chu = (ji[k:] - ji[:-k]) / k
+    if shu:
+        chu = np.swapaxes(chu, 0, 1)
+    return chu
+
+
+def _mo_tu(tu, sigma):
+    """把整张位图糊一遍：三次方框模糊 ≈ 高斯（跟 VSFilter 的 Rasterizer::Blur
+    一个路子，它也是拿高斯核糊一张覆盖度位图）。
+
+    图上存的是预乘 ARGB，直接糊没问题；糊完把颜色夹回不超过不透明度，免得预乘
+    的关系被糊坏、贴上去发白。
+    """
+    W, H = tu.width(), tu.height()
+    if W < 2 or H < 2 or sigma <= 0.1:
+        return
+    ban = max(1, int(round(sigma * 0.85)))
+    ptr = tu.bits()
+    ptr.setsize(tu.bytesPerLine() * H)
+    quan = np.frombuffer(ptr, dtype=np.uint8)
+    # 这块就是图自己的内存，最后要往它上面写回去（不能只改副本）
+    shi = quan.reshape(H, tu.bytesPerLine() // 4, 4)[:, :W, :]
+    b = shi.astype(np.float32)
+    for _ in range(3):
+        b = _fang_kuang(b, ban, 0)
+        b = _fang_kuang(b, ban, 1)
+    # BGRA：前三个是颜色，第四个是不透明度；预乘的规矩是颜色不能超过不透明度
+    b[:, :, :3] = np.minimum(b[:, :, :3], b[:, :, 3:4])
+    shi[:, :, :] = np.clip(b, 0.0, 255.0).astype(np.uint8)
+
+
+def _yi_hang_kuang(lu, gs, bi, fscx, zhong_x, mo=0.0):
+    """这一段会占多大地方：字 + 描边 + 阴影，写 \\blur 时再加糊出去的那圈"""
+    kb = lu.boundingRect()
     bord = max(0.0, _ass_shuzi(gs.get("bord"), 0.0)) * bi
     if bord > 0.05:
-        bi_bi = QtGui.QPen(_gs_yanse(gs, "c3", "a3", bei))
-        bi_bi.setWidthF(bord * 2.0)
-        bi_bi.setJoinStyle(Qt.RoundJoin)
-        bi_bi.setCapStyle(Qt.RoundCap)
-        huabi.strokePath(lu, bi_bi)
-    huabi.fillPath(lu, _gs_yanse(gs, "c1", "a1", bei))
-    huabi.restore()
+        kb = kb.adjusted(-bord, -bord, bord, bord)
+    shad = max(0.0, _ass_shuzi(gs.get("shad"), 0.0)) * bi
+    if shad > 0.05:
+        kb = kb.united(kb.translated(shad, shad))
+    if abs(fscx - 1.0) > 0.001:
+        kb = QtCore.QRectF(
+            zhong_x + (kb.left() - zhong_x) * fscx, kb.top(),
+            kb.width() * fscx, kb.height(),
+        )
+    if mo > 0.05:
+        bian = max(0.3, mo * 0.7) * 3.0 + 2.0
+        kb = kb.adjusted(-bian, -bian, bian, bian)
+    return kb
 
 
 def _fad_bei(tiao):
@@ -3943,6 +5605,62 @@ def _fad_bei(tiao):
     return max(0.0, min(1.0, bei))
 
 
+def _dong_qian(tiao):
+    """这一刻 \\t 动画的进度（进画面指纹用）
+
+    动画一动指纹就得跟着变，画面才会重画；没写 \\t 的行这条是空的，正常播放时
+    每一帧指纹照样一样、图直接复用。
+    """
+    bu = []
+    hao = None
+    for xing in tiao.get("hang") or []:
+        for wen_d, gs_d in xing:
+            if not (gs_d or {}).get("dong"):
+                continue
+            if hao is None:
+                hao = max(
+                    0, int(tiao.get("ms") or 0) - int(tiao.get("qi") or 0)
+                )
+            g2 = _dong_jia(gs_d, hao)
+            bu.append((wen_d, g2.get("a1"), g2.get("a3"), g2.get("a4")))
+    return tuple(bu)
+
+
+def _zimu_maodian_zhi(gs, jizhun):
+    """一条字幕的锚点（脚本坐标，jizhun = PlayRes）：\\pos 说了算，没写就按
+    \\an + 边距算（居中是在左右边距之间居中，libass / VSFilter 就这样）。
+
+    锚点光看格式就定，跟字体排版没关系 —— 画面真画那一笔（_hua_ass_tiao 记
+    锚点）、拖放方块的底账（HuamianQu.shezhi_zimu）都用这一份，不会两套算法
+    对不上。
+    """
+    kuan_jz = float(max(1, int(jizhun[0])))
+    gao_jz = float(max(1, int(jizhun[1])))
+    an = int(_ass_shuzi(gs.get("an"), 2))
+    an = an if 1 <= an <= 9 else 2
+    lie = (an - 1) % 3               # 0 左 / 1 中 / 2 右
+    pai = (an - 1) // 3              # 0 下 / 1 中 / 2 上
+    pos = gs.get("pos")
+    if pos:
+        return (float(pos[0]), float(pos[1]))
+    ml = max(0.0, _ass_shuzi(gs.get("ml"), 0.0))
+    mr = max(0.0, _ass_shuzi(gs.get("mr"), 0.0))
+    mv = max(0.0, _ass_shuzi(gs.get("mv"), 0.0))
+    if lie == 0:
+        ax = ml
+    elif lie == 1:
+        ax = (kuan_jz + ml - mr) / 2.0
+    else:
+        ax = kuan_jz - mr
+    if pai == 0:
+        ay = gao_jz - mv
+    elif pai == 1:
+        ay = gao_jz / 2.0
+    else:
+        ay = mv
+    return (ax, ay)
+
+
 def _hua_ass_tiao(huabi, qu, tiao, jizhun):
     """把一条字幕画进画面矩形 qu 里
 
@@ -3959,6 +5677,8 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
     bei = _fad_bei(tiao)
     if bei <= 0.004:
         return          # 渐入渐出到全透明了，这一帧干脆不画
+    # 这一行播到第几毫秒（\\t 的时间是相对这一行开头算的，不是画面绝对时刻）
+    hao = max(0, int(tiao.get("ms") or 0) - int(tiao.get("qi") or 0))
     kuan_jz = float(max(1, int(jizhun[0])))      # 基准宽（PlayResX）
     gao_jz = float(max(1, int(jizhun[1])))       # 基准高（PlayResY）
     bi_x = qu.width() / kuan_jz                  # 基准 -> 画面，横竖各一个比例
@@ -3984,59 +5704,129 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
     xing = []
     for x in hang:
         xing.extend(_zhe_duan(fangda, x, kuan * fangda))
-    # 行高 = 上伸 + 下伸（不算 Qt 的 leading），跟 ASS 的行距一致
-    lh = max(1.0, (fm.ascent() + fm.descent()) / fangda)
-    zong_gao = lh * len(xing)
+    # 行高 = 上伸 + 下伸（不算 Qt 的 leading），跟 ASS 的行距一致。
+    # 而且按**每一行自己最大的字号**算 —— xy-VSFilter 就是这么干的：样式 fs40、
+    # 行里写 {\fs25} 时，它两行的行距正好 25 不是 40（拿 VSFilter.dll 实测）。
+    # 竖排里这个行高就是列距，按样式字号算的话每列就多让开一截、整块铺太开。
+    hang_lh = []
+    hang_shang = []
+    for duan in xing:
+        gs_h = None
+        da = -1.0
+        for _wen_d, gs_d in duan:
+            if int(_ass_shuzi(gs_d.get("p"), 0) or 0) > 0:
+                continue          # 矢量绘图段不占字号
+            fs_d = _ass_shuzi(gs_d.get("fs"), 0.0)
+            if fs_d > da:
+                da = fs_d
+                gs_h = gs_d
+        if gs_h is None:
+            hang_lh.append(max(1.0, (fm.ascent() + fm.descent()) / fangda))
+            hang_shang.append(fm.ascent() / fangda)
+            continue
+        fm_h = QtGui.QFontMetricsF(_hua_ziti(gs_h, fangda))
+        hang_lh.append(max(1.0, (fm_h.ascent() + fm_h.descent()) / fangda))
+        hang_shang.append(fm_h.ascent() / fangda)
+    zong_gao = sum(hang_lh)
     an = int(_ass_shuzi(gs.get("an"), 2))
     an = an if 1 <= an <= 9 else 2
     lie = (an - 1) % 3               # 0 左 / 1 中 / 2 右
     pai = (an - 1) // 3              # 0 下 / 1 中 / 2 上
-    pos = gs.get("pos")
-    if pos:
-        ax = float(pos[0])
-        ay = float(pos[1])
-    else:
-        if lie == 0:
-            ax = ml
-        elif lie == 1:
-            # 居中：在左右边距之间居中，左/右边距各推一半 —— libass / VSFilter
-            # 就是这么算的（Aegisub 画面一模一样），不是死钉在画面正中。
-            ax = (kuan_jz + ml - mr) / 2.0
-        else:
-            ax = kuan_jz - mr
-        if pai == 0:
-            ay = gao_jz - mv
-        elif pai == 1:
-            ay = gao_jz / 2.0
-        else:
-            ay = mv
+    ax, ay = _zimu_maodian_zhi(gs, jizhun)
+    # 这一笔算出来的锚点记回这条上：拖放模式的方块要跟画面显示得一模一样，
+    # 就不能在外面另算一遍（两份实现，早晚对不上）
+    tiao["_ax"] = ax
+    tiao["_ay"] = ay
     if pai == 0:
         ding = ay - zong_gao
     elif pai == 1:
         ding = ay - zong_gao / 2.0
     else:
         ding = ay
+    # 每行的基线：从块顶往下按**各行自己**的行高累出来（不是统一行距）
+    di_men = []
+    _y = ding
+    for _i in range(len(xing)):
+        di_men.append(_y + hang_shang[_i])
+        _y += hang_lh[_i]
     huabi.save()
     huabi.setRenderHint(QtGui.QPainter.Antialiasing, True)
     # 基准坐标 -> 画面：挪到画面左上角、按两个方向的比例缩过去；画面外的切掉
     huabi.translate(qu.left(), qu.top())
     huabi.scale(bi_x, bi_y)
-    huabi.setClipRect(QtCore.QRectF(0.0, 0.0, kuan_jz, gao_jz))
+    # 画面这一层裁剪（整块脚本坐标系）。每段再按自己的 \clip 在这上面切一刀。
+    # 双色字幕就是这么来的：两条文字完全一样、位置也一样，其中一条写
+    # {\c&H..&\clip(左,上,右,下)}，只有框里那部分字换成另一个颜色。
+    lu_huamian = QtGui.QPainterPath()
+    lu_huamian.addRect(QtCore.QRectF(0.0, 0.0, kuan_jz, gao_jz))
+    huabi.setClipPath(lu_huamian)
+    # \frz（样式表里的 Angle 就是它）：libass 转的是**整块**文字、绕 \pos 那个
+    # 锚点转，不是一行一行各转各的。方向也得照 Aegisub：Angle 写负数是顺时针
+    # （AEG 里 -90° 的竖排样式，整块往锚点左下方铺）。这一下决定列的顺序和字
+    # 头朝哪边，方向写反整块就倒 180°。
+    frz = _ass_shuzi(gs.get("frz"), 0.0)
+    if abs(frz) > 0.01:
+        huabi.translate(ax, ay)
+        huabi.rotate(-frz)
+        huabi.translate(-ax, -ay)
+    # 整行只有矢量绘图（{\p1}m 0 0 l 100 0 …{\p0} 画分割线那种）：照 libass
+    # 走另一条 —— 不看字体、不排行高，把画出来的框按 \an 直接贴到锚点上
+    chun_huitu = any(yi for yi in xing) and all(
+        int(_ass_shuzi((gd or {}).get("p"), 0) or 0) > 0
+        for yi in xing for _w, gd in yi
+    )
+    if chun_huitu:
+        lu_h = _chun_huitu_lu(
+            xing, fscx, max(0.01, _ass_shuzi(gs.get("fscy"), 100) / 100.0)
+        )
+        lu_h = _bai_dao_maodian(lu_h, ax, ay, an)
+        _tian_huitu(huabi, lu_h, gs, bei)
+        # 遮盖矢量图：把这一笔画出来的框（脚本坐标）记回这条上 —— 画面上的
+        # 拖角方块照它摆，拖完也算回 \fscx/\fscy/\pos，跟显示必然一致（一个算法）。
+        # 记的是**整块转过之后**的框：竖排样式 Angle=-90，方块自己也转了 90°，
+        # 画面上看到的长方形跟 \fscx/\fscy 是拧着的，手柄得照看到的来。
+        # 跟 _ax/_ay 一样，画完就被 _zimu_ceng 摘走存进控件，别进指纹。
+        kuang_h = lu_h.boundingRect()
+        tiao["_kuang"] = _shiliang_kuang_zhuan(
+            (kuang_h.left(), kuang_h.top(), kuang_h.right(), kuang_h.bottom()),
+            ax, ay, frz,
+        )
+        tiao["_kuang_an"] = int(an)
+        tiao["_kuang_p"] = max(1, int(_ass_shuzi(gs.get("p"), 1) or 1))
+        tiao["_kuang_frz"] = float(frz)
+        huabi.restore()
+        return
     if int(_ass_shuzi(gs.get("bs"), 1)) == 3:
         # 实底框：左右边距之间铺一条（ASS 的"不透明框"）
         kuang = QtCore.QRectF(
             ml, ding, max(1.0, kuan_jz - ml - mr), zong_gao,
         )
         huabi.fillRect(kuang, _gs_yanse(gs, "c3", "a3"))
+    # 先把所有段的排版算出来，不急着画 —— xy-VSFilter 是把整行的"阴影+描边"
+    # 光栅化成一整层、所有段的"填充"另成一整层（RTS.cpp 的两个 overlay），
+    # 填充永远压在**所有**描边上面。也照这样分遍画：一段一段各画各的话，
+    # 后一段的白描边会把前一段字的黑色底部糊掉（竖排里 \fn 换字体的省略号
+    # 把"奈"盖住就是这个病）。
+    hui_duan = []      # 矢量绘图段：(路径, 格式, 裁剪)
+    wen_duan = []      # 文字段：(路径, 格式, 裁剪, fscx 锚点)
     for i, duan in enumerate(xing):
         # 行宽 = 各段宽度之和；对齐照这一行的总宽算
         kuan_duan = []
         kuan_x = 0.0
         for wen_d, gs_d in duan:
-            kuan_duan.append(
-                sum(w for _c, _g, w in _ziti_kuan_biao(fangda, [(wen_d, gs_d)]))
-                / fangda * fscx
-            )
+            if int(_ass_shuzi(gs_d.get("p"), 0) or 0) > 0:
+                # 矢量绘图：量出来的就是脚本坐标，不用再除 FANGDA
+                kuan_duan.append(
+                    sum(
+                        w for _c, _g, w in _ziti_kuan_biao(fangda, [(wen_d, gs_d)])
+                    ) * fscx
+                )
+            else:
+                kuan_duan.append(
+                    sum(
+                        w for _c, _g, w in _ziti_kuan_biao(fangda, [(wen_d, gs_d)])
+                    ) / fangda * fscx
+                )
             kuan_x += kuan_duan[-1]
         if lie == 0:
             x0 = ax
@@ -4044,11 +5834,49 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
             x0 = ax - kuan_x / 2.0
         else:
             x0 = ax - kuan_x
-        di = ding + i * lh + fm.ascent() / fangda
-        # 一段一段画：每段用自己那份格式（颜色 / 粗斜体 / 字号都能只有几个字不一样）
+        di = di_men[i]
         x_dang = x0
         zhong_x = x0 + kuan_x / 2.0
+        ju_dang = lu_huamian           # 这一段眼下待的裁剪（没写 \clip 就是整块画面）
         for (wen_d, gs_d), kuan_d in zip(duan, kuan_duan):
+            # 这一段自己那份 \clip（框里留下）/ \iclip（框外留下，框里挖空）
+            ju_jian = gs_d.get("clip")
+            ju_kong = gs_d.get("iclip")
+            if ju_jian or ju_kong:
+                ju = ju_jian or ju_kong
+                lu_ju = QtGui.QPainterPath()
+                lu_ju.addRect(
+                    QtCore.QRectF(
+                        float(ju[0]), float(ju[1]),
+                        float(ju[2]) - float(ju[0]),
+                        float(ju[3]) - float(ju[1]),
+                    ).normalized()
+                )
+                ju_dang = (
+                    lu_huamian.intersected(lu_ju) if ju_jian
+                    else lu_huamian.subtracted(lu_ju)
+                )
+            # \t 这类动画按这一刻的画面时刻算（打字机逐字冒出来就是它）
+            gs_hua = _dong_jia(gs_d, hao)
+            if not (
+                _gs_yanse(gs_hua, "c1", "a1", bei).alpha()
+                or _gs_yanse(gs_hua, "c3", "a3", bei).alpha()
+                or _gs_yanse(gs_hua, "c4", "a4", bei).alpha()
+            ):
+                # 全是透明的（打字机还没轮到冒出来的那些字）这一帧不画
+                x_dang += kuan_d
+                continue
+            p_zhi = int(_ass_shuzi(gs_hua.get("p"), 0) or 0)
+            if p_zhi > 0:
+                # 一行里既有文字又有绘图的写法：绘图接着前面那段排，y = 0 落
+                # 在基线上（跟 libass 一样，绘图是当字形摆的）
+                lu_h = _huitu_lu(
+                    wen_d, float(1 << (max(1, min(20, p_zhi)) - 1))
+                )
+                lu_h.translate(x_dang, di)
+                hui_duan.append((lu_h, gs_hua, ju_dang))
+                x_dang += kuan_d
+                continue
             ziti_d = _hua_ziti(gs_d, fangda)
             ming_d = str(gs_d.get("font") or "").strip()
             if _shi_shu(ming_d):
@@ -4060,8 +5888,82 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
                 lu_da = QtGui.QPainterPath()
                 lu_da.addText(x_dang * fangda, di * fangda, ziti_d, wen_d)
             lu = QtGui.QTransform().scale(1.0 / fangda, 1.0 / fangda).map(lu_da)
-            _hua_yi_hang(huabi, lu, gs_d, 1.0, fscx, zhong_x, di, bei)
+            wen_duan.append((lu, gs_hua, ju_dang, zhong_x))
             x_dang += kuan_d
+
+    # 第一遍：写了 \blur 的段，按糊的量分组，每组的"阴影+描边"合进一张位图
+    # 糊一次再贴回（VSFilter 的 PaintFromBluredOverlay 就是整层糊一次；
+    # 一段一段各糊各的话，光晕会互相叠、整块比它黑一大截）
+    mo_qun = {}
+    for lu, gs_hua, ju_lu, zhong_x in wen_duan:
+        mo = max(0.0, _ass_shuzi(gs_hua.get("blur"), 0.0))
+        if mo > 0.05:
+            mo_qun.setdefault(round(mo, 2), []).append((lu, gs_hua, ju_lu, zhong_x))
+    for mo, zu in mo_qun.items():
+        sigma = max(0.3, mo * 0.7)
+        kb = None
+        for lu, gs_hua, ju_lu, zhong_x in zu:
+            k = _yi_hang_kuang(lu, gs_hua, 1.0, fscx, zhong_x, mo)
+            kb = k if kb is None else kb.united(k)
+        bian = sigma * 3.0 + 2.0
+        kb = kb.adjusted(-bian, -bian, bian, bian)
+        W = max(1, int(kb.width()) + 1)
+        H = max(1, int(kb.height()) + 1)
+        tu = QtGui.QImage(W, H, QtGui.QImage.Format_ARGB32_Premultiplied)
+        tu.fill(QtCore.Qt.transparent)
+        tb = QtGui.QPainter(tu)
+        tb.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        tb.translate(-kb.left(), -kb.top())
+        for lu, gs_hua, ju_lu, zhong_x in zu:
+            you_bian = (
+                max(0.0, _ass_shuzi(gs_hua.get("bord"), 0.0)) > 0.05
+                or max(0.0, _ass_shuzi(gs_hua.get("shad"), 0.0)) > 0.05
+            )
+            if ju_lu is lu_huamian:
+                tb.setClipRect(kb)
+            else:
+                tb.setClipPath(ju_lu)
+            # 有描边/阴影：图里只放描边和阴影，字身等会儿清清楚楚压上去；
+            # 描边阴影全没有的（\bord0\shad0），照 VSFilter 整字一起糊
+            _hua_yi_hang_nei(
+                tb, lu, gs_hua, 1.0, fscx, zhong_x, bei,
+                "kuang" if you_bian else "quan",
+            )
+        tb.end()
+        _mo_tu(tu, sigma)
+        # 贴回画面：目标框给脚本坐标，画布的缩放 / 整块旋转由画笔自己带上
+        huabi.drawImage(kb, tu, QtCore.QRectF(0.0, 0.0, float(W), float(H)))
+    # 第二遍：不糊的那些段，阴影 + 描边直接画
+    for lu, gs_hua, ju_lu, zhong_x in wen_duan:
+        if max(0.0, _ass_shuzi(gs_hua.get("blur"), 0.0)) > 0.05:
+            continue
+        if ju_lu is lu_huamian:
+            huabi.setClipPath(lu_huamian)
+        else:
+            huabi.setClipPath(ju_lu)
+        _hua_yi_hang_nei(huabi, lu, gs_hua, 1.0, fscx, zhong_x, bei, "kuang")
+    # 第三遍：所有段的字身（填充）清清楚楚压在最上面 —— 到这儿描边再也咬不到字
+    for lu, gs_hua, ju_lu, zhong_x in wen_duan:
+        mo = max(0.0, _ass_shuzi(gs_hua.get("blur"), 0.0))
+        you_bian = (
+            max(0.0, _ass_shuzi(gs_hua.get("bord"), 0.0)) > 0.05
+            or max(0.0, _ass_shuzi(gs_hua.get("shad"), 0.0)) > 0.05
+        )
+        if mo > 0.05 and not you_bian:
+            # 描边阴影全没有的段整字已经糊进位图了，不再画清晰版
+            continue
+        if ju_lu is lu_huamian:
+            huabi.setClipPath(lu_huamian)
+        else:
+            huabi.setClipPath(ju_lu)
+        _hua_yi_hang_nei(huabi, lu, gs_hua, 1.0, fscx, zhong_x, bei, "zi")
+    # 第四遍：矢量绘图段照原来的次序画（它那份 \blur 柔边是自带的）
+    for lu_h, gs_hua, ju_lu in hui_duan:
+        if ju_lu is lu_huamian:
+            huabi.setClipPath(lu_huamian)
+        else:
+            huabi.setClipPath(ju_lu)
+        _tian_huitu(huabi, lu_h, gs_hua, bei)
     huabi.restore()
 
 
@@ -4079,6 +5981,7 @@ def _zimu_qian(tiao_men, mubiao, jizhun):
                 repr(tiao.get("hang") or []),
                 repr(tiao.get("gs") or {}),
                 round(float(_fad_bei(tiao)), 3),
+                _dong_qian(tiao),
             )
         )
     return (
@@ -4147,7 +6050,138 @@ def _chai_ass(wenben):
     }
 
 
-def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None):
+# 编辑位置段：Aegisub 管它叫 [Aegisub Project Garbage]，记「上次编辑到哪儿」
+# （源码 src/subtitle_format_ass.cpp 第 92 行起、src/ass_parser.cpp 第 59 行起）
+_JILU_DUAN = "[aegisub project garbage]"
+
+
+def _ass_jilu_du(wenben):
+    """读 ASS 里记的编辑位置 -> {"you": 有没有这个段, "xuan": 第几行, "zhen": 第几帧}
+
+    行号是 0 起的（跟 Aegisub 一样，它那个 Active Line 从 0 数）。没写那行就
+    给 -1 —— 跟 Aegisub 的「0 不写」一个意思，只是它读回来当 0（等于第一行）。
+    """
+    you, xuan, zhen, zai = False, -1, -1, False
+    for yuan_hang in (wenben or "").splitlines():
+        tiao = yuan_hang.strip()
+        if tiao.startswith("[") and tiao.endswith("]"):
+            zai = tiao.lower() == _JILU_DUAN
+            if zai:
+                you = True
+            continue
+        if not zai or ":" not in tiao:
+            continue
+        jian, zhi = tiao.split(":", 1)
+        jian = jian.strip().lower()
+        if jian in ("active line", "aegisub active line"):
+            try:
+                xuan = int(zhi.strip())
+            except ValueError:
+                pass
+        elif jian in ("video position", "aegisub video position"):
+            try:
+                zhen = int(zhi.strip())
+            except ValueError:
+                pass
+    return {"you": you, "xuan": xuan, "zhen": zhen}
+
+
+def _tou_qu_jilu(tou):
+    """骨架里旧的编辑位置段拿出来 ->（剩下的骨架, 旧段里我们不写的那几行）
+
+    AEG 这一段里除了编辑位置，还记着 Audio File / Video File / Video AR Mode /
+    Video AR Value / Video Zoom Percent（上次用的是哪个视频、画面怎么缩放的）。
+    整段删掉重写会把它们一起抹了 —— AEG 再打开就不认视频了。所以旧段里除了
+    我们管的那三样，其余原样留着，位置也不动。
+    """
+    chu, bao, zai = [], [], False
+    for tiao in tou or []:
+        t = tiao.strip()
+        if t.startswith("[") and t.endswith("]"):
+            zai = t.lower() == _JILU_DUAN
+            if zai:
+                continue
+        if zai:
+            if t:
+                bao.append(tiao)
+            continue
+        chu.append(tiao)
+    return chu, bao
+
+
+# 这一段里只有这三样归我们写，别的键（Audio File 那些）原样留着
+_JILU_ZIJI = (
+    "scroll position", "active line", "video position",
+    "aegisub active line", "aegisub video position",
+)
+
+
+def _jilu_duan_hang(jilu, bao=None):
+    """照 Aegisub 把 [Aegisub Project Garbage] 段拼出来；没记的就给空表
+
+    jilu = {"gun": 列表顶上第几行, "xuan": 选中第几行(0 起), "zhen": 第几帧}，
+    -1 表示没记（不写那一行）；手写的旧段里已经有了的也留着。
+
+    bao = 旧段里我们不管的行（Audio File / Video File / 缩放那些），原样排在
+    我们那三行前面 —— 顺序跟 AEG 写出来的一致（见 src/subtitle_format_ass.cpp
+    第 108 行起：先视频那几项，再 Scroll / Active / Video Position）。
+    """
+    men = {}
+    for jian, moren in (("gun", -1), ("xuan", -1), ("zhen", -1)):
+        try:
+            men[jian] = int((jilu or {}).get(jian, moren))
+        except (TypeError, ValueError):
+            men[jian] = -1
+    liu = [t for t in (bao or []) if t.split(":", 1)[0].strip().lower()
+           not in _JILU_ZIJI]
+    if all(x < 0 for x in men.values()) and not liu:
+        return []
+    hang = ["[Aegisub Project Garbage]"]
+    hang.extend(liu)
+    for ming, jian in (("Scroll Position", "gun"),
+                       ("Active Line", "xuan"),
+                       ("Video Position", "zhen")):
+        if men[jian] >= 0:
+            hang.append(f"{ming}: {men[jian]}")
+    hang.append("")
+    return hang
+
+
+def _tou_cha_jilu(tou, jilu):
+    """把编辑位置段插进骨架里，位置照 Aegisub：紧跟在 [Script Info] 段之后
+
+    （    Aegisub 是 Script Info -> Project Garbage -> Styles -> Events 这个顺序；
+    它读的时候是按段头认的，放哪儿都认，但存回去会按这个顺序排，我们写出来
+    就照它的顺序，两边打开看到的一模一样。）
+
+    旧段里 AEG 记的视频那几行（Audio File / Video File / 缩放）一并带过去，
+    只更新我们管的三样。
+    """
+    chu, bao = _tou_qu_jilu(tou)
+    duan = _jilu_duan_hang(jilu, bao)
+    if not duan:
+        return chu
+    cha = len(chu)
+    zai = False
+    for i, tiao in enumerate(chu):
+        t = tiao.strip()
+        if t.startswith("[") and t.endswith("]"):
+            if zai:
+                cha = i
+                break
+            zai = t.lower() == "[script info]"
+    if not zai:                     # 没有 [Script Info] 段：摆在最前头
+        cha = 0
+    while cha > 0 and not chu[cha - 1].strip():
+        cha -= 1
+    hou = cha
+    if cha < len(chu):              # 后面还有段头：中间的旧空行并成一个
+        while hou < len(chu) and not chu[hou].strip():
+            hou += 1
+    return chu[:cha] + [""] + duan + chu[hou:]
+
+
+def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None, jilu=None):
     """按原 ASS 的结构写出去：骨架 / 样式表 / 每行的字段原样带过去
 
     只有时间、条数、文字会变：每条字幕优先认原来的那一行（先认文字、再认原来
@@ -4156,6 +6190,9 @@ def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None):
 
     fu_liebiao = 每条的字段表（样式 / 说话人 / 层 / 边距 / 特效 / 注释），给了就
     盖在认出来的那一行上。
+
+    jilu = 这次的编辑位置（选中第几行 + 播放头第几帧），照 Aegisub 写在
+    [Script Info] 之后、[Events] 之前，下次打开能接回去。
     """
     from anylabeling.views.labeling.utils.video import (
         ASS_TEMPLATE,
@@ -4224,8 +6261,11 @@ def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None):
         hang_xin.append(bu)
 
     lei_zhi = str(hang_xin[0].get("_lei") or "Dialogue") if hang_xin else ""
+    tou = jiegou.get("tou") or []
+    if tou and jilu is not None:
+        # 编辑位置段：旧的先清掉，新的插在 [Script Info] 之后（顺序照 AEG）
+        tou = _tou_cha_jilu(tou, jilu)
     with open(lu, "w", encoding="utf-8-sig") as f:
-        tou = jiegou.get("tou") or []
         if tou:
             for tiao in tou:
                 f.write(tiao + "\n")
@@ -4245,10 +6285,10 @@ def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None):
             )
 
 
-def _xie_zimu_dao_wenjian(lu, zimu, ass_yuan=None, fu_liebiao=None):
+def _xie_zimu_dao_wenjian(lu, zimu, ass_yuan=None, fu_liebiao=None, jilu=None):
     """按扩展名挑写法：.ass / .ssa 有原结构就按原结构写，否则用模板"""
     if ass_yuan and osp.splitext(lu)[1].lower() in (".ass", ".ssa"):
-        _xie_ass_baoliu(lu, ass_yuan, zimu, fu_liebiao)
+        _xie_ass_baoliu(lu, ass_yuan, zimu, fu_liebiao, jilu)
     else:
         _xie_zimu_wenjian(lu, zimu)
 
@@ -4417,6 +6457,25 @@ class ShijianZhou(QtWidgets.QWidget):
         原来选中的那块跟着往后挪一格，插在前面也不会选中别的块。
         """
         wei = zimu_charu_weizhi(self._zimu, qi_ms, zhi_ms)
+        self._zimu.insert(wei, (int(qi_ms), int(zhi_ms), str(wenben or "")))
+        self._zimu_tao.insert(wei, 0)   # 新块默认摆第一行
+        if len(self._kuai_yanse) == len(self._zimu) - 1:
+            self._kuai_yanse.insert(wei, None)  # 新块先按默认色，外面重喂再换
+        self._jing_ban += 1             # 字幕数据变了，静层缓存作废（见 _jing_tu）
+        if wei <= self._xuan_zhong:
+            self._xuan_zhong += 1
+        self._xuan_duo = [x + 1 if x >= wei else x for x in self._xuan_duo]
+        self._zai_kuai = None       # 块变了，播放头压着哪几块重新认
+        self.update()
+        return wei
+
+    def charu_zimu(self, wei, qi_ms, zhi_ms, wenben):
+        """按指定行号插一块（照 tianjia_zimu 那一套账，位置由外面指定）
+
+        遮盖矢量图就走这儿：要插在它盖的那条字幕**前面** —— 同一层里先画的在
+        下头，白块才盖得住原文、又不挡字幕。
+        """
+        wei = max(0, min(int(wei), len(self._zimu)))
         self._zimu.insert(wei, (int(qi_ms), int(zhi_ms), str(wenben or "")))
         self._zimu_tao.insert(wei, 0)   # 新块默认摆第一行
         if len(self._kuai_yanse) == len(self._zimu) - 1:
@@ -6597,6 +8656,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.setStyleSheet(_yangshi_quanju())
         # 画面拆到独立窗口（照 AEG 的 Detach Video）：没拆的时候是 None
         self._duli_chuang = None
+        # 正在画字幕遮罩（\clip）：记着这次画的是哪一条，画完就往它身上写
+        self._zhemo_mu = None
+        # 画面鼠标模式：标准（双击画面定位字幕）/ 拖放（拖锚点方块移动字幕）
+        self._shu_biao_mo = "biaozhun"
+        # 拖放进行中：[(第几条, 按住时它锚在哪(脚本坐标)), ...] 和这次拖的起点
+        self._tuo_pos_qi = None
+        self._tuo_pos_dian = None
         # 拆出去之前左右分栏的尺寸（搬回来照着摆回去）
         self._zuo_you_chi = None
         # 正在关窗口：这期间别再挂渲染上下文、别再排延时活
@@ -7291,6 +9357,24 @@ class VideoWorkDialog(QtWidgets.QDialog):
             w.customContextMenuRequested.connect(self._tan_weizhi_caidan)
         self._jian_hang_caidan()
 
+    def _dian_hang(self, zong):
+        """右键点中的是字幕列表第几行；点在表头 / 边上 / 底下空白上给 -1
+
+        表格那块画布（viewport）顶上被表头占掉一截，直接拿事件坐标去找行会
+        偏一行（点着某行下手，实际落到上一行去）；用鼠标的屏幕位置换算到画
+        布上，再问它那一格是第几行。键盘调出来的右键菜单鼠标不在表上，这儿
+        给 -1，回去用列表里选中的行。
+        """
+        biao = self.bianji_mianban.biao
+        try:
+            dian = biao.viewport().mapFromGlobal(QtGui.QCursor.pos())
+        except (TypeError, RuntimeError):
+            return -1
+        if not biao.viewport().rect().contains(dian):
+            return -1
+        hang = biao.indexAt(dian).row()
+        return hang if 0 <= hang < zong else -1
+
     def _tan_liebiao_caidan(self, kuang, pos):
         """字幕列表右键：批量加「」+ 位置切换
 
@@ -7303,10 +9387,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
         """
         zimu = self.zimu_mianban.zimu_liebiao()
         mu = [int(x) for x in self.bianji_mianban.xuan_zhong_hang()]
-        if kuang is self.bianji_mianban.biao and zimu:
-            hang = self.bianji_mianban.biao.indexAt(pos).row()
-            if 0 <= hang < len(zimu) and hang not in mu:
-                mu = [hang]
+        # 点在行上：不管你有没有先选中，这一行就是这轮要处理的对象
+        hang = self._dian_hang(len(zimu))
+        if hang >= 0 and hang not in mu:
+            mu = [hang]
         mu = [i for i in mu if 0 <= i < len(zimu)]
         # 这轮右键要处理哪几行：菜单里的动作触发时来这儿取（快捷键触发时
         # 这儿是 None，回去拿列表里真正选中的那几行）
@@ -7345,27 +9429,834 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if bool(dian is lie) != self._liebiao_zai_xia:
             self._qiehuan_weizhi()
 
+    def _zimu_zuobiao_mu(self):
+        """画面右键「复制字幕坐标」该拿哪几条的坐标
+
+        先认列表里选中 / 正在编辑的那一条；没选中、或者那一条是个空壳（一行
+        里一个字都没有）就给空表 —— 菜单里这一项跟着变灰。不去猜播放头停在
+        哪条，猜错了复制出来是别的字幕的坐标，比不给还坑。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        mu = [int(x) for x in self.bianji_mianban.xuan_zhong_hang()]
+        if not mu:
+            try:
+                xu = int(self.bianji_mianban.dangqian_xu())
+            except (TypeError, ValueError):
+                xu = -1
+            if xu >= 0:
+                mu = [xu]
+        chu = []
+        for i in mu:
+            if not (0 <= i < len(zimu)):
+                continue
+            if not _zhemo_chun_wen(zimu[i][2]):
+                continue        # 这条里一个字都没有，没东西可对
+            chu.append(i)
+        return chu
+
+    def _fuzhi_zimu_zuobiao(self, mu):
+        """复制字幕坐标：把选中那几条的 \\pos 数复制走
+
+        这条自己写着 \\pos / \\move 的，照它写的来；一个字没写的，按它自己的
+        对齐方式 + 边距算一个 —— 跟 AEG 排版那套算法一样，所以粘到 AEG 里位置
+        对得上。多条就一行一条。算不出（还没视频、没尺寸）就什么都不复制。
+
+        画遮罩时给变色层标的也是这个坐标：两条标在同一个点，AEG 打开才叠在
+        一起（只标一条 / 一条标样式一条标 \\pos，就是"两行字幕不重叠"）。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        yuan = []
+        for xu in mu:
+            xu = int(xu)
+            if not (0 <= xu < len(zimu)):
+                continue
+            jd = self._zimu_maodian(xu, zimu)
+            if jd is None:
+                continue
+            yuan.append(
+                "{\\pos(%d,%d)}" % (int(round(jd[0])), int(round(jd[1])))
+            )
+        if not yuan:
+            self.shezhi_mianban.zhuangtai_shezhi("这条字幕算不出坐标")
+            return
+        QtWidgets.QApplication.clipboard().setText("\n".join(yuan))
+        self.shezhi_mianban.zhuangtai_shezhi("字幕坐标已复制：" + " ".join(yuan))
+
     # ---- 画面右键菜单：复制坐标 / 拆分视频（照 AEG 的视频右键菜单）----
     def _tan_huamian_caidan(self, dian):
         """鼠标在画面上点右键 -> 弹菜单
 
-        照 Aegisub 的视频右键菜单来的，先放这两项：
-          复制坐标到剪贴板（AEG 的 video/copy_coordinates）
-          拆分视频      （AEG 的 video/detach，其实就是把画面弹到独立窗口）
+        照 Aegisub 的视频右键菜单来的：
+          复制坐标到剪贴板  （AEG 的 video/copy_coordinates：鼠标落在画面上的那点）
+          复制字幕坐标      （选中那条字幕锚在哪 —— 双击 / 画遮罩写的就是这个数）
+          画字幕遮罩 / 画遮盖矢量图 / 拆分视频 / 标准模式 / 拖放模式
         dian 是控件坐标，算坐标要用到。
         """
         cai = QtWidgets.QMenu(self.huamian)
         a_zuobiao = cai.addAction("复制坐标到剪贴板")
         a_zuobiao.setEnabled(self.huamian.yuan_chicun() is not None)
+        mu_zb = self._zimu_zuobiao_mu()
+        a_zimu_zb = cai.addAction("复制字幕坐标")
+        a_zimu_zb.setEnabled(bool(mu_zb))
+        cai.addSeparator()
+        a_zhemo = cai.addAction("画字幕遮罩（框里那段字单独换色）")
+        a_zhemo.setEnabled(self.huamian.yuan_chicun() is not None)
+        a_shiliang = cai.addAction("画遮盖矢量图（白块盖住漫画原文）")
+        a_shiliang.setEnabled(self.huamian.yuan_chicun() is not None)
         cai.addSeparator()
         a_duli = cai.addAction("拆分视频")
         a_duli.setCheckable(True)
         a_duli.setChecked(self._duli_chuang is not None)
+        cai.addSeparator()
+        a_bz = cai.addAction("标准模式（双击画面 = 选中的字幕搬到那儿）")
+        a_bz.setCheckable(True)
+        a_bz.setChecked(self._shu_biao_mo == "biaozhun")
+        a_tf = cai.addAction("拖放模式（拖方块移动字幕 / 拖矢量图改大小）")
+        a_tf.setCheckable(True)
+        a_tf.setChecked(self._shu_biao_mo == "tuofang")
         dian_le = cai.exec_(QtGui.QCursor.pos())
         if dian_le is a_zuobiao:
             self._fuzhi_huamian_zuobiao(dian)
+        elif dian_le is a_zimu_zb:
+            self._fuzhi_zimu_zuobiao(mu_zb)
+        elif dian_le is a_zhemo:
+            self._kaishi_hua_zhemo()
+        elif dian_le is a_shiliang:
+            self._kaishi_hua_shiliang()
         elif dian_le is a_duli:
             self._qiehuan_huamian_duli()
+        elif dian_le is a_bz:
+            self._qiehuan_shu_biao_mo("biaozhun")
+        elif dian_le is a_tf:
+            self._qiehuan_shu_biao_mo("tuofang")
+
+    def _kaishi_hua_zhemo(self):
+        """进「画字幕遮罩」状态：在画面上拖个矩形，把 \\clip 写进选中那条字幕
+
+        双色字幕就是这么来的：两条文字、位置一模一样，其中一条写
+        {\\c&H..&\\clip(左,上,右,下)}，只有遮罩框里那部分字换成另一个颜色。
+        Aegisub 里也是画面上拖这个矩形（它管这个叫 vector clip）。
+        """
+        mu = [int(x) for x in self.bianji_mianban.xuan_zhong_hang()]
+        if len(mu) != 1:
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "先只选中一条字幕（画遮罩一次只给一条画）"
+            )
+            return
+        self._zhemo_mu = mu[0]
+        self.huamian.kaishi_kuang_xuan("zhemo")
+        self.shezhi_mianban.zhuangtai_shezhi(
+            "在画面上拖一个矩形（橙框）：框里那段字会单独换色，"
+            "外面照样是原来的颜色（第一次画要挑一次颜色）"
+        )
+
+    def _zhemo_hua_wan(self, ju):
+        """遮罩画完了：照 AEG 的两条写法，把 \\clip 落到该落的那条上
+
+        AEG 里双色是两条 Dialogue：一条完整的原色，另一条同样的字、只留
+        裁剪框里那截、换成另一个颜色。所以这里绝不拿唯一的原条去挨刀 ——
+        那会把整句裁掉一半，框外那半没着落，看着就是"只显示一半"。
+        """
+        xu = getattr(self, "_zhemo_mu", None)
+        self._zhemo_mu = None
+        if not ju or xu is None:
+            return
+        xu = int(xu)
+        zimu = self.zimu_mianban.zimu_liebiao()
+        if not (0 <= xu < len(zimu)):
+            return
+        qi, zhi = int(zimu[xu][0]), int(zimu[xu][1])
+        jiu = str(zimu[xu][2] or "")
+        # 原条那一行的字段（样式 / 说话人 / 层 / 三个边距 / 特效）先抄一份留着。
+        # 变色层必须跟原条同一个样式 —— AEG 里双色本来就是复制第二条，两条样式
+        # 一样才叠在同一处；样式要是掉了（变成 Default），AEG 按 Default 的左下
+        # 对齐去摆，跟原条的底部居中差一大截，看着就是"上下两行"。
+        # 取字段得在动手改之前，那会儿 xu 指的还是原条。
+        try:
+            fu_yuan = dict(self._zimu_fujia(zimu)[xu] or {})
+        except (IndexError, TypeError, AttributeError):
+            fu_yuan = {}
+        # 原条现在锚在哪儿：写了 \pos 就用它写的，没写就照它自己的对齐方式 +
+        # 边距算一个（跟 AEG 的排版规则一套算法）。这个坐标等下连 clip 一起
+        # 写进变色层 —— 两条标同一个点，AEG 里才叠得上；只写一条，或者一条
+        # 写在样式上、一条写在 \pos 上，就成了"两行字幕不重叠"。
+        jd = self._zimu_maodian(xu)
+        if jd is not None:
+            # 坐标先落到这一行的开头：变色层整条是从这儿抄过去的，标签顺序就
+            # 是 AEG 手工写的那种 {\pos(...)\c...\clip(...)}；本来有 \pos 的
+            # 也在这儿归到同一个值上
+            jiu = _pos_xie_ru(jiu, jd[0], jd[1])
+        xin_jian = False
+        if re.search(r"\\i?clip\(", jiu):
+            # 这条自己就带裁剪 —— 它本来就是变色层（AEG 里手工写的第二条那种）
+            mu = xu
+        else:
+            # 这条是原色层。同一句话要是已经有配好的变色层，就直接改那一条
+            chun = _zhemo_chun_wen(jiu)
+            mu = None
+            for i, t in enumerate(zimu):
+                if i == xu or int(t[0]) != qi or int(t[1]) != zhi:
+                    continue
+                if re.search(r"\\i?clip\(", str(t[2] or "")) and _zhemo_chun_wen(t[2]) == chun:
+                    mu = i
+                    break
+            if mu is None:
+                # 还没变色层：另起一条克隆当变色层，原条一个字都不动，
+                # 框外那半才有原色接着（跟 AEG 里手工复制第二条一个道理）
+                se = self._zhemo_tiao_yanse()
+                if se is None:
+                    return
+                mu = self._jia_zimu_kuai(
+                    qi, zhi, _zhemo_xie_ru(_zhemo_jia_yanse(jiu, se), ju)
+                )
+                xin_jian = True
+        wenben = str(self.zimu_mianban.zimu_liebiao()[mu][2] or "")
+        xin = _zhemo_xie_ru(wenben, ju)
+        if jd is not None:
+            # 坐标跟 clip 一块儿写进去（同一对花括号）：变色层和原条标同一个
+            # 锚点，AEG 打开两条叠在同一处
+            xin = _pos_xie_ru(xin, jd[0], jd[1])
+        if fu_yuan:
+            # 变色层认领原条的字段：写 ASS 时就带上同一个样式 / 边距，
+            # AEG 打开才跟原条叠在同一处（不认领就掉成 Default，错行）
+            self._fu_wai[(qi, zhi, str(xin))] = dict(fu_yuan)
+        if xin != wenben:
+            self._huan_zimu_wenben(mu, xin)
+        if xin_jian:
+            self._shoudao_xuan_zhong_zimu(mu)
+        # 遮罩改的就是"这一刻画面上的那一条"，必须当场重画那层字幕。
+        # 不能指望上面那两步：新建克隆那条时它本来就是带着 \clip 建出来的，
+        # _huan_zimu_wenben 一看文字没变直接 return，结果没人叫画面重画 ——
+        # 得把播放头挪走再回来（\fad 让指纹变了）才看得见效果。
+        self._zimu_hang_ji = None       # 折行缓存作废（新克隆了一条）
+        self._zimu_tiao_wen = None
+        self._shuaxin_zimu_tiao()
+
+    def _zhemo_tiao_yanse(self):
+        """变色层用什么颜色：弹一次调色板，选过就记住，接着画还用这个色
+
+        走的是照 AEG 复刻的那个调色板（widgets/color_dialog.py 的 YsgColorDialog）——
+        Windows 上 QtWidgets.QColorDialog 走系统原生那套，原生压根没有 alpha。
+        取消且之前没选过 —— 当作放弃这次画遮罩，返回 None。
+        """
+        jiu = getattr(self, "_zhemo_yanse_cun", None)
+        yan, hao = YsgColorDialog.tiao(
+            self,
+            jiu if jiu is not None else QtGui.QColor("#FF0000"),
+            alpha=True,
+            biaoti="框里那截字用什么颜色",
+        )
+        if not hao or yan is None:
+            return jiu
+        self._zhemo_yanse_cun = yan
+        return yan
+
+    # ---- 画面鼠标模式：标准（双击定位）/ 拖放（拖方块移动），照 AEG ----
+    def _qiehuan_shu_biao_mo(self, mo):
+        """画面右键菜单：标准模式 / 拖放模式（AEG 里就是两种 visual tool）
+
+        以前这里还往设置面板写一句"拖放模式：…"的提示，那半截面板属于「硬字幕
+        提取」页，在「字幕编辑」页看不见，等于写进隔壁房间 —— 删了。
+        """
+        self._shu_biao_mo = "tuofang" if mo == "tuofang" else "biaozhun"
+        self.huamian.shezhi_shu_biao_mo(self._shu_biao_mo)
+        self._shuaxin_dingwei_kuai()
+
+    def _zimu_maodian(self, xu, zimu=None):
+        """第 xu 条字幕锚在哪（脚本坐标）
+
+        写了 \\pos / \\move 就用它写的；一个字没写的，按它自己的对齐方式 +
+        边距算一个 —— 跟画面画它时那套算法一模一样，方块才落在字上。
+        """
+        if zimu is None:
+            zimu = self.zimu_mianban.zimu_liebiao()
+        xu = int(xu)
+        if not (0 <= xu < len(zimu)):
+            return None
+        # 取值路径跟 _shuaxin_huamian_zimu 一模一样（样式表、附加字段、用原文
+        # 还是列表里这份）—— 两边取的东西不同，算出来的锚点就会对不上
+        fu_men = self._zimu_fu_ji
+        if len(fu_men) != len(zimu):
+            fu_men = self._zimu_fujia(zimu)
+        pei = self._zimu_pei_ji
+        if len(pei) != len(zimu):
+            pei = self._zimu_pipei(zimu)
+        yuan = pei[xu][2] if xu < len(pei) else ""
+        wen = (
+            str(yuan or "")
+            if yuan and _ass_yuan_wen(yuan) == _ass_yuan_wen(zimu[xu][2])
+            else str(zimu[xu][2] or "")
+        )
+        jd = _pos_du(wen)
+        if jd is not None:
+            return jd
+        jizhun, biao = self._ass_geshi_biao()
+        fu = fu_men[xu] if xu < len(fu_men) else {}
+        ge = dict(_ASS_MOREN_YANGSHI)
+        zhao = biao.get(str(fu.get("yang") or "Default").strip().lower())
+        if zhao:
+            ge = dict(zhao)
+        for jian, wei in (("ml", "zuo"), ("mr", "you"), ("mv", "shu")):
+            zhi_shu = int(fu.get(wei) or 0)
+            if zhi_shu > 0:
+                ge[jian] = zhi_shu
+        _hang, gs = _jie_ass_tiao(wen, ge, biao)
+        an = int(_ass_shuzi(gs.get("an"), 2))
+        an = an if 1 <= an <= 9 else 2
+        lie = (an - 1) % 3            # 0 左 / 1 中 / 2 右
+        pai = (an - 1) // 3           # 0 下 / 1 中 / 2 上
+        ml = max(0.0, _ass_shuzi(gs.get("ml"), 0.0))
+        mr = max(0.0, _ass_shuzi(gs.get("mr"), 0.0))
+        mv = max(0.0, _ass_shuzi(gs.get("mv"), 0.0))
+        jw = float(max(1, int(jizhun[0])))
+        jh = float(max(1, int(jizhun[1])))
+        if lie == 0:
+            ax = ml
+        elif lie == 1:
+            ax = (jw + ml - mr) / 2.0
+        else:
+            ax = jw - mr
+        if pai == 0:
+            ay = jh - mv
+        elif pai == 1:
+            ay = jh / 2.0
+        else:
+            ay = mv
+        return (ax, ay)
+
+    # ---- 遮盖矢量图：画一块白方块盖住漫画原文，之后在画面上拖它改大小 ----
+    def _kaishi_hua_shiliang(self):
+        """进「画遮盖矢量图」状态：在画面上拖个框，松手就新建一条 \\p1 的白方块
+
+        抄的就是原文件里那种写法（{\\fad(300,400)\\p1\\blur4\\c&HFFFFFF&\\1a&H00&
+        \\fscx宽\\fscy高\\pos(x,y)}m 0 0 l 100 0 100 100 0 100）：时间和样式都抄
+        当前那条字幕，层比它低一层 —— 层小的先画，文字压在白块上面。
+        """
+        xu = self._shiliang_yuan_tiao()
+        if xu is None:
+            return
+        self._shiliang_mu = int(xu)
+        self.huamian.kaishi_kuang_xuan("shiliang")
+
+    def _shiliang_yuan_tiao(self):
+        """画遮盖矢量图时抄哪一条：选中的那条；没选就认播放头压着的那条"""
+        mu = [int(x) for x in self.bianji_mianban.xuan_zhong_hang()]
+        if len(mu) == 1:
+            return mu[0]
+        if not mu:
+            try:
+                xu = int(self.zimu_mianban.zimu_xu_zai_ms(self._bofang_ms))
+            except Exception:      # noqa
+                xu = -1
+            if xu >= 0:
+                return xu
+        return None
+
+    def _shiliang_tiao_yanse(self):
+        """遮块用什么颜色：画完框先弹调色板，选完才建那条
+
+        也是照 AEG 复刻的那个（带透明度那一栏）。
+        选过的颜色记着，下一个遮块默认还是这个色（跟画字幕遮罩那个变色层一个
+        套路）。取消：以前选过就用以前那个色；一次都没选过就当作这次不画了。
+        """
+        jiu = getattr(self, "_shiliang_yanse_cun", None)
+        yan, hao = YsgColorDialog.tiao(
+            self,
+            jiu if jiu is not None else QtGui.QColor("#FFFFFF"),
+            alpha=True,
+            biaoti="遮块用什么颜色",
+        )
+        if not hao or yan is None:
+            return jiu
+        self._shiliang_yanse_cun = yan
+        return yan
+
+    def _shiliang_hua_wan(self, ju):
+        """框画完了：新建一条遮盖矢量图
+
+        ju = (左,上,右,下) 脚本坐标。时间 / 样式 / 说话人 / 边距 / 特效全抄原条，
+        层 = 原条 - 1；\\fscx / \\fscy 就是框的长宽，\\pos 按那条的对齐算（那套
+        竖排样式 an=7，\\pos 就是框的左上角）。
+        """
+        xu = getattr(self, "_shiliang_mu", None)
+        self._shiliang_mu = None
+        if not ju or xu is None:
+            return
+        xu = int(xu)
+        zimu = self.zimu_mianban.zimu_liebiao()
+        if not (0 <= xu < len(zimu)):
+            return
+        qi, zhi = int(zimu[xu][0]), int(zimu[xu][1])
+        x0, y0, x1, y1 = [float(v) for v in ju]
+        x0, x1 = min(x0, x1), max(x0, x1)
+        y0, y1 = min(y0, y1), max(y0, y1)
+        if x1 - x0 < 3.0 or y1 - y0 < 3.0:
+            return
+        # 先问颜色：画完框弹调色板，选完才建（取消且一次都没选过 = 这次不画）
+        se = self._shiliang_tiao_yanse()
+        if se is None:
+            return
+        # 这条眼下生效的对齐方式和整块角度（行里写了 \an / \frz 就认行里的）
+        gs_yuan = self._hang_gs(xu, zimu, None)
+        an = int(_ass_shuzi(gs_yuan.get("an"), 2) or 2)
+        frz = float(_ass_shuzi(gs_yuan.get("frz"), 0.0))
+        fscx, fscy, ax, ay = _shiliang_kuang_dao_zi((x0, y0, x1, y1), an, 1.0, frz)
+        # 就按你拖出来的那个框写：\fscx/\fscy 是框的长宽（竖排样式整块转了 90°，
+        # 所以那两个数跟画面的宽高是拧着的，_shiliang_kuang_dao_zi 已经算好了）、
+        # \pos 是框按那条样式对齐该落的锚点。画多大就是多大，不是先写 0 再让你拖。
+        # 插在原条**前面**：同一层里先画的在下头，白块正好压在原文上、字幕还在
+        # 它上面 —— 用户自己那些行就是这么排的（层都写 0，靠先后分挡次）
+        wei = self._jia_zimu_kuai_zai(
+            xu, qi, zhi, _shiliang_wen(fscx, fscy, ax, ay, se)
+        )
+        fu = {}
+        try:
+            fu = dict(self._zimu_fujia(zimu)[xu] or {})
+        except (IndexError, TypeError, AttributeError):
+            fu = {}
+        if fu:
+            # 样式 / 说话人 / 层 / 三个边距 / 特效整个抄过来（层不动：0 就 0，
+            # 挡次靠上面那个"插在前面"）
+            self._fu_wai[tuple(self.zimu_mianban.zimu_liebiao()[wei])] = fu
+        self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao())
+        self._shoudao_xuan_zhong_zimu(wei)
+        # 画完就切到拖放模式：这条已经选中了，框和 8 个手柄直接出来，能马上拖
+        if self._shu_biao_mo != "tuofang":
+            self._qiehuan_shu_biao_mo("tuofang")
+        self._shuaxin_huamian_zimu()
+
+    def _dian_shiliang(self, xu):
+        """在画面上点了一条遮盖矢量图的框：选中它（框和 8 个手柄就出来了）"""
+        try:
+            xu = int(xu)
+        except (TypeError, ValueError):
+            return
+        if xu < 0:
+            return
+        self._shoudao_xuan_zhong_zimu(xu)
+        self._shuaxin_shiliang_kuang()
+
+    def _shiliang_kuang_zi_tiao(self, xu):
+        """这条矢量图按它自己写的那一份算出来的框（脚本坐标, \\an, \\pN）
+
+        画面上正画着它就用画面那一份（更准）；播放头没压着它、画面上根本没这
+        一条的时候，按 \\fscx/\\fscy/\\pos 自己算一个，手柄不至于没处摆。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        xu = int(xu)
+        if not (0 <= xu < len(zimu)):
+            return None
+        wen = str(zimu[xu][2] or "")
+        p = max(1, _shiliang_p(wen))
+        dan = SHILIANG_KUAI * float(1 << (p - 1))
+        kuan = dan * max(1.0, _shiliang_shuzi(wen, "fscx", 100.0)) / 100.0
+        gao = dan * max(1.0, _shiliang_shuzi(wen, "fscy", 100.0)) / 100.0
+        if kuan < 2.0 or gao < 2.0:
+            # \fscx0\fscy0 那种占位（或者手写进去的 0）：给个 32×32 的小方块摆手柄，
+            # 不然缩成一个点谁也按不着。正方形碰上 ±90° 还是正方形，不用换算。
+            kuan = gao = 32.0
+        jd = _pos_du(wen)
+        if jd is None:
+            jd = self._zimu_maodian(xu, zimu)
+        if jd is None:
+            return None
+        gs_yuan = self._hang_gs(xu, zimu, None)
+        an = int(_ass_shuzi(gs_yuan.get("an"), 2) or 2)
+        frz = float(_ass_shuzi(gs_yuan.get("frz"), 0.0))
+        an = an if 1 <= an <= 9 else 2
+        lie = (an - 1) % 3
+        pai = (an - 1) // 3
+        if lie == 0:
+            x0 = jd[0]
+        elif lie == 1:
+            x0 = jd[0] - kuan / 2.0
+        else:
+            x0 = jd[0] - kuan
+        if pai == 0:
+            y0 = jd[1] - gao
+        elif pai == 1:
+            y0 = jd[1] - gao / 2.0
+        else:
+            y0 = jd[1]
+        # 整块还要照角度转一下，画面上看到的才是这个框
+        ju = _shiliang_kuang_zhuan((x0, y0, x0 + kuan, y0 + gao), jd[0], jd[1], frz)
+        return (ju[0], ju[1], ju[2], ju[3], an, p, frz)
+
+    def _shuaxin_shiliang_kuang(self):
+        """拖放模式：把选中那条矢量图的框摆成画面上的框 + 8 个手柄
+
+        只有"整行都是矢量绘图"的那些才画（框就是它自己画出来的那块）；选中的是
+        文字行就把框收起来，别在人家身上糊一圈手柄。
+        """
+        hua = getattr(self, "huamian", None)
+        ban = getattr(self, "bianji_mianban", None)
+        if hua is None or ban is None:
+            return
+        if self._shu_biao_mo != "tuofang":
+            hua.shezhi_shiliang_kuang(None)
+            return
+        mu = [int(x) for x in ban.xuan_zhong_hang()]
+        if len(mu) != 1:
+            hua.shezhi_shiliang_kuang(None)
+            return
+        xu = mu[0]
+        zimu = self.zimu_mianban.zimu_liebiao()
+        wen = str(zimu[xu][2] or "") if 0 <= xu < len(zimu) else ""
+        if not _shi_chun_huitu_wen(wen):
+            hua.shezhi_shiliang_kuang(None)
+            return
+        # 播放头没压着这条 —— 框收起来：这块遮块这一刻根本没出现在画面上，凭什么
+        # 挂个框在那儿（跟字幕一样，只有它真画出来的时候才有得拖）。
+        # 拖的过程中不看时间：不然手一抖播放头跑了，正拖着的框当场消失。
+        if getattr(self, "_tuo_kuang_qi", None) is None and 0 <= xu < len(zimu):
+            try:
+                ms = int(self._huamian_ms())
+            except Exception:            # noqa
+                ms = None
+            if ms is not None:
+                qi_hang, zhi_hang = int(zimu[xu][0]), int(zimu[xu][1])
+                if not (qi_hang <= ms < max(qi_hang + 1, zhi_hang)):
+                    hua.shezhi_shiliang_kuang(None)
+                    return
+        ju = self._shiliang_kuang_you_xiao(xu)
+        kuang = None
+        if ju is not None and len(ju) >= 4:
+            q = hua.kongjian_zuobiao(ju[0], ju[1])
+            r = hua.kongjian_zuobiao(ju[2], ju[3])
+            if q is not None and r is not None:
+                kuang = QtCore.QRectF(
+                    QtCore.QPointF(q), QtCore.QPointF(r)
+                ).normalized()
+        hua.shezhi_shiliang_kuang(kuang, xu)
+
+    def _shiliang_kuang_you_xiao(self, xu):
+        """这条遮块该拿哪个框摆手柄 / 当拖拽底账
+
+        优先用画面真画出来的那个框（跟显示必然一致）；播放头没压着这条、画面上
+        没它，就按它自己写的 \\fscx/\\fscy/\\pos 算一个。真遇到 \\fscx0\\fscy0
+        那种（有人手写进去、或者贴了条占位的进来），算出来是个点，那条路会给
+        个 32×32 的默认框，好让你按得着、拖得动。
+        """
+        xu = int(xu)
+        ju = self.huamian.tiao_kuang_juben(xu)
+        if ju is not None and len(ju) >= 6:
+            if (ju[2] - ju[0]) > 1.5 and (ju[3] - ju[1]) > 1.5:
+                return ju
+            return ju
+        return self._shiliang_kuang_zi_tiao(xu)
+
+    def _tuo_kuang_kaishi(self, xin):
+        """按住矢量图的框 / 手柄：记下按下去时的 \\fscx/\\fscy、框和鼠标位置
+
+        xin = (第几条, 哪个手柄, 脚本坐标)。照拖放方块的老规矩：按住谁就是谁。
+        底账按 AEG 的缩放工具记：一开始那份 scale（src/visual_tool_scale.cpp 的
+        InitializeHold：initial_scale = scale），后面每动一下就照位移重算。
+        """
+        if not xin:
+            self._tuo_kuang_qi = None
+            return
+        xu, shou, zu = xin
+        mu = [int(x) for x in self.bianji_mianban.xuan_zhong_hang()]
+        if mu != [int(xu)]:
+            self._shoudao_xuan_zhong_zimu(int(xu))
+        ju = self._shiliang_kuang_you_xiao(int(xu))
+        if ju is None or len(ju) < 6:
+            self._tuo_kuang_qi = None
+            return
+        zimu = self.zimu_mianban.zimu_liebiao()
+        xu = int(xu)
+        jiu = str(zimu[xu][2] or "") if 0 <= xu < len(zimu) else ""
+        gs = self._hang_gs(xu, zimu, None) if jiu else {}
+        # 一开始的 scale：标签里有就用标签，没有用样式那两份；AEG 那边也是
+        # 读出来至少当 1（GetLineScale：scale = max(tag, 1)）—— 手写进去的
+        # \fscx0\fscy0 就从 1 开始往上拖
+        init_x = max(1.0, _ass_shuzi(gs.get("fscx"), 100.0))
+        init_y = max(1.0, _ass_shuzi(gs.get("fscy"), 100.0))
+        # 位置那份底账：挪位置（拖框里）走 \pos，缩放只改 \fscx/\fscy
+        jd = _pos_du(jiu) if jiu else None
+        self._tuo_kuang_qi = {
+            "xu": xu,
+            "shou": str(shou),
+            "kuang": tuple(float(v) for v in ju[:4]),
+            "an": int(ju[4]),
+            "p": int(ju[5]),
+            "frz": float(ju[6]) if len(ju) > 6 else 0.0,
+            "init_x": float(init_x),
+            "init_y": float(init_y),
+            "pos": (float(jd[0]), float(jd[1])) if jd is not None else None,
+            "dian": (float(zu[0]), float(zu[1])),
+        }
+        self._shuaxin_shiliang_kuang()
+
+    def _tuo_kuang_hua(self, xin, qi=None):
+        """拖矢量图：照 AEG 那套算出新的 \\fscx/\\fscy/\\pos，写回这条字幕
+
+        - 手柄（八个角/边）：数值 = 按下去时的 scale + 鼠标位移 × 1.25（AEG 的
+          UpdateHold），shift/alt/ctrl 三个修饰键也照它；框按新数值重新摆，
+          你抓的那条边跟着鼠标走（顺带挪 \\pos，不然手柄会跟鼠标脱节）。
+        - 框里（"nei"）：整条挪位置（照 AEG 的拖放工具，位移 1:1，shift 锁单轴）。
+        返回新的画面框（脚本坐标），给画面摆手柄用；没算成给 None。
+        """
+        if qi is None:
+            qi = getattr(self, "_tuo_kuang_qi", None)
+        if not qi or not xin:
+            return None
+        zimu = self.zimu_mianban.zimu_liebiao()
+        i = int(qi["xu"])
+        if not (0 <= i < len(zimu)):
+            return None
+        jiu = str(zimu[i][2] or "")
+        zu = (float(xin[0]), float(xin[1]))
+        xiu = tuple(xin[2] or ()) if len(xin) > 2 else ()
+        shou = str(qi["shou"])
+        if shou == "nei":
+            # 挪位置：位移照脚本坐标 1:1（AEG 的拖放工具就是这么挪 \pos 的）
+            dx = zu[0] - qi["dian"][0]
+            dy = zu[1] - qi["dian"][1]
+            if "shift" in xiu:      # AEG 的 UpdateDrag(..., shift)：锁单轴
+                if abs(dx) < abs(dy):
+                    dx = 0.0
+                else:
+                    dy = 0.0
+            jd = qi["pos"] or (0.0, 0.0)
+            xin_wen = _shiliang_xie_ru(jiu, x=jd[0] + dx, y=jd[1] + dy)
+            if xin_wen == jiu:
+                return None
+            self.zimu_mianban.gai_zimu_wenben(i, xin_wen)
+            self._zimu_tiao_wen = None
+            return (
+                qi["kuang"][0] + dx, qi["kuang"][1] + dy,
+                qi["kuang"][2] + dx, qi["kuang"][3] + dy,
+            )
+        # 缩放：鼠标位移换算成"画面像素"，照 AEG 1 像素 = 1.25 个点
+        m = self._kongjian_weiyi(qi["dian"], zu)
+        if m is None:
+            return None
+        p_bi = float(1 << (int(qi["p"]) - 1))
+        fscx, fscy = _shiliang_tuo_zhi(
+            qi["init_x"], qi["init_y"], m, qi["frz"], shou, xiu
+        )
+        kuang = _shiliang_kuang_zi_zhi(
+            qi["kuang"], p_bi, qi["frz"], fscx, fscy, shou
+        )
+        ax, ay = _shiliang_kuang_dao_zi(kuang, qi["an"], p_bi, qi["frz"])[2:]
+        xin_wen = _shiliang_xie_ru(jiu, kuan=fscx, gao=fscy, x=ax, y=ay)
+        if xin_wen == jiu:
+            return kuang
+        self.zimu_mianban.gai_zimu_wenben(i, xin_wen)
+        self._zimu_tiao_wen = None
+        return kuang
+
+    def _kongjian_weiyi(self, cong, dao):
+        """两个脚本坐标点之间在画面上隔了多少像素（AEG 的 1 像素 = 1.25 个点）
+
+        没视频（映射不出来）就给 None。给不出来的话退回脚本坐标的差 —— 总比
+        拖不动强。
+        """
+        hua = getattr(self, "huamian", None)
+        if hua is not None:
+            a = hua.kongjian_zuobiao(cong[0], cong[1])
+            b = hua.kongjian_zuobiao(dao[0], dao[1])
+            if a is not None and b is not None:
+                return (float(b.x() - a.x()), float(b.y() - a.y()))
+        return (float(dao[0] - cong[0]), float(dao[1] - cong[1]))
+
+    def _shiliang_kuang_huamian(self, kuang, xu=None):
+        """把脚本坐标的那个框摆到画面上（手柄跟着它走）"""
+        hua = getattr(self, "huamian", None)
+        if hua is None or kuang is None:
+            return
+        a = hua.kongjian_zuobiao(kuang[0], kuang[1])
+        b = hua.kongjian_zuobiao(kuang[2], kuang[3])
+        if a is None or b is None:
+            return
+        hua.shezhi_shiliang_kuang(
+            QtCore.QRectF(QtCore.QPointF(a), QtCore.QPointF(b)).normalized(), xu
+        )
+
+    def _tuo_kuang_zhong(self, xin):
+        """正拖着矢量图：实时跟着鼠标变（松手才写进字幕文件）"""
+        kuang = self._tuo_kuang_hua(xin)
+        if kuang is None:
+            return
+        qi = getattr(self, "_tuo_kuang_qi", None)
+        self._shiliang_kuang_huamian(kuang, qi["xu"] if qi else None)
+        self._shuaxin_huamian_zimu()
+
+    def _tuo_kuang_wan(self, xin):
+        """松手：这一下才真算数（改完的字幕写回文件）"""
+        qi = getattr(self, "_tuo_kuang_qi", None)
+        if not qi:
+            return
+        self._tuo_kuang_qi = None
+        kuang = self._tuo_kuang_hua(xin, qi)
+        if kuang is None:
+            self._shuaxin_huamian_zimu()
+            self._shuaxin_shiliang_kuang()
+            return
+        self._shiliang_kuang_huamian(kuang, qi["xu"])
+        self._weizhi_luo_di([int(qi["xu"])])
+
+    def _shuaxin_dingwei_kuai(self):
+        """拖放模式：把选中那条字幕的锚点摆成画面上的小方块
+
+        没选 / 选了不止一条 / 还没视频 —— 就不摆（拖一次只认一条，不糊涂账）。
+        遮盖矢量图那块（框 + 8 个手柄）顺带一起校准。
+        """
+        self._shuaxin_shiliang_kuang()
+        hua = getattr(self, "huamian", None)
+        ban = getattr(self, "bianji_mianban", None)
+        if hua is None or ban is None:
+            return
+        if self._shu_biao_mo != "tuofang":
+            hua.shezhi_dingwei_kuai(None)
+            return
+        mu = [int(x) for x in ban.xuan_zhong_hang()]
+        if len(mu) != 1:
+            hua.shezhi_dingwei_kuai(None)
+            return
+        # 播放头没压着这条 —— 黄方块收起来（跟遮块那个框一个规矩：这条此刻根本没
+        # 出现在画面上，黄方块却全局挂在那儿，看着像它一直贴在画面上）。
+        # 正拖着锚点的时候不看时间：不然播放头一跑，手里拖的方块当场没了。
+        if getattr(self, "_tuo_pos_qi", None) is None:
+            zimu_hang = self.zimu_mianban.zimu_liebiao()
+            if 0 <= mu[0] < len(zimu_hang):
+                try:
+                    ms_hang = int(self._huamian_ms())
+                except Exception:            # noqa
+                    ms_hang = None
+                if ms_hang is not None:
+                    qi_h, zhi_h = int(zimu_hang[mu[0]][0]), int(zimu_hang[mu[0]][1])
+                    if not (qi_h <= ms_hang < max(qi_h + 1, zhi_h)):
+                        hua.shezhi_dingwei_kuai(None)
+                        return
+        # 优先用画面真画那一笔算出来的锚点（必然跟画面对得上）；播放头压着它、可
+        # 画面这一帧还没画出来的时候，退回按样式算一个
+        dian = hua.tiao_maodian(mu[0])
+        if dian is None:
+            jd = self._zimu_maodian(mu[0])
+            dian = hua.kongjian_zuobiao(jd[0], jd[1]) if jd is not None else None
+        hua.shezhi_dingwei_kuai(dian, mu[0])
+
+    def _weizhi_luo_di(self, xu_lie):
+        """改完位置统一落盘：字幕列表 / 时间轴 / SRT ASS 一起走一遍
+
+        多点一次只写一次文件 —— 逐条调 _huan_zimu_wenben 会一条写一遍。
+        """
+        xu_lie = [int(i) for i in xu_lie]
+        zimu = self.zimu_mianban.zimu_liebiao()
+        for i in xu_lie:
+            if 0 <= i < len(zimu):
+                self.shijianzhou.gai_zimu_wenben(i, str(zimu[i][2] or ""))
+        if xu_lie and 0 <= xu_lie[0] < len(zimu):
+            self._shezhi_bianji_zimu(zimu, xu_lie[0])
+        self._zimu_hang_ji = None
+        self._zimu_tiao_wen = None
+        self._shuaxin_zimu_tiao()
+        xie = self._chong_xie_zimu_wenjian("移动字幕", "wenben")
+        self._shuaxin_dingwei_kuai()
+        self.shezhi_mianban.zhuangtai_shezhi(
+            "%d 条字幕的位置已改%s"
+            % (len(xu_lie), "，SRT / ASS 已重写" if xie else "（Ctrl+S 保存字幕）")
+        )
+
+    def _shuangji_huamian(self, dian):
+        """标准模式双击画面：把选中的字幕搬到这个点（写 / 改它们的 \\pos）
+
+        照 AEG 的 cross 工具（src/visual_tool_cross.cpp:58）：先认第一条的锚点
+        跟目标点的差，其余各条按同一个位移挪 —— 多选时相对位置保持不动。
+        """
+        mu = [int(x) for x in self.bianji_mianban.xuan_zhong_hang()]
+        if not mu:
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "先在字幕列表里选中一条，再双击画面定位"
+            )
+            return
+        zu = self.huamian.juben_zuobiao(dian)
+        if zu is None:
+            return
+        zimu = self.zimu_mianban.zimu_liebiao()
+        maodian = []
+        for i in mu:
+            # 同拖放：先问画面这条真画在哪儿，问不到再按样式算
+            jd = None
+            dian = self.huamian.tiao_maodian(i)
+            if dian is not None:
+                jd = self.huamian.juben_zuobiao(dian)
+            if jd is None:
+                jd = self._zimu_maodian(i, zimu)
+            if jd is None:
+                return
+            maodian.append((i, jd))
+        dx = float(zu[0]) - maodian[0][1][0]
+        dy = float(zu[1]) - maodian[0][1][1]
+        gai = []
+        for i, jd in maodian:
+            jiu = str(zimu[i][2] or "")
+            xin = _pos_luo_dao(jiu, jd[0] + dx, jd[1] + dy)
+            if xin != jiu:
+                self.zimu_mianban.gai_zimu_wenben(i, xin)
+                gai.append(i)
+        if not gai:
+            return
+        self._weizhi_luo_di(gai)
+        self.shezhi_mianban.zhuangtai_shezhi(
+            "%d 条字幕搬到 (%d,%d)"
+            % (len(gai), int(round(zu[0])), int(round(zu[1])))
+        )
+
+    def _tuo_pos_kaishi(self, xin):
+        """按住了画面上的锚点方块：记下这条现在锚在哪，好照位移挪
+
+        xin = (第几条, (x,y) 脚本坐标)。照 AEG 的拖放工具
+        （src/visual_tool_drag.cpp 的 OnMouseEvent + SetSelection）：
+        按住谁就是谁 —— 按的不是选中的那条，先把选中挪到它身上。
+        """
+        xu, zu = xin
+        mu = [int(x) for x in self.bianji_mianban.xuan_zhong_hang()]
+        if xu is not None and mu != [int(xu)]:
+            self._shoudao_xuan_zhong_zimu(int(xu))
+            mu = [int(xu)]
+        jd = None
+        if len(mu) == 1:
+            # 先问画面：它真画在哪儿就是哪儿（方块本来就是照它摆的），这样
+            # 一按下去不会跳；问不到（这条此刻不在画面里）才按样式算
+            dian = self.huamian.tiao_maodian(mu[0])
+            if dian is not None:
+                jd = self.huamian.juben_zuobiao(dian)
+        if jd is None:
+            jd = self._zimu_maodian(mu[0]) if mu else None
+        if jd is None:
+            self._tuo_pos_qi = None
+            return
+        self._tuo_pos_qi = [(mu[0], jd)]
+        self._tuo_pos_dian = (float(zu[0]), float(zu[1]))
+
+    def _tuo_pos_zhong(self, zu):
+        """正拖着：字幕实时跟着鼠标走（只改内存 + 画面，松手才落盘）"""
+        qi = getattr(self, "_tuo_pos_qi", None)
+        if not qi or self._tuo_pos_dian is None:
+            return
+        dx = float(zu[0]) - self._tuo_pos_dian[0]
+        dy = float(zu[1]) - self._tuo_pos_dian[1]
+        zimu = self.zimu_mianban.zimu_liebiao()
+        for i, jd in qi:
+            if not (0 <= i < len(zimu)):
+                continue
+            jiu = str(zimu[i][2] or "")
+            xin = _pos_luo_dao(jiu, jd[0] + dx, jd[1] + dy)
+            self.zimu_mianban.gai_zimu_wenben(i, xin)
+        self._zimu_tiao_wen = None
+        self._shuaxin_huamian_zimu()
+
+    def _tuo_pos_wan(self, zu):
+        """松手：这一下才真写进字幕（列表 / 时间轴 / SRT ASS）"""
+        qi = getattr(self, "_tuo_pos_qi", None)
+        self._tuo_pos_qi = None
+        self._tuo_pos_dian = None
+        if not qi:
+            return
+        self._weizhi_luo_di([i for i, _jd in qi])
 
     def _fuzhi_huamian_zuobiao(self, dian):
         """把鼠标在画面上的坐标拷进剪贴板（照 AEG 的 video/copy_coordinates）
@@ -7563,8 +10454,28 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.huamian.shezhi_huan_zhen_hui(self._mpv_huan_zhen)
         self.huamian.chicun_bian.connect(self._tongbu_suo_dao)
         self.huamian.chicun_bian.connect(self._he_huamian_gao)
+        self.huamian.chicun_bian.connect(self._shuaxin_dingwei_kuai)
         # 画面里点右键 -> 主窗口弹菜单（复制坐标到剪贴板 / 拆分视频，照 AEG）
         self.huamian.youjian.connect(self._tan_huamian_caidan)
+        # 画面上拖完字幕遮罩 -> 写进那条字幕的 \clip
+        self.huamian.zhemo_bian.connect(self._zhemo_hua_wan)
+        # 画面上拖完遮盖矢量图的框 -> 新建一条 \p1 的白方块
+        self.huamian.shiliang_bian.connect(self._shiliang_hua_wan)
+        # 遮盖矢量图：点它的框 = 选中它；拖角/拖边改长宽、拖里面挪位置
+        self.huamian.kuang_dian.connect(self._dian_shiliang)
+        self.huamian.kuang_tuo_qi.connect(self._tuo_kuang_kaishi)
+        self.huamian.kuang_tuo.connect(self._tuo_kuang_zhong)
+        self.huamian.kuang_tuo_wan.connect(self._tuo_kuang_wan)
+        # 双击画面 = 把选中的字幕搬到那儿；拖放模式 = 拖锚点方块移动字幕
+        self.huamian.shuangji.connect(self._shuangji_huamian)
+        self.huamian.pos_tuo_qi.connect(self._tuo_pos_kaishi)
+        self.huamian.pos_tuo.connect(self._tuo_pos_zhong)
+        self.huamian.pos_tuo_wan.connect(self._tuo_pos_wan)
+        # 画面里那层字幕重画了 -> 拖放方块按画面真画出来的位置再对一遍
+        # （排队走：不然就在画的中途回头改画面，重入）
+        self.huamian.zimu_chong_hua.connect(
+            self._shuaxin_dingwei_kuai, Qt.QueuedConnection
+        )
         bu.addWidget(self.huamian, 1)
 
         # ---- 画面下方：当前这一段的字幕（跟画面对照用）；底栏有个开关能收起来 ----
@@ -8430,6 +11341,31 @@ class VideoWorkDialog(QtWidgets.QDialog):
         elif dongzuo == "D":
             self.shijianzhou.jin_tie(-1)
 
+    def _zai_zimu_liebiao(self, duixiang):
+        """这一下按键是不是发生在「字幕列表」（下块那个深色列表）里"""
+        lie = getattr(self.zimu_mianban, "liebiao", None)
+        if lie is None or not isinstance(duixiang, QtWidgets.QWidget):
+            return False
+        try:
+            return duixiang is lie or lie.isAncestorOf(duixiang)
+        except (TypeError, RuntimeError):
+            return False
+
+    def _dazhou_liebiao_an(self, dongzuo):
+        """焦点在字幕列表里按 Q/W/E/R/A/D：拿列表里选中的那一条打轴
+
+        打轴那套（_dazhou_an）认的是时间轴上选中的块。列表里点一条本来就会
+        把时间轴选中带过去，正常两边是同一条；万一不一致（时间轴被别处改过），
+        先照列表这条把选中对齐，再走同一套动作。
+        """
+        lie = self.zimu_mianban.liebiao
+        xu = int(lie.currentRow())
+        if not (0 <= xu < len(self.zimu_mianban.zimu_liebiao())):
+            return
+        if self.shijianzhou.xuan_zhong_liebiao() != [xu]:
+            self._shoudao_xuan_zhong_zimu(xu)
+        self._dazhou_an(dongzuo)
+
     def _tiaobu(self, ms):
         if self.duqu is None:
             return
@@ -9217,6 +12153,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
         hua = getattr(self, "huamian", None)
         if hua is None:
             return
+        # 遮块的框 + 拖放模式的黄方块先跟着这一刻走：播放头压着它才摆，滑出去就收
+        # （_shuaxin_dingwei_kuai 内部顺带会刷遮块那个框，一次两样都校准）
+        self._shuaxin_dingwei_kuai()
         zimu = self.zimu_mianban.zimu_liebiao()
         if not zimu:
             hua.shezhi_zimu([])
@@ -9259,6 +12198,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
             # qi / zhi / ms 是给 \fad 渐入渐出算这一刻透明度用的
             xuan.append(
                 {
+                    "xu": i,          # 这是整份字幕里的第几条（拖放方块按它找）
                     "hang": hang,
                     "gs": gs,
                     "qi": int(qi),
@@ -9267,8 +12207,6 @@ class VideoWorkDialog(QtWidgets.QDialog):
                     "ceng": int(fu.get("ceng") or 0),
                 }
             )
-            if len(xuan) >= 8:
-                break
         # 层大的盖在上面（跟 libass 一个规矩）
         xuan.sort(key=lambda x: x["ceng"])
         hua.shezhi_zimu(xuan, jizhun)
@@ -9288,6 +12226,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.bianji_mianban.shezhi_zimu(zimu, xuan, fu_men)
         self._shuaxin_gongju(zimu, fu_men)
         self._shuaxin_kuai_yanse(zimu, fu_men)
+        self._shuaxin_dingwei_kuai()   # 拖放模式：选中换了，锚点方块跟着挪
 
     def _shuaxin_kuai_yanse(self, zimu=None, fu_men=None):
         """给时间轴上每块字幕算底色：说话人非空 -> 用它那个样式的主文字色
@@ -9380,6 +12319,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._ji_chexiao("新建一条", "xinjian")
         return wei
 
+    def _jia_zimu_kuai_zai(self, wei, qi_ms, zhi_ms, wenben):
+        """新建一条字幕并插在第 wei 行前面（遮盖矢量图用：要压在它盖的那条前头）"""
+        wei = max(0, min(int(wei), self.zimu_mianban.zimu_shu()))
+        zai = self.zimu_mianban.charu_zimu(wei, qi_ms, zhi_ms, wenben)
+        self.shijianzhou.charu_zimu(wei, qi_ms, zhi_ms, wenben)
+        self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao())
+        self._ji_chexiao("新建一条", "xinjian")
+        return zai
+
     def _shoudao_xuan_zhong_zimu(self, xu):
         """字幕列表 ↔ 时间轴 ↔ 字幕编辑：选中同一段，几处高亮对齐，时间轴滚过去"""
         self.shijianzhou.shezhi_xuan_zhong(xu)
@@ -9399,8 +12347,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         这里不走 _shoudao_xuan_zhong_zimu：那条还带一句"时间轴滚到这条"，
         播放中会跟时间轴自己的滚动（播放头锁中间 / 播放头往前走）打架。
         """
-        if not self._bofangtou_xuanzhong:
-            return
+        if not self._bofangtou_xuanzhong or self._chexiao_zhong:
+            return          # 撤销摆回存档那会儿不跟 —— 会把选中抢走还滚列表
         xu = self.zimu_mianban.zimu_xu_zai_ms(self._bofang_ms)
         if xu < 0 or xu == self._bofangtou_xuanzhong_zimu:
             return
@@ -9688,6 +12636,62 @@ class VideoWorkDialog(QtWidgets.QDialog):
             + "（Ctrl+S 保存字幕）"
         )
 
+    def _daziji_tao(self, she):
+        """样式编辑器里点了「打字机」的确定：给字幕逐字加淡入标签
+
+        自选 = 列表里选中的那几条；全部 = 整份都来。行里已有的特效标签原样
+        留着（不会被拆坏），已经加过打字机的不再叠一层；加完 Ctrl+Z 能退回来。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        if not zimu:
+            self.shezhi_mianban.zhuangtai_shezhi("还没有字幕")
+            return
+        if str((she or {}).get("fanwei")) == "quanbu":
+            mu = list(range(len(zimu)))
+        else:
+            mu = [int(x) for x in self.bianji_mianban.xuan_zhong_hang()]
+        mu = [i for i in mu if 0 <= i < len(zimu)]
+        if not mu:
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "先选中要加打字机的字幕（或者把范围改成「全部」）"
+            )
+            return
+        gai = 0
+        yi = 0
+        for i in mu:
+            qi, zhi, jiu = int(zimu[i][0]), int(zimu[i][1]), str(zimu[i][2] or "")
+            if re.search(r"\\alphaFF\\t\(", jiu):
+                yi += 1             # 这条已经有打字机了，再套一遍会叠两层
+                continue
+            xin = _daziji(jiu, zhi - qi, she)
+            if not xin or xin == jiu:
+                continue
+            self.zimu_mianban.gai_zimu_wenben(i, xin)
+            self.shijianzhou.gai_zimu_wenben(i, xin)
+            gai += 1
+        if not gai:
+            self.shezhi_mianban.zhuangtai_shezhi(
+                f"这 {len(mu)} 条都没加成"
+                + (f"（{yi} 条已经有打字机了）" if yi else "（空行 / 没有可加的字）")
+            )
+            return
+        self._shezhi_bianji_zimu(
+            self.zimu_mianban.zimu_liebiao(), self.bianji_mianban.dangqian_xu()
+        )
+        # 整表重建会把多选冲掉，重新选回原来这一批
+        self.bianji_mianban.shezhi_xuan_zhong_duo(mu)
+        self._zimu_hang_ji = None
+        self._zimu_tiao_wen = None
+        self._shuaxin_zimu_tiao()
+        self._shuaxin_huamian_zimu()        # 画面这一刻的字幕按新标签重画
+        xie = self._chong_xie_zimu_wenjian("打字机")
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"已给 {gai} 条加上打字机"
+            + (f"，另有 {yi} 条本来就加过" if yi else "")
+            + ("，SRT / ASS 已重写" if xie else "")
+            + "（Ctrl+S 保存字幕）"
+        )
+
     def _qiehuan_zhushi(self):
         """Alt+S：把当前这条（列表里多选就这一批）在「注释 / 普通」之间翻一下
 
@@ -9773,6 +12777,12 @@ class VideoWorkDialog(QtWidgets.QDialog):
         )
         self._yangshi_chuang = dlg
         dlg.gaile.connect(lambda z: self._yulan_yangshi(z, yang))
+        # 「自动化脚本 ▸ 打字机」点了确定：拿参数去给字幕加逐字淡入标签
+        dlg.daziji.connect(self._daziji_tao)
+        # 这个窗口开着时按 Ctrl+Z / Ctrl+Y：转过来撤字幕（照 AEG 自动化跑完
+        # 还能接着撤销那个行为）
+        dlg.chexiao.connect(self._chexiao)
+        dlg.chongzuo.connect(self._chongzuo)
         dlg.queren.connect(
             # 名字每一趟都现取：点过「应用」之后这条就叫新名字了，接着点
             # 「确定」是改它，不是又新建一条
@@ -9936,6 +12946,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._zimu_hang_ji = None
         self._zimu_tiao_wen = None
         self._shuaxin_zimu_tiao()
+        # 照 AEG：编辑区里敲的每个字都进字幕、也进撤销栈。连着敲算一笔
+        # （_ji_chexiao 那个 lei 合并），停一下再敲才另起一笔。
+        self._ji_chexiao("改文字", "wenben")
 
     def _shoudao_zimu_bianji_wancheng(self, xu, _wenben):
         """编辑框失焦：这一版文字改完了 —— 把 SRT / ASS 重写一遍
@@ -10862,9 +13875,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if not self._tuo_bt_zhong:
             # 正播着才让列表跟着播放行滚；暂停着只涂色不滚 —— 打注释 / 改字段
             # 会整表重建，紧接着这次刷新拿的是还没动的播放头位置，一滚列表就
-            # "啪"跳回最顶上，等定位回来再滚下去，看着就是闪
+            # "啪"跳回最顶上，等定位回来再滚下去，看着就是闪。撤销摆回存档那
+            # 会儿也别滚：列表得停在存档记的那一行上。
             self.bianji_mianban.shezhi_bofang_ms(
-                self._bofang_ms, self.zhengzai_bofang
+                self._bofang_ms,
+                self.zhengzai_bofang and not self._chexiao_zhong,
             )
         # 「播放头选中」：播放头压到哪条就选哪条。拖播放头的时候先不跟 ——
         # 拖动中一跨条就要滚列表 / 切编辑区，会把播放头拖慢；松手那一下补上
@@ -10947,7 +13962,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         try:
             os.makedirs(osp.dirname(shuo), exist_ok=True)
             _xie_zimu_dao_wenjian(
-                shuo, zimu, self._ass_yuan, self._zimu_fujia(zimu)
+                shuo, zimu, self._ass_yuan, self._zimu_fujia(zimu),
+                self._ass_jilu_dangqian(),
             )
         except OSError as cuowu:
             logger.error(f"视频工作台：自动保存失败 {cuowu}")
@@ -10995,7 +14011,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._zidong_beifen(ass_lu)     # 同上
         try:
             _xie_zimu_dao_wenjian(
-                ass_lu, zimu, self._ass_yuan, self._zimu_fujia(zimu)
+                ass_lu, zimu, self._ass_yuan, self._zimu_fujia(zimu),
+                self._ass_jilu_dangqian(),
             )
             xie.append(ass_lu)
         except Exception as cuowu:  # noqa
@@ -11010,6 +14027,87 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self.zimu_mianban.fujia_biao(),
             int(self.bianji_mianban.dangqian_xu()),
         )
+
+    def _chexiao_jiemian(self):
+        """现在眼睛看在哪：两份列表各自选中的行、各自滚到哪个像素
+
+        撤销**不**恢复历史某一刻的界面，而是"摆完字幕照原样放回来" —— 照
+        Aegisub：它的网格（列表）不重建，滚动天然不动；选中又是实时记在栈顶
+        那笔上的（subs_controller.cpp 的 OnSelectionChanged），撤销后还是你
+        刚才选的那几行。所以这儿取的是撤销**前**这一瞬间的界面。
+        编辑框里的光标位置也一起记（AEG 的 UndoInfo 里就有 pos / sel）。
+        """
+        return (
+            self.bianji_mianban.xuan_zhong_hang(),
+            self.zimu_mianban.liebiao.currentRow(),
+            self.zimu_mianban.liebiao.verticalScrollBar().value(),
+            self.bianji_mianban.biao.verticalScrollBar().value(),
+            self._bianji_guangbiao(),
+            self.shijianzhou.xuan_zhong_liebiao(),
+        )
+
+    def _bianji_guangbiao(self):
+        """字幕编辑框里光标在第几个字（取不到给 -1）"""
+        try:
+            return int(self.bianji_mianban.kuang.cursorPosition())
+        except (AttributeError, TypeError, RuntimeError):
+            return -1
+
+    def _she_bianji_guangbiao(self, wei):
+        """把字幕编辑框的光标放回第 wei 个字上（超出去就贴到末尾）"""
+        try:
+            wei = int(wei)
+        except (TypeError, ValueError):
+            return
+        if wei < 0:
+            return
+        try:
+            kuang = self.bianji_mianban.kuang
+            zi = kuang.textCursor()
+            # 记的是框里的位置，就按框里的字符数收边（框里带 \N 的显示写法，
+            # 跟字幕文本不是一个长度）
+            zi.setPosition(min(wei, len(kuang.toPlainText())))
+            kuang.setTextCursor(zi)
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+
+    def _chexiao_ba_jiemian(self, jie):
+        """把刚才那一瞬间的选中 / 滚动位置放回来（字幕本身不动）
+
+        摆选中全程 blockSignals：不能顺带把时间轴滚过去、把播放头带走 ——
+        那样看着就成了"撤销还附带滚动"。
+        """
+        if not jie:
+            return
+        duo = [int(x) for x in (jie[0] or [])]
+        dan_l = jie[1] if len(jie) > 1 else -1
+        gun_l = jie[2] if len(jie) > 2 else 0
+        gun_b = jie[3] if len(jie) > 3 else 0
+        guang = jie[4] if len(jie) > 4 else -1
+        shi_xuan = [int(x) for x in (jie[5] or [])] if len(jie) > 5 else []
+        lie = self.zimu_mianban.liebiao
+        biao = self.bianji_mianban.biao
+        # 多选（Ctrl+A / Shift 连选那一批）：整批高亮放回去
+        if len(duo) >= 2:
+            self.bianji_mianban.shezhi_xuan_zhong_duo(duo)
+        if len(shi_xuan) > 1:
+            self.shijianzhou.shezhi_xuan_zhong_duo(shi_xuan)
+        try:
+            dan = int(dan_l)
+        except (TypeError, ValueError):
+            dan = -1
+        jiu = lie.blockSignals(True)
+        try:
+            if 0 <= dan < lie.count():
+                lie.setCurrentRow(dan)
+            lie.verticalScrollBar().setValue(int(gun_l or 0))
+        finally:
+            lie.blockSignals(jiu)
+        try:
+            biao.verticalScrollBar().setValue(int(gun_b or 0))
+        except (TypeError, ValueError):
+            pass
+        self._she_bianji_guangbiao(guang)      # 光标也回到刚才那个字上
 
     def _ji_chexiao(self, shuo, lei=None):
         """一个动作做完了：把现在这一版记一笔，供 Ctrl+Z 回退
@@ -11044,50 +14142,54 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self._ji_chexiao(shuo, "zairu")
 
     def _chexiao_huifu(self, kuai):
-        """把存档里的那一版字幕整个摆回来（列表 / 时间轴 / 文件一起回去）"""
-        zimu, fu_biao, xuan = kuai
+        """把存档里的那一版字幕整个摆回来（列表 / 时间轴 / 文件一起回去）
+
+        只管字幕内容：摆之前先记下"现在看在哪"，摆完照原样放回来 —— 撤销
+        不该顺带把你选的行、列表滚到的位置一起挪走（AEG 就是这样：网格不
+        重建、滚动天然不动，选中又是实时记在栈顶那笔上的）。
+        """
+        zimu, fu_biao, _xuan = kuai
+        jie = self._chexiao_jiemian()
+        # 摆哪儿算"当前这条"：还是你刚才编辑的那条；它没了就退到多选的第一条、
+        # 再退到列表里选中的那条（不给 -1 —— 那样编辑框会被清空禁用）
+        xuan = int(self.bianji_mianban.dangqian_xu())
+        if xuan < 0:
+            mu = self.bianji_mianban.xuan_zhong_hang()
+            xuan = int(mu[0]) if mu else int(self.zimu_mianban.liebiao.currentRow())
+        # 两份列表先停重绘：整表重建会把滚动条甩回顶上、再滚到选中那条，中间
+        # 这些位置都不该让人看见（不然就是"撤销时列表闪一下 / 滚一下"）。摆完
+        # 选中和滚动位置再一起放出来，只画最终这一帧。
+        lie = self.zimu_mianban.liebiao
+        biao = self.bianji_mianban.biao
+        lie.setUpdatesEnabled(False)
+        biao.setUpdatesEnabled(False)
         self._chexiao_zhong = True
         try:
             # 字段表得先摆好：_ying_yong_zimu 一路会把「样式 / 说话人」重算出来
             self.zimu_mianban.shezhi_fujia_biao(fu_biao)
             self._ying_yong_zimu(
-                [(int(q), int(z), str(w)) for q, z, w in zimu], int(xuan)
+                [(int(q), int(z), str(w)) for q, z, w in zimu], xuan
+            )
+            self._chexiao_ba_jiemian(jie)
+            # 「播放头选中」这会儿别插一脚 —— 它会把选中抢成播放头压着的那条，
+            # 顺带把列表滚过去，看着就像"撤销还附带了滚动"。等播放头真的移到
+            # 别的条上再照常跟进。
+            self._bofangtou_xuanzhong_zimu = self.zimu_mianban.zimu_xu_zai_ms(
+                self._bofang_ms
             )
         finally:
             self._chexiao_zhong = False
-
-    def _shuru_chexiao(self, dong):
-        """这一下 Ctrl+Z / Ctrl+Y 该不该交给本窗口的输入框自己办
-
-        只有焦点落在**本窗口内**的输入框里、且那框里确实有得撤（重做）时
-        才让它办，返回 True 表示已经办完了。焦点在别处 —— 时间轴上、或者
-        查找 / 替换 / 选择那三个窗口里 —— 一律走字幕的撤销栈。
-        """
-        zhu = QtWidgets.QApplication.focusWidget()
-        if zhu is None or not self.isAncestorOf(zhu):
-            return False
-        if not isinstance(
-            zhu,
-            (QtWidgets.QLineEdit, QtWidgets.QTextEdit,
-             QtWidgets.QPlainTextEdit),
-        ):
-            return False
-        you = (zhu.isRedoAvailable() if dong == "redo"
-               else zhu.isUndoAvailable())
-        if not you:
-            return False
-        zhu.redo() if dong == "redo" else zhu.undo()
-        return True
+            biao.setUpdatesEnabled(True)     # 放出来，只画最终这一帧
+            lie.setUpdatesEnabled(True)
 
     def _chexiao(self):
         """Ctrl+Z：退回到上一版
 
-        焦点在本窗口的输入框里、那框里又有字可撤时，这一次撤那一行文字
-        （输入框自己的撤销）；其余情况一律撤字幕 —— 跟 AEG 一个规矩，
-        撤销栈是整个字幕的，不分窗口。
+        照 Aegisub：整个程序只有这一个撤销栈（内存里的整版快照），输入框没有
+        自己那套"撤销打字"。字幕编辑框里的字跟字幕就是同一份 —— 敲一个字就
+        进字幕、就记一笔撤销，所以撤字幕等于把刚敲的字一起撤了，不用分家。
+        焦点在哪儿（编辑框里、列表上、时间轴上）都是这一条路。
         """
-        if self._shuru_chexiao("undo"):
-            return
         if len(self._chexiao_zhan) <= 1:
             self.ss_zhuangtai("没有可撤销的了")
             return
@@ -11099,9 +14201,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.ss_zhuangtai(f"已撤销：{shuo}")
 
     def _chongzuo(self):
-        """Ctrl+Y：把撤销掉的那一步再做回来（输入框里有得重做就是重做那行文字）"""
-        if self._shuru_chexiao("redo"):
-            return
+        """Ctrl+Y：把撤销掉的那一步再做回来（同样走这一个撤销栈）"""
         if not self._chongzuo_zhan:
             self.ss_zhuangtai("没有可重做的了")
             return
@@ -11182,8 +14282,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
             from anylabeling.views.labeling.utils.video import ASS_TEMPLATE
 
             self._ass_yuan = _chai_ass(ASS_TEMPLATE)
+            jilu = None
         else:
-            self._ass_yuan = _chai_ass(_du_wenben(lu))
+            yuan_wen = _du_wenben(lu)
+            self._ass_yuan = _chai_ass(yuan_wen)
+            jilu = _ass_jilu_du(yuan_wen)   # 上次编辑到哪儿（AEG 那个记录段）
         self._ass_qing_jilu = None
 
         jiu = self.zimu_mianban.zimu_shu()
@@ -11206,6 +14309,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
             + (f"（替换原有 {jiu} 条）" if jiu else "")
         )
         logger.info(f"视频工作台：载入字幕 {lu}，{len(zimu)} 条")
+        # 照 AEG：这份字幕里记了上次编辑到哪儿，就接着那儿 —— 选中那一行 +
+        # 播放头跳回去（AEG 是打开文件时读 [Aegisub Project Garbage] 恢复）
+        if jilu and jilu.get("you"):
+            x = int(jilu.get("xuan", -1))
+            if 0 <= x < len(zimu):
+                self._shoudao_xuan_zhong_zimu(x)
+            zhen = int(jilu.get("zhen", -1))
+            if zhen >= 0 and self.duqu is not None:
+                self._shoudao_tiaozheng(_zhen_ms(zhen, self.fps))
         self._chexiao_qingkong(f"载入 {osp.basename(lu)}")
         return True
 
@@ -11235,11 +14347,18 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 return True
         return False
 
+    def _tishi_fudong(self, wen, miao=1.6):
+        """在画面上飘一条小提示（画面还没建起来就只留状态栏那句）"""
+        hua = getattr(self, "huamian", None)
+        if hua is not None:
+            hua.xianshi_tishi(wen, miao)
+
     def _cun_zimu(self):
         """保存字幕（按钮 / Ctrl+S）：有目标文件就直接存回去，没有就弹另存为"""
         zimu = self.zimu_mianban.zimu_liebiao()
         if not zimu:
             self.shezhi_mianban.zhuangtai_shezhi("还没有字幕可保存")
+            self._tishi_fudong("还没有字幕可保存")
             return
         if self.zimu_wenjian and not self._srt_cun_bu_liao():
             self._xie_zimu_dao(self.zimu_wenjian, zimu)
@@ -11291,12 +14410,72 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 lu = osp.splitext(lu)[0] + ".ass"
         self._xie_zimu_dao(lu, zimu)
 
+    def _liebiao_ding_hang(self):
+        """现在看的那份字幕列表，最顶上露着第几行（AEG 的 Scroll Position 就是它）
+
+        两个列表（字幕编辑那张表 / 字幕列表）哪个摆在眼前就取哪个；都看不见
+        就给 -1（写文件时不写这一行）。
+        """
+        for mian, kong in (
+            (getattr(self, "bianji_mianban", None), "biao"),
+            (getattr(self, "zimu_mianban", None), "liebiao"),
+        ):
+            if mian is None:
+                continue
+            try:
+                if not mian.isVisible():
+                    continue
+            except AttributeError:
+                continue
+            lie = getattr(mian, kong, None)
+            if lie is None:
+                continue
+            try:
+                xiang = lie.itemAt(1, 1)     # 视口左上角那一格露着的行
+            except (TypeError, AttributeError):
+                xiang = None
+            if xiang is None:
+                return 0
+            try:
+                return int(xiang.row())
+            except (TypeError, AttributeError):
+                return 0
+        return -1
+
+    def _ass_jilu_dangqian(self):
+        """现在这一版要写进 ASS 的编辑位置（照 AEG）
+
+        跟 AEG 一样记三样：列表顶上第几行（Scroll Position，AEG 打开靠它滚到
+        位）、选中第几行（Active Line，AEG 靠它高亮）、播放头第几帧（Video
+        Position）。行号都是 0 起；没记的给 -1，写文件时不写那一行。
+        """
+        gun = self._liebiao_ding_hang()
+        xuan = -1
+        try:
+            xuan = int(self.bianji_mianban.dangqian_xu())
+        except (TypeError, ValueError):
+            xuan = -1
+        if xuan < 0:
+            try:
+                hang = self.bianji_mianban.xuan_zhong_hang()
+                xuan = int(hang[-1]) if hang else -1
+            except (TypeError, ValueError, IndexError):
+                xuan = -1
+        zhen = -1
+        try:
+            if float(self.fps or 0) > 0:
+                zhen = int(_ms_zhen(int(self._bofang_ms or 0), self.fps))
+        except (TypeError, ValueError):
+            zhen = -1
+        return {"gun": gun, "xuan": xuan, "zhen": zhen}
+
     def _xie_zimu_dao(self, lu, zimu):
         """把字幕写到指定文件，并把它记成之后 Ctrl+S 的目标"""
         self._zidong_beifen(lu)     # 覆盖前先把原来那份抄进「自动备份」
         try:
             _xie_zimu_dao_wenjian(
-                lu, zimu, self._ass_yuan, self._zimu_fujia(zimu)
+                lu, zimu, self._ass_yuan, self._zimu_fujia(zimu),
+                self._ass_jilu_dangqian(),
             )
         except OSError as cuowu:
             QtWidgets.QMessageBox.critical(
@@ -11309,6 +14488,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._zidong_shange = [(int(q), int(z), str(w)) for q, z, w in zimu]
         self.shezhi_mianban.zhuangtai_shezhi(
             f"字幕已保存 · {osp.basename(lu)}（{len(zimu)} 条）"
+        )
+        self._tishi_fudong(
+            "字幕保存成功 · " + time.strftime("%Y-%m-%d %H:%M:%S")
         )
         logger.info(f"视频工作台：字幕已保存 {lu}，{len(zimu)} 条")
         return True
@@ -11407,6 +14589,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         """没选中字幕块时按回车：以播放头为起点，建一条 XINJIAN_ZIMU_MS 的空白字幕块
 
         新块不选中 —— 接着按回车就是接着往后建，不用先取消选择。
+        落在第几轨按"那一刻哪一轨空着"挑（见 _kong_hang_wei）：以前一律落第 1 轨，
+        第 1 轨那个位置已经有块了就叠在它上面，看着就是"糊成一坨"。
         """
         if self.shichang_ms <= 0 or self.fps <= 0:
             return False
@@ -11418,8 +14602,48 @@ class VideoWorkDialog(QtWidgets.QDialog):
         zhi = min(self._wei_ms(zhen + zhen_chang - 1), int(self.shichang_ms))
         if zhi <= qi:
             return False
-        self._jia_zimu_kuai(qi, zhi, "")
+        # 行号必须**先算**：_jia_zimu_kuai 会把这条插进去，插完再算就把自己也数
+        # 成"那一刻第 1 轨有人了"，于是新块被平白往后挤一轨
+        hang, _die = self._kong_hang_wei(qi, zhi)
+        wei = self._jia_zimu_kuai(qi, zhi, "")
+        # 摆行号必须放在 _jia_zimu_kuai 之后，而且**第 1 轨也要显式摆一遍**：
+        # shezhi_zimu 是"按内容认行号"的，空文字的新块内容跟别的空块一样，不显式
+        # 摆就会去继承上一条空块的行
+        self.shijianzhou.shezhi_hang([(wei, hang)])
+        # 新行跟别的改动一样要落到 SRT / ASS 上（空文字就是一条空行，写出去长这样：
+        # Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,）。lei 跟上面那次
+        # _ji_chexiao 一样是 "xinjian"，同一类动作会并成一笔，撤销不会多出一步。
+        # 不说话：块直接出现在时间轴上，看得见，不用再提示一句
+        self._chong_xie_zimu_wenjian("新建一条空白字幕块", "xinjian")
         return True
+
+    def _kong_hang_wei(self, qi_ms, zhi_ms):
+        """新建的块该摆第几轨：-> (行号 0 起, 是不是回卷叠罗汉)
+
+        1→2→…→8 顺次找第一条"那一刻没有块"的轨；8 条都占着就回卷叠罗汉 ——
+        第 9 个叠第 1 轨、第 10 个叠第 2 轨（按"那一刻已经压着几个块"取模）。
+        """
+        zui_da = int(getattr(self.shijianzhou, "ZIMU_HANG_ZUIDA", 8) or 8)
+        zimu = self.zimu_mianban.zimu_liebiao()
+        zhan = set()
+        chong = 0
+        for i, hang_zi in enumerate(zimu):
+            try:
+                qi, zhi = int(hang_zi[0]), int(hang_zi[1])
+            except (IndexError, TypeError, ValueError):
+                continue
+            if zhi <= int(qi_ms) or qi >= int(zhi_ms):
+                continue                        # 挨着 / 完全错开都不算占
+            chong += 1
+            try:
+                zhan.add(int(self.shijianzhou.zimu_hang(i)))
+            except Exception:            # noqa
+                zhan.add(0)
+        for hang in range(zui_da):
+            if hang not in zhan:
+                return hang, False
+        # 八条都占着：回卷（第 9 个 -> 第 1 轨，第 10 个 -> 第 2 轨…）
+        return chong % zui_da, True
 
     def resizeEvent(self, event):
         """窗口尺寸变了，字幕条那行省略号得按新宽度重算"""
@@ -11491,15 +14715,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._beiping_kuangjie = []
 
     def eventFilter(self, duixiang, shijian):
-        """视频工作台的全局按键：Tab / ` / ~
+        """视频工作台的全局按键：Tab / ` / ~ / Ctrl+Z / Ctrl+Y
 
-        这两个键在视频工作台里哪儿按都好使（焦点在字幕编辑框里照样），而且
-        不许落进输入框变成 Tab 缩进 / 波浪号。
+        这几个键在视频工作台里哪儿按都好使（焦点在字幕编辑框里照样），而且
+        Tab、波浪号不许落进输入框变成缩进 / 字符。
 
         不走 QShortcut 的原因：焦点在 QPlainTextEdit（字幕编辑框）里时，它会
         把 Tab、波浪号当成自己要输入的字符，还会抢先声明"这键归我"，快捷键
-        就轮不上了。在应用级把按键拦下来最稳：是这两个键就直接办功能，
-        事件吃掉、不再往下送。
+        就轮不上了；Ctrl+Z 更霸道，框里有没有字可撤都归它。在应用级把按键拦
+        下来最稳：是这几个键就直接办功能，事件吃掉、不再往下送。
         """
         if shijian.type() != QtCore.QEvent.KeyPress or not self.isVisible():
             return super().eventFilter(duixiang, shijian)
@@ -11513,13 +14737,38 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if shijian.modifiers() & (
             Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
         ):
+            # Ctrl+Z / Ctrl+Y 除外：焦点在字幕编辑框（QPlainTextEdit）里时，
+            # 那个控件会把 Ctrl+Z 当自家的"撤销打字"无条件吃掉（框里有没有字
+            # 可撤都吃），窗口级那份快捷键根本收不到 —— 这就是"焦点在字幕
+            # 编辑区里撤不了字幕"的根子。跟 Tab 一个道理，在应用级拦下来自己办。
+            if shijian.modifiers() == Qt.ControlModifier:
+                if shijian.key() == Qt.Key_Z:
+                    self._chexiao()
+                    return True
+                if shijian.key() == Qt.Key_Y:
+                    self._chongzuo()
+                    return True
             return super().eventFilter(duixiang, shijian)
         jian = shijian.key()
         if jian == Qt.Key_Tab:
             self._tab_an_xia()
             return True
         if jian in (Qt.Key_QuoteLeft, Qt.Key_AsciiTilde):
-            self._bofang_dangqian_kuai()
+            # 单独按 `（波浪号键，不按 Shift）= 播放当前字幕块当前行；
+            # Shift+~ 是打字（真实的波浪号字符）：放行，字幕编辑区 /
+            # 查找替换选择这些能打字的地方照常输入（照 AEG：按键带 Shift
+            # 就是字符，不是快捷键）。
+            if not (shijian.modifiers() & Qt.ShiftModifier):
+                self._bofang_dangqian_kuai()
+                return True
+            return super().eventFilter(duixiang, shijian)
+        # 焦点在「字幕列表」里时，Q/W/E/R/A/D 跟时间轴上一样好使：对象就是
+        # 列表里选中的那一条。QListWidget 会把这些字母当成它自己的"键盘
+        # 搜索"抢先吃掉，窗口级那份打轴快捷键根本收不到，所以在应用级拦。
+        if jian in (
+            Qt.Key_Q, Qt.Key_W, Qt.Key_E, Qt.Key_R, Qt.Key_A, Qt.Key_D
+        ) and self._zai_zimu_liebiao(duixiang):
+            self._dazhou_liebiao_an(chr(jian))
             return True
         return super().eventFilter(duixiang, shijian)
 

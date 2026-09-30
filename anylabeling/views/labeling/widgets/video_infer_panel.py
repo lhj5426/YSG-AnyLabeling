@@ -34,6 +34,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, pyqtSignal
 
 from anylabeling.views.labeling.logger import logger
+from anylabeling.views.labeling.widgets.color_dialog import YsgColorDialog
 from anylabeling.views.labeling.widgets.video_work_styles import (
     du_ku,
     ku_zai,
@@ -274,7 +275,32 @@ def _zidonghua_mo_ren():
         ],
         "paichu_ci": ["旁白", "narration", "Narration"],
         "paichu_fuhao": ["「", "」", "『", "』", "（", "）", "(", ")"],
+        # 打字机（逐字淡入）的参数：跟 AEG 那个 Lua 脚本问的一样
+        "daziji": {
+            "fanwei": "zixuan",     # zixuan = 只作用于选中的行 / quanbu = 全部行
+            "kongge": True,         # 空格算不算一个字符（占时间）
+            "moshi": 1,             # 1 固定每字间隔 / 2 按行时长百分比 / 3 固定总时长
+            "m1": 78,               # 模式1：每个字间隔多少毫秒
+            "m2": 50,               # 模式2：总时间占该行时长的百分比
+            "m3": 1000,             # 模式3：全部字加起来多少毫秒
+        },
     }
+
+
+def _du_daziji(q, mo):
+    """打字机那几项从 ini 里读出来；缺哪个用默认"""
+    zi = dict(mo)
+    zi["fanwei"] = str(q.value("zidonghua/daziji_fanwei", zi["fanwei"])
+                      or zi["fanwei"])
+    zi["kongge"] = str(q.value("zidonghua/daziji_kongge", "1")) not in (
+        "0", "false", "False"
+    )
+    for jian in ("moshi", "m1", "m2", "m3"):
+        try:
+            zi[jian] = int(q.value("zidonghua/daziji_" + jian, zi[jian]))
+        except (TypeError, ValueError):
+            pass
+    return zi
 
 
 def _caowei_jian(hao, xiang):
@@ -294,8 +320,10 @@ def du_zidonghua_peizhi():
     mo = _zidonghua_mo_ren()
     try:
         pei = buju_qsettings()
-        if not pei.contains("zidonghua/1_shuohua") and not pei.contains(
-            "zidonghua/1_yangshi"
+        if (
+            not pei.contains("zidonghua/1_shuohua")
+            and not pei.contains("zidonghua/1_yangshi")
+            and not pei.contains("zidonghua/daziji_m1")
         ):
             return mo
         cao = [
@@ -309,6 +337,7 @@ def du_zidonghua_peizhi():
             "caowei": cao,
             "paichu_ci": _chai_yi_hang(pei.value("zidonghua/paichu_ci", None), mo["paichu_ci"]),
             "paichu_fuhao": _chai_yi_hang(pei.value("zidonghua/paichu_fuhao", None), mo["paichu_fuhao"]),
+            "daziji": _du_daziji(pei, mo["daziji"]),
         }
     except Exception:  # noqa
         return mo
@@ -332,6 +361,14 @@ def xie_zidonghua_peizhi(pei):
             "zidonghua/paichu_fuhao",
             "|".join(str(x) for x in (pei.get("paichu_fuhao") or [])),
         )
+        zi = dict((pei.get("daziji") or _zidonghua_mo_ren()["daziji"]))
+        q.setValue("zidonghua/daziji_fanwei", str(zi.get("fanwei") or "zixuan"))
+        q.setValue("zidonghua/daziji_kongge", "1" if zi.get("kongge", True) else "0")
+        for jian in ("moshi", "m1", "m2", "m3"):
+            try:
+                q.setValue("zidonghua/daziji_" + jian, int(zi.get(jian) or 0))
+            except (TypeError, ValueError):
+                pass
         q.sync()
     except Exception as cuowu:  # noqa
         logger.error(f"自动化脚本配置写不进去：{cuowu}")
@@ -2082,6 +2119,23 @@ class ZimuMianban(QtWidgets.QWidget):
                 pass
         return wei
 
+    def charu_zimu(self, wei, qi_ms, zhi_ms, wenben):
+        """按指定行号插一条（遮盖矢量图要插在它盖的那条前面 —— 同层靠先后压住）
+
+        跟 tianjia_zimu 一个做法，只是位置不由时间算，是外面指定的。
+        """
+        wei = max(0, min(int(wei), len(self._zimu)))
+        hang = self.liebiao.currentRow()
+        jiu = self._zimu[hang] if 0 <= hang < len(self._zimu) else None
+        self._zimu.insert(wei, (int(qi_ms), int(zhi_ms), str(wenben or "")))
+        self._shuaxin()
+        if jiu is not None:
+            try:
+                self.shezhi_xuan_zhong(self._zimu.index(jiu))
+            except ValueError:      # 原来那条已经不在表里了
+                pass
+        return wei
+
     def shezhi_zimu(self, zimu):
         xin = [tuple(x) for x in (zimu or [])]
         self._fu_ban(xin)
@@ -3076,13 +3130,17 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         self._fa("tag", ("fn", zi.family(), xuan))
 
     def _xuan_yanse(self, wei):
-        """四个颜色按钮：挑一个颜色，往这条字幕里写 \\c / \\2c / \\3c / \\4c"""
+        """四个颜色按钮：挑一个颜色，往这条字幕里写 \\c / \\2c / \\3c / \\4c
+
+        调色板是照 AEG 复刻的那一个（widgets/color_dialog.py）。行内 \\c 只写
+        RGB，不带 alpha（要透明得另写 \\1a），所以这儿不给透明度那一栏。
+        """
         if self._tian:
             return
         xuan = self._xuan_qu()
         qi = QtGui.QColor(str(self._yanse.get(wei) or "#FFFFFF"))
-        yan = QtWidgets.QColorDialog.getColor(qi, self, "选颜色")
-        if not yan.isValid():
+        yan, hao = YsgColorDialog.tiao(self, qi, alpha=False, biaoti="选颜色")
+        if not hao or yan is None:
             return
         self._fa("yanse", (wei, _yanse_to_ass(yan), xuan))
 
@@ -3538,6 +3596,137 @@ class ShuohuaCaoweiDialog(QtWidgets.QDialog):
         ]
 
 
+class DazijiDialog(QtWidgets.QDialog):
+    """打字机（逐字淡入）参数窗口（照 AEG 那个 Lua 脚本的界面抄）
+
+    问三样：作用于哪些行 / 空格算不算一个字 / 用哪种模式，外加三个参数栏 ——
+    照 Lua 全摆出来，哪个模式用哪一栏标签里写着，用不上的那两栏点不动。
+    点「确定」发 baocun，外面照着给字幕加 {\\alphaFF\\t(50,50,1,\\alpha0}。
+    """
+
+    baocun = pyqtSignal(object)
+
+    def __init__(self, she, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("【效果】打字机")
+        self.setModal(True)
+        she = dict(she or {})
+
+        wai = QtWidgets.QVBoxLayout(self)
+        wai.setContentsMargins(10, 10, 10, 10)
+        wai.setSpacing(6)
+
+        shuo = QtWidgets.QLabel("打字机：每个字到点才冒出来")
+        shuo.setStyleSheet(_ys_biao_ti())
+        wai.addWidget(shuo)
+
+        wang = QtWidgets.QGridLayout()
+        wang.setHorizontalSpacing(8)
+        wang.setVerticalSpacing(4)
+
+        wang.addWidget(QtWidgets.QLabel("作用于哪些行"), 0, 0)
+        self.xia_fanwei = QtWidgets.QComboBox()
+        self.xia_fanwei.addItems(
+            ("【自选】只作用于选中的行", "【全部】作用于全部行")
+        )
+        self.xia_fanwei.setCurrentIndex(
+            1 if str(she.get("fanwei")) == "quanbu" else 0
+        )
+        wang.addWidget(self.xia_fanwei, 0, 1)
+
+        wang.addWidget(QtWidgets.QLabel("把空格也算作一个字符（占时间）"), 1, 0)
+        self.xia_kongge = QtWidgets.QComboBox()
+        self.xia_kongge.addItems(("是", "否"))
+        self.xia_kongge.setCurrentIndex(0 if she.get("kongge", True) else 1)
+        wang.addWidget(self.xia_kongge, 1, 1)
+
+        wang.addWidget(QtWidgets.QLabel("模式选择"), 2, 0)
+        self.xia_moshi = QtWidgets.QComboBox()
+        self.xia_moshi.addItems(
+            (
+                "【模式1】每个字符出现的时间间隔（毫秒）",
+                "【模式2】全部字符出现的总时间占该行持续时间的百分之多少",
+                "【模式3】全部字符出现的总时间是（毫秒）",
+            )
+        )
+        try:
+            mo = int(she.get("moshi", 1))
+        except (TypeError, ValueError):
+            mo = 1
+        self.xia_moshi.setCurrentIndex(max(0, min(2, mo - 1)))
+        wang.addWidget(self.xia_moshi, 2, 1)
+
+        self.shuzi = []
+        for i, (ming, moren, di, gao, jian) in enumerate(
+            (
+                ("【模式1】每个字符出现的时间间隔（毫秒）", 78, 1, 60000, "m1"),
+                ("【模式2】全部字符出现的总时间占该行持续时间的百分比",
+                 50, 1, 100, "m2"),
+                ("【模式3】全部字符出现的总时间是（毫秒）",
+                 1000, 1, 600000, "m3"),
+            )
+        ):
+            biao = QtWidgets.QLabel(ming)
+            wang.addWidget(biao, i + 3, 0)
+            kuang = QtWidgets.QSpinBox()
+            kuang.setRange(di, gao)
+            try:
+                kuang.setValue(int(she.get(jian, moren)))
+            except (TypeError, ValueError):
+                kuang.setValue(moren)
+            wang.addWidget(kuang, i + 3, 1)
+            self.shuzi.append(kuang)
+        wai.addLayout(wang)
+
+        tishi = QtWidgets.QLabel(
+            "小提示：行里已有的特效标签（{\\pos…} 这类）原样留在最前面，不会被拆坏；\n"
+            "处理完按 Ctrl+Z 能退回来。"
+        )
+        tishi.setStyleSheet(_ys_biao_ti())
+        wai.addWidget(tishi)
+
+        an = QtWidgets.QHBoxLayout()
+        an.addStretch(1)
+        quxiao = QtWidgets.QPushButton("取消")
+        quxiao.setStyleSheet(_ys_ci_anniu())
+        queding = QtWidgets.QPushButton("确定")
+        queding.setStyleSheet(_ys_zhu_anniu())
+        for x in (quxiao, queding):
+            x.setFixedHeight(26)
+            x.setMinimumWidth(72)
+        an.addWidget(quxiao)
+        an.addWidget(queding)
+        wai.addLayout(an)
+
+        quxiao.clicked.connect(self.reject)
+        queding.clicked.connect(self._queding)
+        self.xia_moshi.currentIndexChanged.connect(self._huan_moshi)
+        self._huan_moshi()
+        self.setMinimumWidth(470)
+
+    def _huan_moshi(self):
+        """三个参数栏只留当前模式下用得上的那个能改（其余灰掉，免得看错）"""
+        dong = self.xia_moshi.currentIndex()
+        for i, kuang in enumerate(self.shuzi):
+            kuang.setEnabled(i == dong)
+
+    def she(self):
+        """现在这份参数（点过确定才有；没点过给空表）"""
+        return getattr(self, "_she", {})
+
+    def _queding(self):
+        self._she = {
+            "fanwei": "quanbu" if self.xia_fanwei.currentIndex() == 1 else "zixuan",
+            "kongge": self.xia_kongge.currentIndex() == 0,
+            "moshi": self.xia_moshi.currentIndex() + 1,
+            "m1": int(self.shuzi[0].value()),
+            "m2": int(self.shuzi[1].value()),
+            "m3": int(self.shuzi[2].value()),
+        }
+        self.baocun.emit(dict(self._she))
+        self.accept()
+
+
 class KuohaoPaichuDialog(QtWidgets.QDialog):
     """【批量添加方括号】排除配置（照 AEG 那个 Lua 脚本的配置窗口抄）
 
@@ -3659,6 +3848,9 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
 
     gaile = pyqtSignal(object)
     queren = pyqtSignal(object)
+    daziji = pyqtSignal(object)     # 「打字机」点了确定：参数交给外面去套用
+    chexiao = pyqtSignal()          # 这个窗口里按了 Ctrl+Z：转给工作台去撤字幕
+    chongzuo = pyqtSignal()         # Ctrl+Y
 
     def __init__(self, ziduan, parent=None, ziti_men=None,
                  jizhun=None, ziti_gongchang=None, yang_men=None,
@@ -3820,7 +4012,12 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
             "配「批量加「」」要跳过的：说话人 / 样式里含这些词的、文本里已经有这些符号的\n"
             f"存在：{buju_peizhi_lu()}"
         )
-        for x in (self.an_caowei_peizhi, self.an_kuohao_peizhi):
+        self.an_daziji = QtWidgets.QPushButton("【效果】打字机")
+        self.an_daziji.setToolTip(
+            "照 AEG 那个打字机脚本：给字幕逐字加 {\\alphaFF\\t(50,50,1,\\alpha0}，\n"
+            "画面上一个字一个字冒出来。点开写参数，点「确定」就套用（Ctrl+Z 能退）"
+        )
+        for x in (self.an_caowei_peizhi, self.an_kuohao_peizhi, self.an_daziji):
             x.setStyleSheet(_ys_ci_anniu())
             x.setFixedHeight(26)
             g.addWidget(x)
@@ -3953,11 +4150,15 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
                 ming = str(self._ziduan.get(wei) or "#FFFFFF")
                 if not re.match(r"^#[0-9A-Fa-f]{6}$", ming):
                     ming = "#FFFFFF"
+                # 不透明度 0（全透）也是个正经值：别写 `or 255`，那样 0 会被
+                # 当成"没填"顶成 255，全透的颜色一填进来就变成不透明
+                zhi_tou = self._ziduan.get("a" + wei[1])
                 try:
-                    tou = max(0, min(255, int(self._ziduan.get("a" + wei[1]) or 255)))
+                    tou = (255 if zhi_tou is None or str(zhi_tou).strip() == ""
+                           else int(zhi_tou))
                 except (TypeError, ValueError):
                     tou = 255
-                self._yanse[wei] = (ming, tou)
+                self._yanse[wei] = (ming, max(0, min(255, tou)))
             self._hua_yanse()
             an = int(self._ziduan.get("an") or 2)
             (self.qian_duiqi.get(an) or self.qian_duiqi[2]).setChecked(True)
@@ -4001,6 +4202,64 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
             kuang.clicked.connect(lambda _=False, w=wei: self._xuan_yanse(w))
         self.an_caowei_peizhi.clicked.connect(self._kai_caowei_peizhi)
         self.an_kuohao_peizhi.clicked.connect(self._kai_kuohao_peizhi)
+        self.an_daziji.clicked.connect(self._kai_daziji)
+
+        # Ctrl+Z / Ctrl+Y。这个窗口是非模态的：点完「打字机」确定，焦点还留在
+        # 这儿，工作台那两个快捷键只管"活跃窗口"，收不到键 —— AEG 里自动化跑完
+        # 能接着 Ctrl+Z 退回，这儿就把按键转给工作台去撤整份字幕。
+        self.chexiao_jian = QtWidgets.QShortcut(
+            QtGui.QKeySequence("Ctrl+Z"), self
+        )
+        self.chexiao_jian.setContext(Qt.WindowShortcut)
+        self.chexiao_jian.activated.connect(
+            lambda: self._zhuan_chexiao("undo")
+        )
+        self.chongzuo_jian = QtWidgets.QShortcut(
+            QtGui.QKeySequence("Ctrl+Y"), self
+        )
+        self.chongzuo_jian.setContext(Qt.WindowShortcut)
+        self.chongzuo_jian.activated.connect(
+            lambda: self._zhuan_chexiao("redo")
+        )
+
+    def _zhuan_chexiao(self, dong):
+        """这个窗口里按了 Ctrl+Z / Ctrl+Y
+
+        焦点在本窗口的输入框里、那框里又有得撤（重做）时让输入框自己办，
+        撤的是刚敲进去的那几个字；其余一律发信号给工作台，撤的是整份字幕
+        —— 跟工作台里那个规矩一模一样，只是这儿得自己接一下：非模态窗口
+        开着的时候，工作台那对快捷键收不到键。
+        """
+        zhu = QtWidgets.QApplication.focusWidget()
+        if isinstance(
+            zhu,
+            (QtWidgets.QLineEdit, QtWidgets.QTextEdit,
+             QtWidgets.QPlainTextEdit),
+        ):
+            you = (
+                zhu.isRedoAvailable() if dong == "redo"
+                else zhu.isUndoAvailable()
+            )
+            if you:
+                zhu.redo() if dong == "redo" else zhu.undo()
+                return
+        (self.chongzuo if dong == "redo" else self.chexiao).emit()
+
+    def _kai_daziji(self):
+        """打开「打字机」参数窗口；点「确定」就把参数交给工作台去套用
+
+        顺带把这次的参数记进配置，下次打开还是上次填的那几个数。
+        """
+        pei = du_zidonghua_peizhi()
+        dlg = DazijiDialog(dict(pei.get("daziji") or {}), self)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        she = dlg.she()
+        if not she:
+            return
+        pei["daziji"] = she
+        xie_zidonghua_peizhi(pei)
+        self.daziji.emit(dict(she))
 
     def _kai_caowei_peizhi(self):
         """打开「说话人 + 样式」的槽位配置（12 个槽位）
@@ -4066,16 +4325,19 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
             )
 
     def _xuan_yanse(self, wei):
-        """色块：开取色器（带透明度那一档），改完实时重画"""
+        """色块：开调色板（照 AEG 那个，带透明度），改完实时重画
+
+        不用 QtWidgets.QColorDialog：Windows 上它走系统原生那个调色板，原生那套
+        **压根没有 alpha**（ShowAlphaChannel 在原生对话框上是空转的），字幕颜色
+        恰恰要调透明度。所以走自己那份照 AEG 复刻的（widgets/color_dialog.py）。
+        """
         if self._tian:
             return
         ming, tou = self._yanse.get(wei, ("#FFFFFF", 255))
         qi = QtGui.QColor(ming)
         qi.setAlpha(tou)
-        yan = QtWidgets.QColorDialog.getColor(
-            qi, self, "选颜色", QtWidgets.QColorDialog.ShowAlphaChannel
-        )
-        if not yan.isValid():
+        yan, hao = YsgColorDialog.tiao(self, qi, alpha=True, biaoti="选颜色")
+        if not hao or yan is None:
             return
         self._yanse[wei] = (yan.name().upper(), yan.alpha())
         self._hua_yanse()
