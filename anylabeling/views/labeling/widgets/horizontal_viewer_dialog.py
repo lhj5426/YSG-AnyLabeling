@@ -470,7 +470,8 @@ class HorizontalViewerDialog(QtWidgets.QDialog):
     def showEvent(self, event):
         super().showEvent(event)
         # 首次显示时，在居中位置基础上向上偏移20像素
-        if not self.populated:
+        shou_ci = not self.populated
+        if shou_ci:
             current_pos = self.pos()
             self.move(current_pos.x(), current_pos.y() - 20)
             QtCore.QTimer.singleShot(50, self.populate_scene)
@@ -478,7 +479,11 @@ class HorizontalViewerDialog(QtWidgets.QDialog):
         QtCore.QTimer.singleShot(100, self.view.setFocus)
         # 延迟更新视图变换，确保窗口大小已确定
         QtCore.QTimer.singleShot(200, self.update_view_transform)
-        QtCore.QTimer.singleShot(250, lambda: self._center_on_current())
+        # 只有首次打开才"居中到当前图"。最小化的时候系统也会补发一次 showEvent，
+        # 若无条件居中，就会把用户已经滚到一百多张的画面又拽回打开时那张（第一张），
+        # 所以还原窗口时不再动滚动位置，用户滚到哪就停在哪。
+        if shou_ci:
+            QtCore.QTimer.singleShot(250, lambda: self._center_on_current())
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -789,6 +794,12 @@ class HorizontalViewerDialog(QtWidgets.QDialog):
             item.update()
 
     def toggle_reverse_mode(self):
+        # 反转滚动方向前，先把"当前图"记成视口正中那张（用户滚到哪就是哪）。
+        # 否则重排之后 _center_on_current 会拿打开时那张（第一张）去居中，
+        # 画面一下就跳回开头了，而不是在原地把方向反过来。
+        zhong = self.get_center_item()
+        if zhong is not None:
+            self.current_filename = zhong.path
         self.reverse_mode = not self.reverse_mode
         self.relayout_items()
         self._center_on_current()
