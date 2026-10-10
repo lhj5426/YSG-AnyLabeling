@@ -9070,6 +9070,7 @@ class _QiepianXiancheng(QtCore.QThread):
 
     jindu = pyqtSignal(int, int)       # 已完成 / 总共
     wancheng = pyqtSignal(bool, str)   # 成不成 / 说明
+    quxiao = pyqtSignal(str)           # 用户自己按的取消：只在底栏说一声，不弹框
 
     def __init__(self, shipin, tiao, peizhi, quyu, shuchu, parent=None):
         super().__init__(parent)
@@ -9145,13 +9146,17 @@ class _QiepianXiancheng(QtCore.QThread):
             shipin.release()
 
         if self._ting:
-            self.wancheng.emit(
-                False, f"已取消：切到一半停了，{cheng} 张已存进 {self.shuchu}"
+            self.quxiao.emit(
+                f"已取消：切到一半停了，{cheng} 张已存进 {self.shuchu}"
             )
             return
-        self.wancheng.emit(
-            True, f"切片完成：共 {cheng} 张，存到 {self.shuchu}"
-        )
+        # 按模式说清楚：中间值一个块一张；前后轴一个块头尾各一张
+        kuai = len(self.tiao)
+        if zhong:
+            shuo = f"切片完成：中间切片 {kuai} 张，存到 {self.shuchu}"
+        else:
+            shuo = f"切片完成：前后切片各 {kuai} 张，存到 {self.shuchu}"
+        self.wancheng.emit(True, shuo)
 
     def _cun(self, shipin, ms, lu):
         """跳到一个时间点、读一帧、按框选区域裁一下、存 jpeg"""
@@ -9224,6 +9229,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._qiepian_tiao = None
         self._qiepian_kuai_shu = 0      # 这一轮总共多少个字幕块（进度框那行字要用）
         self._qiepian_mei_kuai = 1      # 每个块出几张（中间值 1 / 前后轴 2）
+        self._qiepian_ting_le_guo = False   # 这一轮是不是已经被用户取消了
 
         self.lujing = ""
         self.fps = 0.0
@@ -15620,12 +15626,14 @@ class VideoWorkDialog(QtWidgets.QDialog):
         zong = len(tiao) * mei
         self._qiepian_kuai_shu = len(tiao)
         self._qiepian_mei_kuai = mei
+        self._qiepian_ting_le_guo = False
 
         self._qiepian_xiancheng = _QiepianXiancheng(
             self.lujing, tiao, p, quyu, shuchu, self
         )
         self._qiepian_xiancheng.jindu.connect(self._qiepian_jindu)
         self._qiepian_xiancheng.wancheng.connect(self._qiepian_wan)
+        self._qiepian_xiancheng.quxiao.connect(self._qiepian_ting_le)
 
         self._qiepian_tiao = QtWidgets.QProgressDialog(
             self._qiepian_jindu_wen(0, zong), "取消", 0, zong, self
@@ -15646,45 +15654,76 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._qiepian_xiancheng.start()
 
     def _qiepian_quxiao(self):
-        """进度框上按了取消：让后台线程切完手上这张就停"""
+        """进度框上按了取消 / 右上角关掉：让后台线程手上这张一存完就收手
+
+        取消是用户自己按的，不用再回报什么，静悄悄停掉就行。
+        """
+        if self._qiepian_ting_le_guo:
+            return
+        self._qiepian_ting_le_guo = True
         if self._qiepian_xiancheng is not None:
             self._qiepian_xiancheng.ting()
+        tiao = self._qiepian_tiao
+        self._qiepian_tiao = None
+        if tiao is not None:
+            tiao.close()
 
-    def _qiepian_jindu_wen(self, wan, zong):
-        """进度框上那行字：一共多少块、正出第几张、这一张是块的头还是尾
+    def _qiepian_ting_le(self, shuo):
+        """线程收手了：只收摊，不弹框、不留话"""
+        tiao = self._qiepian_tiao
+        self._qiepian_tiao = None
+        self._qiepian_xiancheng = None
+        if tiao is not None:
+            tiao.close()
+        self.shezhi_mianban.zhuangtai_shezhi("")
 
-        wan 是「已经出了几张」（0 = 还没开始）；反过来就是第几张。
+    def _qiepian_dang_kuai(self, wan):
+        """已经出了 wan 张图 → 现在是第几个块
+
+        前后轴模式一个块出两张（头、尾各一张），但进度按「块」算，一块算一张，
+        所以张数得折回块数。
         """
         kuai = max(1, int(self._qiepian_kuai_shu or 0))
         mei = max(1, int(self._qiepian_mei_kuai or 1))
         if wan <= 0:
-            hang = f"准备切片：共 {kuai} 个字幕块，合计 {zong} 张"
-        elif mei > 1:
-            hao = min(kuai, (wan - 1) // mei + 1)
-            tou = "开始点" if (wan - 1) % mei == 0 else "结束点"
-            hang = (f"正在生成第 {wan} / {zong} 张"
-                    f"　第 {hao} / {kuai} 个字幕块（{tou}）")
-        else:
-            hao = min(kuai, wan)
-            hang = f"正在生成第 {wan} / {zong} 张　第 {hao} / {kuai} 个字幕块"
-        return hang
+            return 0
+        return min(kuai, (int(wan) + mei - 1) // mei)
+
+    def _qiepian_jindu_wen(self, wan, zong):
+        """进度框上那行字：一共多少块 + 正出第几块（一行说完，不重复报数）"""
+        kuai = max(1, int(self._qiepian_kuai_shu or 0))
+        # 说清楚这一轮按哪种取的：中间值 1 张 / 前后轴 2 张
+        na = "前后" if max(1, int(self._qiepian_mei_kuai or 1)) > 1 else "中间"
+        dang = self._qiepian_dang_kuai(wan)
+        if dang <= 0:
+            return f"共 {kuai} 个字幕块　准备开始"
+        return f"共 {kuai} 个字幕块　正在生成{na}第 {dang} / {kuai} 张"
 
     def _qiepian_jindu(self, wan, zong):
         hang = self._qiepian_jindu_wen(wan, zong)
-        if self._qiepian_tiao is not None:
-            self._qiepian_tiao.setMaximum(zong)
-            self._qiepian_tiao.setValue(wan)
-            self._qiepian_tiao.setLabelText(
-                hang + f"\n共 {max(1, int(self._qiepian_kuai_shu or 0))} 个字幕块"
-                       f" · 合计 {zong} 张"
-            )
-        self.shezhi_mianban.zhuangtai_shezhi(hang)
+        kuai = max(1, int(self._qiepian_kuai_shu or 0))
+        dang = self._qiepian_dang_kuai(wan)
+        tiao = self._qiepian_tiao
+        if tiao is not None:
+            # 进度条也按块走：前后轴一块只前进一格
+            tiao.setMaximum(kuai)
+            # setValue 会转一圈事件循环：这一圈里要是刚好收到「跑完了」，
+            # 那个槽会把 self._qiepian_tiao 清成 None。所以转完必须重看一眼，
+            # 不然就是「切到最后一张才崩」。
+            tiao.setValue(dang)
+            if self._qiepian_tiao is not None:
+                tiao.setLabelText(hang)
+        # 已经收工了就别再拿进度盖掉那句「切片完成」
+        if self._qiepian_xiancheng is not None:
+            self.shezhi_mianban.zhuangtai_shezhi(hang)
 
     def _qiepian_wan(self, cheng, shuo):
-        if self._qiepian_tiao is not None:
-            self._qiepian_tiao.close()
-            self._qiepian_tiao = None
+        # 先清账再 close：close 也可能转事件循环，账清早了后面就不会踩空
+        tiao = self._qiepian_tiao
+        self._qiepian_tiao = None
         self._qiepian_xiancheng = None
+        if tiao is not None:
+            tiao.close()
         self.shezhi_mianban.zhuangtai_shezhi(shuo)
         if cheng:
             QtWidgets.QMessageBox.information(self, "切片完成", shuo)
