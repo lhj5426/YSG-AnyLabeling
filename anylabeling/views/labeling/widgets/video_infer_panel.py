@@ -76,6 +76,9 @@ KONGXIAN_HAO_MIAO = 3           # 推理线程没帧可取时的等待毫秒
 JINDU_JIAN_GE_HAO_MIAO = 80     # 扫描时进度最快每多少毫秒报一次
 YUJI_ZUI_SHAO_ZHEN = 30         # 至少处理这么多帧才开始估"预计完成"，免得开头几帧乱跳
 QUYU_LISHI_TIAO = 10            # 框选区域的历史记多少条
+MOXING_LISHI_TIAO = 10          # 检测模型历史记多少条
+MOXING_LISHI_JIAN = "tiqu/moxing_lishi"   # 检测模型路径历史记在 ini 里的项名
+QUYU_LISHI_JIAN = "tiqu/quyu_lishi"       # 框选区域历史记在 ini 里的项名
 ZIMU_ZHUI_SHU = 5               # OCR 去重时记住最近多少条已存文字
 ZISHU_MIAO_BANJIAO = 0.5        # 字幕列表「字/秒」：半角字符算几个字（0.5 = 算半个字）
 ZIMU_BIANJI_ZIHAO_MOREN = 13    # 「字幕编辑」编辑框的字号（px），没存过就用这个
@@ -104,6 +107,23 @@ BUJU_PEIZHI_MING = "gongzuotai.ini"    # 视频工作台的全部记忆 / 配置
 TISHIYIN_MOREN = r"J:\A01\硬字幕压制完成.wav"   # 提取跑完播的提示音；想换默认就【只改这一行】
 TISHIYIN_PEIZHI = "tiqu/tishiyin_lu"    # 提示音路径记在 ini 里的项名
 TISHIYIN_KAI_PEIZHI = "tiqu/tishiyin_kai"   # 提示音开关记在 ini 里的项名
+OCR_KAI_PEIZHI = "ocr/kai"              # OCR 启用勾记在 ini 里的项名
+OCR_LU_PEIZHI = "ocr/lu"                # OCR YAML 路径记在 ini 里的项名
+OCR_XIANGSI_PEIZHI = "ocr/xiangsi"      # OCR 相似度（整数百分数）记在 ini 里的项名
+OCR_YOUXIAN_PEIZHI = "ocr/youxian_chang"   # OCR 优先长文本记在 ini 里的项名
+OCR_GUOLV_PEIZHI = "ocr/guolv"          # OCR 去重过滤规则记在 ini 里的项名
+# ---- ①③⑤⑦ 那些选项，也一并记住 ----
+TIQU_YOLO_KAI = "tiqu/yolo_kai"           # ① 启用检测
+TIQU_ZHIXIN = "tiqu/zhixin_du"            # ① 置信度（整数百分数）
+TIQU_LEIBIE = "tiqu/leibie"               # ① 只检测类别
+TIQU_CHANGJING_KAI = "tiqu/changjing_kai"  # ③ 场景检测启用
+TIQU_CHANGJING_MIN = "tiqu/changjing_min"  # ③ 灵敏度
+TIQU_JIANCE_JIANGE = "tiqu/jiance_jiange"  # ③ 每 N 帧
+TIQU_KUAISU = "tiqu/kuaisu"               # ⑤ 快速模式
+TIQU_TIAOXIANGSI = "tiqu/tiaoxiangsi"     # ⑤ 跳过相似帧
+TIQU_TIAOSHI = "tiqu/tiaoshi"             # ⑤ 调试模式
+TIQU_PAOFA = "tiqu/paofa"                 # ⑦ 怎么跑：gensui 跟随播放 / saomiao 全片扫描
+TIQU_HUAMIAN_BUDONG = "tiqu/huamian_budong"   # ⑦ 扫描时画面静止
 CAOWEI_SHU = 12                 # 「说话人 + 样式」槽位个数（对 F1 ~ F12）
 KUOHAO_PAI_CHU_ZI = "旁白"      # 批量加「」：说话人 / 样式里含这几个词的，不套「」
 KUOHAO_PAI_CHU_FU = "「」『』（）()"   # 批量加「」：文本里已经有这些符号的，不再套「」
@@ -212,6 +232,38 @@ def buju_qsettings():
     """视频工作台的界面记忆：软件根目录下的 gongzuotai.ini"""
     _qian_yi_jiu_peizhi()
     return _kai_buju_ini()
+
+
+def _ini_shi_bushi(zhi):
+    """ini 里取的开关值：几种写法都认（true/1/yes/是 都算勾上）"""
+    return str(zhi).strip().lower() in ("true", "1", "yes", "是")
+
+
+def _ini_mingdan(pei, jian):
+    """ini 里取一串字符串
+
+    存的时候是一条用换行拼起来的普通字符串（QSettings 存列表会写成
+    @Variant(...) 那种怪格式，读不回来）。这里按换行拆开。
+    QSettings 存字符串时换行会被转义，读回来是真正的换行，直接 split 就行。
+    """
+    try:
+        zhi = pei.value(jian, None)
+    except Exception:       # noqa
+        return None
+    if zhi is None:
+        return None
+    if isinstance(zhi, (list, tuple)):
+        ming = [str(x) for x in zhi]
+    else:
+        zhi = str(zhi)
+        if not zhi:
+            return []
+        # 历史遗留的坏值（@Variant(...) / @Invalid() 之类）当没存过
+        if zhi.startswith("@"):
+            return None
+        ming = [x for x in zhi.split("\n") if x.strip()]
+    ming = [x for x in ming if x and not x.startswith("@")]
+    return ming
 
 
 # ---------------------------------------------------------------- 编辑框字号
@@ -5914,12 +5966,16 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.ocr_guolv = []
         self.zhengzai = False
         self._kaishi_shike = 0.0        # 这次跑起来的时刻（算已用 / 预计完成）
+        self._zhuang_wan = False        # 界面还在摆 / 还在载入：这期间一律不往回存设置
         self._jian_ui()
         self.zhuang_lishi()             # 载入上次用过的检测模型
         self.zhuang_ocr_lishi()         # 载入上次用过的 OCR 模型
         self.zhuang_quyu_lishi()        # 载入框选过的区域
         self.zhuang_tishiyin()          # 载入提取完的提示音设置
+        self.zhuang_ocr_kaiguan()       # 载入 OCR 那一组（启用勾 / YAML / 相似度 / 优先长文本 / 过滤规则）
+        self.zhuang_tiqu_shezhi()       # 载入 ①③⑤⑦ 那些选项（检测 / 场景 / 其它 / 怎么跑）
         self._shuaxin_lian_dong()
+        self._zhuang_wan = True         # 摆完了，往后改动才存
 
     # ------------------------------------------------------------------
     # 界面
@@ -5972,6 +6028,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.gou_yolo.setChecked(True)
         self.gou_yolo.setStyleSheet(_ys_xuanxiang())
         self.gou_yolo.stateChanged.connect(self._shuaxin_lian_dong)
+        self.gou_yolo.stateChanged.connect(self._cun_tiqu_shezhi)
         hang2.addWidget(self.gou_yolo)
         hang2.addStretch(1)
         hang2.addWidget(QtWidgets.QLabel("置信度"))
@@ -5981,6 +6038,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.zhixin_du.setSuffix("%")
         self.zhixin_du.setFixedWidth(64)
         self.zhixin_du.setStyleSheet(_ys_shuzi())
+        self.zhixin_du.valueChanged.connect(self._cun_tiqu_shezhi)
         hang2.addWidget(self.zhixin_du)
         bu.addLayout(hang2)
 
@@ -5990,6 +6048,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.leibie_shuru = QtWidgets.QLineEdit("changfangtiao")
         self.leibie_shuru.setPlaceholderText("留空 = 全部；多个用逗号隔开")
         self.leibie_shuru.setStyleSheet(_ys_shuru())
+        self.leibie_shuru.editingFinished.connect(self._cun_tiqu_shezhi)
         hang3.addWidget(self.leibie_shuru, 1)
         bu.addLayout(hang3)
 
@@ -6023,6 +6082,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.gou_changjing.setChecked(True)
         self.gou_changjing.setStyleSheet(_ys_xuanxiang())
         self.gou_changjing.stateChanged.connect(self._shuaxin_lian_dong)
+        self.gou_changjing.stateChanged.connect(self._cun_tiqu_shezhi)
         hang.addWidget(self.gou_changjing)
         hang.addStretch(1)
         hang.addWidget(QtWidgets.QLabel("灵敏度"))
@@ -6032,6 +6092,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.changjing_yuzhi.setToolTip("越大越敏感：1 = 要差 10% 才算变化；100 = 差 0.1% 就算")
         self.changjing_yuzhi.setFixedWidth(58)
         self.changjing_yuzhi.setStyleSheet(_ys_shuzi())
+        self.changjing_yuzhi.valueChanged.connect(self._cun_tiqu_shezhi)
         hang.addWidget(self.changjing_yuzhi)
         hang.addWidget(QtWidgets.QLabel("每"))
         self.jiance_jiange = QtWidgets.QSpinBox()
@@ -6040,6 +6101,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.jiance_jiange.setToolTip("每 N 帧比一次；调大更快，但可能漏")
         self.jiance_jiange.setFixedWidth(48)
         self.jiance_jiange.setStyleSheet(_ys_shuzi())
+        self.jiance_jiange.valueChanged.connect(self._cun_tiqu_shezhi)
         hang.addWidget(self.jiance_jiange)
         hang.addWidget(QtWidgets.QLabel("帧"))
         bu.addLayout(hang)
@@ -6051,6 +6113,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.gou_ocr = QtWidgets.QCheckBox("启用 OCR 去重")
         self.gou_ocr.setStyleSheet(_ys_xuanxiang())
         self.gou_ocr.stateChanged.connect(self._shuaxin_lian_dong)
+        self.gou_ocr.stateChanged.connect(self._cun_ocr_kaiguan)
         hang.addWidget(self.gou_ocr)
         self.a_guolv = QtWidgets.QPushButton("过滤规则…")
         self.a_guolv.setStyleSheet(_ys_ci_anniu())
@@ -6063,6 +6126,7 @@ class ShezhiMianban(QtWidgets.QWidget):
             "新文字包含旧文字时用新的：OCR 不会凭空多出字，长的那条更可靠"
         )
         hang.addWidget(self.gou_youxian_chang)
+        self.gou_youxian_chang.stateChanged.connect(self._cun_ocr_kaiguan)
         hang.addStretch(1)
         hang.addWidget(QtWidgets.QLabel("相似度"))
         self.ocr_xiangsi = QtWidgets.QSpinBox()
@@ -6072,6 +6136,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.ocr_xiangsi.setFixedWidth(64)
         self.ocr_xiangsi.setStyleSheet(_ys_shuzi())
         hang.addWidget(self.ocr_xiangsi)
+        self.ocr_xiangsi.valueChanged.connect(self._cun_ocr_kaiguan)
         bu.addLayout(hang)
 
         hang = QtWidgets.QHBoxLayout()
@@ -6096,6 +6161,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.gou_kuaisu.setChecked(True)
         self.gou_kuaisu.setStyleSheet(_ys_xuanxiang())
         self.gou_kuaisu.setToolTip("只在场景变化时才跑检测，快很多")
+        self.gou_kuaisu.stateChanged.connect(self._cun_tiqu_shezhi)
         hang.addWidget(self.gou_kuaisu)
         self.gou_tiaoxiangsi = QtWidgets.QCheckBox("跳过相似帧")
         self.gou_tiaoxiangsi.setChecked(True)
@@ -6103,10 +6169,12 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.gou_tiaoxiangsi.setToolTip(
             "只在「不勾 OCR」时有意义：相邻帧几乎一样就不重复存图"
         )
+        self.gou_tiaoxiangsi.stateChanged.connect(self._cun_tiqu_shezhi)
         hang.addWidget(self.gou_tiaoxiangsi)
         self.gou_tiaoshi = QtWidgets.QCheckBox("调试模式")
         self.gou_tiaoshi.setStyleSheet(_ys_xuanxiang())
         self.gou_tiaoshi.setToolTip("额外输出检测图 / 场景图 / OCR 文字，排查问题时用")
+        self.gou_tiaoshi.stateChanged.connect(self._cun_tiqu_shezhi)
         hang.addWidget(self.gou_tiaoshi)
         hang.addStretch(1)
         bu.addLayout(hang)
@@ -6133,11 +6201,13 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.xuan_gensui.setChecked(True)
         self.xuan_gensui.setStyleSheet(_ys_xuanxiang())
         self.xuan_gensui.setToolTip("边放边推理，看框的效果；跑不过来会自动丢帧")
+        self.xuan_gensui.toggled.connect(self._cun_tiqu_shezhi)
         hang.addWidget(self.xuan_gensui)
         self.xuan_saomiao = QtWidgets.QRadioButton("全片扫描")
         self.xuan_saomiao.setStyleSheet(_ys_xuanxiang())
         self.xuan_saomiao.setToolTip("不播放，整条视频跑一遍，跑完出图 + SRT")
         self.xuan_saomiao.toggled.connect(self._shuaxin_lian_dong)
+        self.xuan_saomiao.toggled.connect(self._cun_tiqu_shezhi)
         hang.addWidget(self.xuan_saomiao)
         hang.addStretch(1)
         bu.addLayout(hang)
@@ -6153,6 +6223,7 @@ class ShezhiMianban(QtWidgets.QWidget):
             "进度条和已用/预计时间照常走，跑完把最后一帧钉在画面上。"
         )
         self.gou_huamian_budong.toggled.connect(self.huamian_jingzhi)
+        self.gou_huamian_budong.toggled.connect(self._cun_tiqu_shezhi)
         hang.addWidget(self.gou_huamian_budong)
         hang.addStretch(1)
         bu.addLayout(hang)
@@ -6355,33 +6426,55 @@ class ShezhiMianban(QtWidgets.QWidget):
             self._ji_lishi_moxing(lujing)
 
     def _ji_lishi_moxing(self, lujing):
-        lishi = self._du_lishi_moxing()
-        if lujing in lishi:
-            lishi.remove(lujing)
-        lishi.insert(0, lujing)
-        lishi = lishi[:10]
-        try:
-            import json
+        from anylabeling.views.labeling.utils.video import _lu_yigui
 
-            with open(self._lishi_wenjian(), "w", encoding="utf-8") as f:
-                json.dump(lishi, f, ensure_ascii=False, indent=2)
-        except Exception as cuowu:  # noqa
-            logger.warning(f"视频工作台：存模型历史失败 {cuowu}")
+        lishi = [_lu_yigui(p) for p in self._du_lishi_moxing()]
+        lu = _lu_yigui(lujing)
+        if lu in lishi:
+            lishi.remove(lu)
+        lishi.insert(0, lu)
+        lishi = lishi[:MOXING_LISHI_TIAO]
+        self._cun_lishi_moxing(lishi)
         self._zhuang_lishi_moxing(lishi)
 
     @staticmethod
-    def _lishi_wenjian():
+    def _jiu_lishi_wenjian():
+        """老版本把模型历史存在 C 盘用户目录；只用来搬一次家，搬完不再用"""
         return osp.join(osp.expanduser("~"), ".ysg_video_jiance_moxing.json")
+
+    def _cun_lishi_moxing(self, lishi):
+        """检测模型历史写进 gongzuotai.ini（绿色软件，东西都放自己目录）"""
+        try:
+            pei = buju_qsettings()
+            pei.setValue(
+                MOXING_LISHI_JIAN,
+                "\n".join(str(p) for p in lishi[:MOXING_LISHI_TIAO]),
+            )
+            pei.sync()
+        except Exception as cuowu:  # noqa
+            logger.warning(f"视频工作台：存模型历史失败 {cuowu}")
 
     def _du_lishi_moxing(self):
         try:
-            import json
+            pei = buju_qsettings()
+            if pei.contains(MOXING_LISHI_JIAN):
+                ming = _ini_mingdan(pei, MOXING_LISHI_JIAN) or []
+            else:
+                # 头一次：把 C 盘那个老 json 搬进 ini（老文件留着不动）
+                from anylabeling.views.labeling.utils.video import _lu_yigui
 
-            lu = self._lishi_wenjian()
-            if not osp.exists(lu):
-                return []
-            with open(lu, "r", encoding="utf-8") as f:
-                return [p for p in json.load(f) if osp.exists(p)]
+                ming = []
+                try:
+                    jiu = self._jiu_lishi_wenjian()
+                    if osp.exists(jiu):
+                        with open(jiu, "r", encoding="utf-8") as f:
+                            ming = [_lu_yigui(p) for p in (json.load(f) or [])]
+                except Exception as cuowu:  # noqa
+                    logger.warning(f"视频工作台：搬旧模型历史失败 {cuowu}")
+                    ming = []
+                if ming:
+                    self._cun_lishi_moxing(ming)
+            return [p for p in ming if osp.exists(p)]
         except Exception as cuowu:  # noqa
             logger.warning(f"视频工作台：读模型历史失败 {cuowu}")
             return []
@@ -6416,6 +6509,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         if not lujing:
             return
         self._she_ocr(lujing, ji_lishi=True)
+        self._cun_ocr_kaiguan()
 
     def _she_ocr(self, lujing, ji_lishi=False):
         self.ocr_lu = lujing
@@ -6435,6 +6529,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         p = self.ocr_xiala.currentData()
         if p:
             self._she_ocr(p)
+            self._cun_ocr_kaiguan()
 
     def zhuang_ocr_lishi(self):
         try:
@@ -6452,10 +6547,157 @@ class ShezhiMianban(QtWidgets.QWidget):
         for p in lishi:
             self.ocr_xiala.addItem(osp.basename(p), p)
         self.ocr_xiala.setCurrentIndex(0)
+        if lishi:
+            # 这一句也得掐着信号放：不掐的话会触发 _lishi_ocr -> _cun_ocr_kaiguan，
+            # 而这时候「启用 OCR」那个勾还没从 ini 恢复（zhuang_ocr_kaiguan 在后头跑），
+            # 等于拿默认的「没勾」把 ini 盖掉 —— 重启后勾就没了。
+            self.ocr_xiala.setCurrentIndex(1)
         self.ocr_xiala.blockSignals(False)
         if lishi:
-            self.ocr_xiala.setCurrentIndex(1)
             self._she_ocr(lishi[0])
+
+    def _cun_ocr_kaiguan(self, *_):
+        """OCR 这一组（启用勾 / YAML / 相似度 / 优先长文本 / 过滤规则）改一下就存进
+        gongzuotai.ini，下次开软件还是这个样"""
+        if not self._zhuang_wan:
+            return          # 界面还在载入：这会儿的值不是用户改的，别往回存
+        try:
+            pei = buju_qsettings()
+            pei.setValue(OCR_KAI_PEIZHI, bool(self.gou_ocr.isChecked()))
+            pei.setValue(OCR_LU_PEIZHI, self.ocr_lu or "")
+            pei.setValue(OCR_XIANGSI_PEIZHI, int(self.ocr_xiangsi.value()))
+            pei.setValue(
+                OCR_YOUXIAN_PEIZHI, bool(self.gou_youxian_chang.isChecked())
+            )
+            # 用换行拼成一条普通字符串存：QSettings 直接存列表会写成
+            # @Variant(...) 那种怪格式，读不回来。规则里本来就可能有 | ，所以
+            # 不能用 | 拼。
+            pei.setValue(
+                OCR_GUOLV_PEIZHI, "\n".join(str(x) for x in (self.ocr_guolv or []))
+            )
+            pei.sync()
+        except Exception as cuowu:      # noqa
+            logger.warning(f"视频工作台：存 OCR 设置失败 {cuowu}")
+
+    def zhuang_ocr_kaiguan(self):
+        """开面板时把 OCR 这一组摆回上次的样子；没存过就用默认"""
+        try:
+            pei = buju_qsettings()
+            kai = pei.value(OCR_KAI_PEIZHI, None)
+            lu = pei.value(OCR_LU_PEIZHI, None)
+            xiangsi = pei.value(OCR_XIANGSI_PEIZHI, None)
+            youxian = pei.value(OCR_YOUXIAN_PEIZHI, None)
+            guolv = _ini_mingdan(pei, OCR_GUOLV_PEIZHI)
+        except Exception as cuowu:      # noqa
+            logger.warning(f"视频工作台：读 OCR 设置失败 {cuowu}")
+            return
+        # 摆值的时候先掐掉信号：免得摆到一半就把 ini 又写回去、自己盖掉自己
+        for kj in (self.gou_ocr, self.ocr_xiangsi, self.gou_youxian_chang):
+            kj.blockSignals(True)
+        try:
+            if kai is not None:
+                self.gou_ocr.setChecked(_ini_shi_bushi(kai))
+            if lu:
+                self._she_ocr(str(lu))
+            if xiangsi is not None:
+                try:
+                    self.ocr_xiangsi.setValue(int(xiangsi))
+                except Exception:       # noqa
+                    pass
+            if youxian is not None:
+                self.gou_youxian_chang.setChecked(_ini_shi_bushi(youxian))
+            if guolv is not None:
+                self.ocr_guolv = guolv
+        finally:
+            for kj in (self.gou_ocr, self.ocr_xiangsi, self.gou_youxian_chang):
+                kj.blockSignals(False)
+
+    def _cun_tiqu_shezhi(self, *_):
+        """①③⑤⑦ 这些选项（检测 / 场景检测 / 其它 / 怎么跑）改一下就存进
+        gongzuotai.ini，下次开软件还是这个样"""
+        if not self._zhuang_wan:
+            return          # 界面还在载入：这会儿的值不是用户改的，别往回存
+        try:
+            pei = buju_qsettings()
+            pei.setValue(TIQU_YOLO_KAI, bool(self.gou_yolo.isChecked()))
+            pei.setValue(TIQU_ZHIXIN, int(self.zhixin_du.value()))
+            pei.setValue(TIQU_LEIBIE, self.leibie_shuru.text().strip())
+            pei.setValue(
+                TIQU_CHANGJING_KAI, bool(self.gou_changjing.isChecked())
+            )
+            pei.setValue(TIQU_CHANGJING_MIN, int(self.changjing_yuzhi.value()))
+            pei.setValue(TIQU_JIANCE_JIANGE, int(self.jiance_jiange.value()))
+            pei.setValue(TIQU_KUAISU, bool(self.gou_kuaisu.isChecked()))
+            pei.setValue(TIQU_TIAOXIANGSI, bool(self.gou_tiaoxiangsi.isChecked()))
+            pei.setValue(TIQU_TIAOSHI, bool(self.gou_tiaoshi.isChecked()))
+            pei.setValue(
+                TIQU_PAOFA,
+                "saomiao" if self.xuan_saomiao.isChecked() else "gensui",
+            )
+            pei.setValue(
+                TIQU_HUAMIAN_BUDONG, bool(self.gou_huamian_budong.isChecked())
+            )
+            pei.sync()
+        except Exception as cuowu:      # noqa
+            logger.warning(f"视频工作台：存提取设置失败 {cuowu}")
+
+    def zhuang_tiqu_shezhi(self):
+        """开面板时把 ①③⑤⑦ 那些选项摆回上次的样子；没存过的就用代码里的默认"""
+        try:
+            pei = buju_qsettings()
+        except Exception as cuowu:      # noqa
+            logger.warning(f"视频工作台：读提取设置失败 {cuowu}")
+            return
+
+        def _kai(jian, moren):
+            zhi = pei.value(jian, None)
+            if zhi is None:
+                return moren
+            return _ini_shi_bushi(zhi)
+
+        def _shu(jian, moren, zui_xiao, zui_da):
+            zhi = pei.value(jian, None)
+            if zhi is None:
+                return moren
+            try:
+                return max(zui_xiao, min(zui_da, int(zhi)))
+            except (TypeError, ValueError):
+                return moren
+
+        # 摆值之前把信号掐住：免得摆到一半又往回存（_zhuang_wan 这会儿还是
+        # False 兜着，这里是双保险）
+        kao = (self.gou_yolo, self.zhixin_du, self.leibie_shuru,
+               self.gou_changjing, self.changjing_yuzhi, self.jiance_jiange,
+               self.gou_kuaisu, self.gou_tiaoxiangsi, self.gou_tiaoshi,
+               self.xuan_gensui, self.xuan_saomiao,
+               self.gou_huamian_budong)
+        for w in kao:
+            w.blockSignals(True)
+        try:
+            self.gou_yolo.setChecked(_kai(TIQU_YOLO_KAI, True))
+            self.zhixin_du.setValue(_shu(TIQU_ZHIXIN, 50, 1, 100))
+            leibie = pei.value(TIQU_LEIBIE, None)
+            if leibie is not None:
+                self.leibie_shuru.setText(str(leibie))
+            self.gou_changjing.setChecked(_kai(TIQU_CHANGJING_KAI, True))
+            self.changjing_yuzhi.setValue(_shu(TIQU_CHANGJING_MIN, 70, 1, 100))
+            self.jiance_jiange.setValue(_shu(TIQU_JIANCE_JIANGE, 1, 1, 30))
+            self.gou_kuaisu.setChecked(_kai(TIQU_KUAISU, True))
+            self.gou_tiaoxiangsi.setChecked(_kai(TIQU_TIAOXIANGSI, True))
+            self.gou_tiaoshi.setChecked(_kai(TIQU_TIAOSHI, False))
+            paofa = pei.value(TIQU_PAOFA, None)
+            if paofa is not None:
+                if str(paofa).strip().lower() in ("saomiao", "quanpian",
+                                                  "true", "1"):
+                    self.xuan_saomiao.setChecked(True)
+                else:
+                    self.xuan_gensui.setChecked(True)
+            self.gou_huamian_budong.setChecked(
+                _kai(TIQU_HUAMIAN_BUDONG, False)
+            )
+        finally:
+            for w in kao:
+                w.blockSignals(False)
 
     def _kuang_xuan(self):
         """在工作台的视频画面上框选检测区域（不弹窗）"""
@@ -6486,25 +6728,68 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.quyu_biangeng.emit(None)
 
     # ------------------------------------------------------------------
-    # 框选区域的历史（跟模型历史一个路子，存在用户主目录）
+    # 框选区域的历史（跟模型历史一个路子，存在 gongzuotai.ini 里）
     # ------------------------------------------------------------------
     @staticmethod
-    def _quyu_lishi_wenjian():
+    def _jiu_quyu_lishi_wenjian():
+        """老版本把区域历史存在 C 盘用户目录；只用来搬一次家，搬完不再用"""
         return osp.join(osp.expanduser("~"), ".ysg_video_quyu_lishi.json")
+
+    @staticmethod
+    def _quyu_yi_wen(qu):
+        """区域 -> ini 里存的那串  x,y,w,h"""
+        return "%d,%d,%d,%d" % tuple(int(v) for v in qu)
+
+    @staticmethod
+    def _wen_yi_quyu(wen):
+        """那串 x,y,w,h -> 区域；不对就返回 None"""
+        bu = [x.strip() for x in str(wen).split(",")]
+        if len(bu) != 4:
+            return None
+        try:
+            return tuple(int(v) for v in bu)
+        except ValueError:
+            return None
+
+    def _cun_lishi_quyu(self, lishi):
+        """区域历史写进 gongzuotai.ini（绿色软件，东西都放自己目录）"""
+        try:
+            pei = buju_qsettings()
+            pei.setValue(
+                QUYU_LISHI_JIAN,
+                "\n".join(self._quyu_yi_wen(q)
+                          for q in lishi[:QUYU_LISHI_TIAO]),
+            )
+            pei.sync()
+        except Exception as cuowu:  # noqa
+            logger.warning(f"视频工作台：存区域历史失败 {cuowu}")
 
     def _du_lishi_quyu(self):
         try:
-            import json
-
-            lu = self._quyu_lishi_wenjian()
-            if not osp.exists(lu):
-                return []
-            with open(lu, "r", encoding="utf-8") as f:
-                shu = json.load(f)
-            gui = []
-            for x in shu or []:
-                if isinstance(x, (list, tuple)) and len(x) == 4:
-                    gui.append(tuple(int(v) for v in x))
+            pei = buju_qsettings()
+            if pei.contains(QUYU_LISHI_JIAN):
+                gui = [self._wen_yi_quyu(x)
+                       for x in (_ini_mingdan(pei, QUYU_LISHI_JIAN) or [])]
+                gui = [q for q in gui if q is not None]
+            else:
+                # 头一次：把 C 盘那个老 json 搬进 ini（老文件留着不动）
+                gui = []
+                try:
+                    jiu = self._jiu_quyu_lishi_wenjian()
+                    if osp.exists(jiu):
+                        with open(jiu, "r", encoding="utf-8") as f:
+                            for x in (json.load(f) or []):
+                                if (isinstance(x, (list, tuple))
+                                        and len(x) == 4):
+                                    try:
+                                        gui.append(tuple(int(v) for v in x))
+                                    except (TypeError, ValueError):
+                                        continue
+                except Exception as cuowu:  # noqa
+                    logger.warning(f"视频工作台：搬旧区域历史失败 {cuowu}")
+                    gui = []
+                if gui:
+                    self._cun_lishi_quyu(gui)
             return gui[:QUYU_LISHI_TIAO]
         except Exception as cuowu:  # noqa
             logger.warning(f"视频工作台：读区域历史失败 {cuowu}")
@@ -6515,18 +6800,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         lishi = [x for x in self._du_lishi_quyu() if x != qu]
         lishi.insert(0, qu)
         lishi = lishi[:QUYU_LISHI_TIAO]
-        try:
-            import json
-
-            with open(
-                self._quyu_lishi_wenjian(), "w", encoding="utf-8"
-            ) as f:
-                json.dump(
-                    [list(x) for x in lishi], f,
-                    ensure_ascii=False, indent=2,
-                )
-        except Exception as cuowu:  # noqa
-            logger.warning(f"视频工作台：存区域历史失败 {cuowu}")
+        self._cun_lishi_quyu(lishi)
         self._zhuang_lishi_quyu(lishi)
 
     def _zhuang_lishi_quyu(self, lishi):
@@ -6565,6 +6839,7 @@ class ShezhiMianban(QtWidgets.QWidget):
             if dlg.exec_():
                 self.ocr_guolv = list(dlg.get_rules() or [])
                 logger.info(f"视频工作台：OCR 过滤规则 {len(self.ocr_guolv)} 条")
+                self._cun_ocr_kaiguan()
         except Exception as cuowu:  # noqa
             logger.error(f"视频工作台：过滤规则打不开 {cuowu}")
             QtWidgets.QMessageBox.warning(self, "提示", f"打不开：{cuowu}")

@@ -5,7 +5,7 @@ import shutil
 import tempfile
 import numpy as np
 
-from PyQt5.QtCore import Qt, QRect, QPoint
+from PyQt5.QtCore import Qt, QRect, QPoint, QSettings
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 from PyQt5.QtWidgets import (
     QFileDialog,
@@ -37,34 +37,116 @@ os.environ.setdefault("ORT_CUDNN_CONV_ALGO_SEARCH", "HEURISTIC")
 _ocr_model = None
 _ocr_model_path = None  # 当前加载的V6模型路径
 
-# OCR路径历史记录文件
+# OCR 路径历史：存在软件根目录的 gongzuotai.ini 里（项名 ocr/lishi），只留 10 条
+OCR_LISHI_JIAN = "ocr/lishi"
+OCR_LISHI_TIAO = 10
+# 老版本的历史（C 盘用户目录的 json），只用于第一次搬家
 OCR_PATH_HISTORY_FILE = osp.join(osp.expanduser("~"), ".ocr_path_history.json")
 
 
-def load_ocr_path_history():
-    """加载OCR路径历史记录"""
+def _gongzuotai_ini():
+    """软件根目录下的 gongzuotai.ini
+
+    本文件在 <软件根>/anylabeling/views/labeling/utils/ 下面，往上走五层就是根。
+    """
+    gen = osp.dirname(
+        osp.dirname(
+            osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__))))
+        )
+    )
+    pei = QSettings(osp.join(gen, "gongzuotai.ini"), QSettings.IniFormat)
+    pei.setIniCodec("UTF-8")
+    return pei
+
+
+def _lishi_yi_mingdan(zhi):
+    """ini 里取回来的一串路径（存的时候用换行拼成一条普通字符串）
+
+    读到 Qt 那种 @Variant(...) / @Invalid() 的怪格式就返回 None（当没存过，
+    好让上面重新搬一次、重写成普通字符串）。
+    """
+    if zhi is None:
+        return None
+    if isinstance(zhi, (list, tuple)):
+        ming = [str(x) for x in zhi]
+    else:
+        zhi = str(zhi)
+        if zhi.startswith("@"):
+            return None
+        if not zhi.strip():
+            return []
+        for fen in ("\n", ","):
+            if fen in zhi:
+                ming = [x.strip() for x in zhi.split(fen)]
+                break
+        else:
+            ming = [zhi]
+    return [x for x in ming if x.strip() and not x.startswith("@")]
+
+
+def _lu_yigui(lu):
+    """路径归一：分隔符统一成正斜杠
+
+    QSettings 往 ini 里写路径时会把反斜杠换成正斜杠，取出来就是 /。
+    判「是不是同一个文件」之前先按这个规矩归一，不然同一份会被记成两条。
+    """
+    lu = str(lu).strip()
+    if not lu:
+        return ""
+    return osp.normpath(lu).replace("\\", "/")
+
+
+def _du_jiu_lishi_json():
+    """老版本的历史（C 盘用户目录那个 json），只用于搬家进 ini"""
     import json
     try:
         if osp.exists(OCR_PATH_HISTORY_FILE):
-            with open(OCR_PATH_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                history = json.load(f)
-                return [p for p in history if osp.exists(p)]
+            with open(OCR_PATH_HISTORY_FILE, "r", encoding="utf-8") as f:
+                ji = json.load(f)
+            return [str(p) for p in ji if str(p).strip()]
+    except Exception:  # noqa
+        pass
+    return []
+
+
+def load_ocr_path_history():
+    """加载 OCR 路径历史（读 gongzuotai.ini 的 ocr/lishi）
+
+    第一次改过来时，老版本存在 C 盘用户目录的 json 会搬进 ini。
+    已经不存在的路径滤掉（文件删了 / 移走了就不占位置）。
+    """
+    try:
+        pei = _gongzuotai_ini()
+        if pei.contains(OCR_LISHI_JIAN):
+            lishi = _lishi_yi_mingdan(pei.value(OCR_LISHI_JIAN, None))
+        else:
+            lishi = None
+        if lishi is None:
+            # 没记过 / 之前存成了怪格式：从老 json 搬一次，重写成普通字符串
+            lishi = [p for p in _du_jiu_lishi_json() if osp.exists(p)]
+            pei.setValue(OCR_LISHI_JIAN, "\n".join(lishi[:OCR_LISHI_TIAO]))
+            pei.sync()
+        return [p for p in lishi if osp.exists(p)]
     except Exception as e:
         logger.warning(f"Failed to load OCR path history: {e}")
     return []
 
 
 def save_ocr_path_history(ocr_path):
-    """保存OCR路径到历史记录"""
-    import json
+    """保存 OCR 路径到历史（gongzuotai.ini）：同一条提到最前，只留 10 条，最旧的挤掉"""
     try:
-        history = load_ocr_path_history()
-        if ocr_path in history:
-            history.remove(ocr_path)
-        history.insert(0, ocr_path)
-        history = history[:10]
-        with open(OCR_PATH_HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
+        lishi = [_lu_yigui(p) for p in load_ocr_path_history()]
+        ocr_path = _lu_yigui(ocr_path)
+        if not ocr_path:
+            return
+        if ocr_path in lishi:
+            lishi.remove(ocr_path)
+        lishi.insert(0, ocr_path)
+        pei = _gongzuotai_ini()
+        # 用换行拼成一条普通字符串：QSettings 直接存列表会写成 @Variant(...)
+        # 那种怪格式，读不回来
+        pei.setValue(OCR_LISHI_JIAN, "\n".join(lishi[:OCR_LISHI_TIAO]))
+        pei.sync()
     except Exception as e:
         logger.warning(f"Failed to save OCR path history: {e}")
 
