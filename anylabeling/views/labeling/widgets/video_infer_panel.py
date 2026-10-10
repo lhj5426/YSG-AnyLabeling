@@ -101,6 +101,9 @@ _LIEBIAO_ZITI_JI = None         # 查到的字体名（空 = 还没查到，每�
 _LIEBIAO_ZITI_MEI_BAO = False   # "没找到"这句话报过没有（免得反复刷屏）
 ZIDONGHUA_PEIZHI_MING = "zimu_zidonghua.json"   # 老版本的自动化脚本配置（现已并进 gongzuotai.ini，这个名字只用于搬家）
 BUJU_PEIZHI_MING = "gongzuotai.ini"    # 视频工作台的全部记忆 / 配置都存这一个文件，放软件根目录
+TISHIYIN_MOREN = r"J:\A01\硬字幕压制完成.wav"   # 提取跑完播的提示音；想换默认就【只改这一行】
+TISHIYIN_PEIZHI = "tiqu/tishiyin_lu"    # 提示音路径记在 ini 里的项名
+TISHIYIN_KAI_PEIZHI = "tiqu/tishiyin_kai"   # 提示音开关记在 ini 里的项名
 CAOWEI_SHU = 12                 # 「说话人 + 样式」槽位个数（对 F1 ~ F12）
 KUOHAO_PAI_CHU_ZI = "旁白"      # 批量加「」：说话人 / 样式里含这几个词的，不套「」
 KUOHAO_PAI_CHU_FU = "「」『』（）()"   # 批量加「」：文本里已经有这些符号的，不再套「」
@@ -2424,11 +2427,35 @@ def _kuang_chu(wen):
     return str(wen or "").replace("\n", "")
 
 
+def _xuanzhong_shuzi_ma(shi):
+    """圈中的这一段是不是一个纯数字（整数 / 小数，可带正负号；前后空格不算）"""
+    return bool(re.fullmatch(r"\s*[-+]?\d+(\.\d+)?\s*", shi or ""))
+
+
+def _shuzi_jia(shi, liang):
+    """把这段数字加（减）一个量：前后空格、小数位数、负号都照旧
+
+    小数按原来的位数补零（0.5 加 1 还是 1.5、不是 1.500000001），整数就还是整数。
+    """
+    tou = shi[: len(shi) - len(shi.lstrip())]
+    wei = shi[len(shi.rstrip()):]
+    gan = shi.strip()
+    if "." in gan:
+        wei_shu = len(gan.split(".")[1])
+        xin = ("%." + str(wei_shu) + "f") % round(float(gan) + liang, wei_shu)
+    else:
+        xin = str(int(gan) + liang)
+    return tou + xin + wei
+
+
 class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
     """字幕编辑框：一离开焦点就说一声「这一条改完了」（好去重写字幕文件）
 
     Ctrl + 滚轮 = 改框里的字号（跟 Aegisub 那排字号一个意思），不带 Ctrl 的
     滚轮还是正常上下滚。字号写在样式里，不然压不住外面套的那套样式。
+
+    圈着一段数字时（比如 {\\pos(76,472)} 里的 472），滚轮上下就是加减这个数：
+    上滚 +1、下滚 -1，按着 Shift 一次走 10 —— 改完还圈着它，能连着滚。
 
     回车 = 换到下一条字幕（列表往下走一行）；Shift + 回车 = 在这条字幕里换行
     （落一个 \\N 标签 + 真换行）。
@@ -2488,16 +2515,47 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
         return self._zihao
 
     def wheelEvent(self, event):
-        if not (event.modifiers() & Qt.ControlModifier):
+        jian = event.modifiers()
+        gun = event.angleDelta().y()
+        # 圈着数字：滚轮就是加减这个数（不按 Ctrl 的那一路）
+        if not (jian & Qt.ControlModifier) and gun != 0:
+            if self._gun_gai_shuzi(
+                1 if gun > 0 else -1, bool(jian & Qt.ShiftModifier)
+            ):
+                event.accept()
+                return
+        if not (jian & Qt.ControlModifier):
             super().wheelEvent(event)
             return
-        gun = event.angleDelta().y()
         if gun == 0:
             super().wheelEvent(event)
             return
         self.shezhi_zihao(self._zihao + (1 if gun > 0 else -1))
         self._tan_zihao_ti()
         event.accept()
+
+    def _gun_gai_shuzi(self, bu, da_bu):
+        """滚轮改圈中的那个数字；改到了返回 True
+
+        没圈东西、或者圈的是一段字（标签、台词）就返回 False —— 滚轮该滚动还
+        滚动。数字原样替换，改完重新圈住新数字，所以能连着往上 / 往下滚。
+        """
+        kuang = self.textCursor()
+        if not kuang.hasSelection():
+            return False
+        jiu = kuang.selectedText()
+        if not _xuanzhong_shuzi_ma(jiu):
+            return False
+        xin = _shuzi_jia(jiu, (10 if da_bu else 1) * bu)
+        if xin == jiu:
+            return True                 # 数值没变（比如 0 加减 0 位）也算处理过了
+        qi = kuang.selectionStart()
+        kuang.insertText(xin)
+        kuang.setPosition(qi)
+        kuang.setPosition(qi + len(xin), QtGui.QTextCursor.KeepAnchor)
+        self.setTextCursor(kuang)
+        self.ensureCursorVisible()
+        return True
 
     def keyPressEvent(self, event):
         """回车 = 换到下一条字幕；Shift + 回车 = 在字幕里换行
@@ -5860,6 +5918,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.zhuang_lishi()             # 载入上次用过的检测模型
         self.zhuang_ocr_lishi()         # 载入上次用过的 OCR 模型
         self.zhuang_quyu_lishi()        # 载入框选过的区域
+        self.zhuang_tishiyin()          # 载入提取完的提示音设置
         self._shuaxin_lian_dong()
 
     # ------------------------------------------------------------------
@@ -6097,6 +6156,36 @@ class ShezhiMianban(QtWidgets.QWidget):
         hang.addWidget(self.gou_huamian_budong)
         hang.addStretch(1)
         bu.addLayout(hang)
+
+        # ---- 提取完提示音 ----
+        bu.addWidget(_biaoti_wenben("⑧ 提取完提示音"))
+        hang = QtWidgets.QHBoxLayout()
+        hang.setSpacing(6)
+        self.gou_tishiyin = QtWidgets.QCheckBox("提取完成后播放提示音")
+        self.gou_tishiyin.setChecked(True)
+        self.gou_tishiyin.setStyleSheet(_ys_xuanxiang())
+        self.gou_tishiyin.setToolTip(
+            "全片扫描跑完自动播一个 WAV，人不用守着屏幕等。"
+        )
+        self.gou_tishiyin.stateChanged.connect(self._cun_tishiyin)
+        hang.addWidget(self.gou_tishiyin)
+        hang.addStretch(1)
+        bu.addLayout(hang)
+
+        hang = QtWidgets.QHBoxLayout()
+        hang.setSpacing(6)
+        self.tishiyin_shuru = QtWidgets.QLineEdit()
+        self.tishiyin_shuru.setStyleSheet(_ys_shuru())
+        self.tishiyin_shuru.setPlaceholderText("提示音 WAV 文件路径")
+        self.tishiyin_shuru.editingFinished.connect(self._cun_tishiyin)
+        hang.addWidget(self.tishiyin_shuru, 1)
+        self.a_tishiyin = QtWidgets.QPushButton("选择 WAV…")
+        self.a_tishiyin.setStyleSheet(_ys_ci_anniu())
+        self.a_tishiyin.clicked.connect(self._xuan_tishiyin)
+        hang.addWidget(self.a_tishiyin)
+        bu.addLayout(hang)
+        self.tishiyin_wenben = _zici_wenben("")
+        bu.addWidget(self.tishiyin_wenben)
 
         hang = QtWidgets.QHBoxLayout()
         hang.setSpacing(6)
@@ -6487,6 +6576,77 @@ class ShezhiMianban(QtWidgets.QWidget):
         )
         if mulu:
             self.shuchu_shuru.setText(mulu)
+
+    # ------------------------------------------------------------------
+    # 提取完提示音
+    # ------------------------------------------------------------------
+    def _xuan_tishiyin(self):
+        """挑一个 WAV 当「提取完成」的提示音"""
+        qi = self.tishiyin_shuru.text().strip()
+        if not qi or not osp.exists(qi):
+            qi = TISHIYIN_MOREN
+        lujing, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择提示音（WAV）", osp.dirname(qi) or qi,
+            "WAV 音频 (*.wav);;所有文件 (*)",
+        )
+        if lujing:
+            self.tishiyin_shuru.setText(lujing)
+            self._cun_tishiyin()
+
+    def _shuaxin_tishiyin_wenben(self):
+        """底下那行小字：选的文件在不在，一眼能看出来"""
+        lu = self.tishiyin_shuru.text().strip()
+        if not lu:
+            self.tishiyin_wenben.setText("还没选提示音文件 —— 跑完不会响")
+        elif osp.exists(lu):
+            self.tishiyin_wenben.setText("找到：" + osp.basename(lu))
+        else:
+            self.tishiyin_wenben.setText("找不到这个文件：" + lu)
+
+    def _cun_tishiyin(self, *_):
+        """勾了 / 改了路径就立刻存进 gongzuotai.ini，下次开软件还在"""
+        self._shuaxin_tishiyin_wenben()
+        try:
+            pei = buju_qsettings()
+            pei.setValue(TISHIYIN_KAI_PEIZHI, bool(self.gou_tishiyin.isChecked()))
+            pei.setValue(TISHIYIN_PEIZHI, self.tishiyin_shuru.text().strip())
+            pei.sync()
+        except Exception as cuowu:      # noqa
+            logger.warning(f"视频工作台：存提示音设置失败 {cuowu}")
+
+    def zhuang_tishiyin(self):
+        """开面板时把上次的提示音设置摆回去；没存过就用默认那条"""
+        kai = True
+        lu = TISHIYIN_MOREN
+        try:
+            pei = buju_qsettings()
+            zhi = pei.value(TISHIYIN_KAI_PEIZHI, None)
+            if zhi is not None:
+                kai = str(zhi).strip().lower() in ("true", "1", "yes", "是")
+            zhi = pei.value(TISHIYIN_PEIZHI, None)
+            if zhi is not None:
+                lu = str(zhi)
+        except Exception as cuowu:      # noqa
+            logger.warning(f"视频工作台：读提示音设置失败 {cuowu}")
+        self.gou_tishiyin.setChecked(kai)
+        self.tishiyin_shuru.setText(lu)
+        self._shuaxin_tishiyin_wenben()
+
+    def bo_wancheng_tishiyin(self):
+        """提取跑完叫一声：开着开关、文件也在 才播（异步，不卡界面）"""
+        if not self.gou_tishiyin.isChecked():
+            return
+        lu = self.tishiyin_shuru.text().strip()
+        if not lu or not osp.exists(lu):
+            logger.warning(f"视频工作台：提示音文件找不到，没播 {lu}")
+            return
+        try:
+            import winsound
+
+            winsound.PlaySound(lu, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            logger.info(f"视频工作台：跑完提示音 {osp.basename(lu)}")
+        except Exception as cuowu:      # noqa
+            logger.warning(f"视频工作台：提示音放不出来 {cuowu}")
 
     # ------------------------------------------------------------------
     # 开始 / 停止
