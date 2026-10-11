@@ -70,6 +70,7 @@ from anylabeling.views.labeling.widgets.video_infer_panel import (
     buju_qsettings,
     du_zidonghua_peizhi,
     ms_tou_zhen,
+    qing_kong_shuchu,
     wen_shi_fou,
     zhen_tou_ms,
     zimu_charu_weizhi,
@@ -118,6 +119,9 @@ GUNDONG_BU_BI = 0.1               # 时间轴上滚一格滚轮，视野往左�
 BO_FANGDA_MOREN = 1.0             # 波形振幅缩放：1 = 原样，越大波形越饱满
 BO_FANGDA_ZUI_XIAO = 0.2          # 波形振幅缩放最小倍数
 BO_FANGDA_ZUIDA = 50.0            # 波形振幅缩放最大倍数
+QUYU_SHOU_RONG = 6                # 检测区域框「抓边」的容差（屏幕像素）：鼠标离框线这么近
+                                  # 就算抓住了那条边 / 那个角，拖着就能改大小（嫌难点就加大）
+QUYU_ZUI_XIAO = 16                # 拖检测区域时最小留多大（视频原始像素），别拖成一条线
 YANSE_QUYU = "#00E5FF"            # 检测区域框颜色（在视频画面上框选时）
 YANSE_ZHEMO = "#FF8A00"           # 字幕遮罩（\clip）框颜色，跟检测区域区分开
 YANSE_DINGWEI = "#FFC800"         # 拖放模式：锚点方块的颜色（选中的那条）
@@ -1927,6 +1931,9 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         self._shipin_gao = 0
         self._kuang = []             # 检测框 [(名字, 分数, (x1,y1,x2,y2))] 原始像素
         self._quyu = None            # 检测区域 (x,y,w,h) 原始像素；None = 整图
+        self._zai_tuo_quyu = False   # 正按着检测区域的边 / 角 / 框里拖
+        self._quyu_shou = None       # 鼠标压在检测区域的哪儿（"l"/"r"/"t"/"b"/"lt"… / "nei"）
+        self._tuo_quyu_qi = None     # 拖检测区域按下那一刻的账（手柄 / 起始框 / 按点）
         self._zimu = []              # 现在要叠在画面上的字幕（外面算好塞进来）
         self._zimu_jizhun = HUA_ZIMU_JIZHUN   # 字幕坐标的基准分辨率
         self._zai_kuang_xuan = False  # 是否正处于框选状态
@@ -1987,6 +1994,9 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         self._kuang_xuan_yong = yong
         self._tuo_qi = None
         self._tuo_dao = None
+        self._zai_tuo_quyu = False    # 别让"拖旧框"半路插进来
+        self._tuo_quyu_qi = None
+        self._quyu_shou = None
         self.setCursor(Qt.CrossCursor)
         self.update()
 
@@ -1994,6 +2004,9 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         self._zai_kuang_xuan = False
         self._tuo_qi = None
         self._tuo_dao = None
+        self._zai_tuo_quyu = False
+        self._tuo_quyu_qi = None
+        self._quyu_shou = None
         # 松手后光标照 AEG：就是系统箭头，不搞小手（两种鼠标模式都一样）
         self.setCursor(Qt.ArrowCursor)
         self.update()
@@ -2226,6 +2239,109 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
             max(0.0, min(float(ih), y)),
         )
 
+    def _quyu_kongjian_ju(self):
+        """检测区域 -> 屏幕坐标 (x1, y1, x2, y2)；没区域 / 没画面返回 None"""
+        qu = self._quyu
+        if not qu:
+            return None
+        mubiao = self.mubiao_qu()
+        if mubiao.width() <= 0:
+            return None
+        iw = self._shipin_kuan
+        if iw <= 0 and self._tupian is not None and not self._tupian.isNull():
+            iw = self._tupian.width()
+        if iw <= 0:
+            return None
+        bi = mubiao.width() / float(iw)
+        x1 = mubiao.left() + qu[0] * bi
+        y1 = mubiao.top() + qu[1] * bi
+        return (x1, y1, x1 + qu[2] * bi, y1 + qu[3] * bi)
+
+    def _quyu_shou_ming(self, dian):
+        """鼠标压在检测区域的哪儿：边（"l"/"r"/"t"/"b"）/ 角（俩拼起来）/ "nei"（框里）
+
+        没设检测区域、或鼠标没挨着它，返回 None。
+        """
+        ju = self._quyu_kongjian_ju()
+        if ju is None:
+            return None
+        x1, y1, x2, y2 = ju
+        x = float(dian.x())
+        y = float(dian.y())
+        rong = QUYU_SHOU_RONG
+        if x < x1 - rong or x > x2 + rong or y < y1 - rong or y > y2 + rong:
+            return None
+        ming = ""
+        if abs(y - y1) <= rong:
+            ming += "t"
+        if abs(y - y2) <= rong:
+            ming += "b"
+        if abs(x - x1) <= rong:
+            ming += "l"
+        if abs(x - x2) <= rong:
+            ming += "r"
+        if not ming:
+            # 框里面：拖放模式下这块要留给锚点方块 / 矢量图手柄，不抢
+            return None if self._shu_biao_mo == "tuofang" else "nei"
+        return ming
+
+    def _tuo_quyu_dao(self, dian):
+        """按着的手柄把检测区域改到鼠标这儿（dian = 视频原始像素）
+
+        框里拖 = 整体挪，尺寸不变；边 / 角拖 = 只动那一条边。
+        最小留 QUYU_ZUI_XIAO 像素，别拖成一条线；整体挪不让框出画面。
+        """
+        qi = self._tuo_quyu_qi
+        yuan = self.yuan_chicun()
+        if qi is None or dian is None or yuan is None:
+            return
+        iw, ih = float(yuan[0]), float(yuan[1])
+        qx, qy, qw, qh = (float(v) for v in qi["qu"])
+        x, y = float(dian[0]), float(dian[1])
+        if qi["shou"] == "nei":
+            nx = min(max(0.0, qx + (x - qi["an_x"])), max(0.0, iw - qw))
+            ny = min(max(0.0, qy + (y - qi["an_y"])), max(0.0, ih - qh))
+            self._quyu = (
+                int(round(nx)), int(round(ny)),
+                int(round(qw)), int(round(qh)),
+            )
+            return
+        shou = qi["shou"]
+        x2 = qx + qw
+        y2 = qy + qh
+        zui = float(QUYU_ZUI_XIAO)
+        if "l" in shou:
+            qx = min(max(0.0, x), x2 - zui)
+        if "r" in shou:
+            x2 = max(min(iw, x), qx + zui)
+        if "t" in shou:
+            qy = min(max(0.0, y), y2 - zui)
+        if "b" in shou:
+            y2 = max(min(ih, y), qy + zui)
+        self._quyu = (
+            int(round(qx)), int(round(qy)),
+            int(round(x2 - qx)), int(round(y2 - qy)),
+        )
+
+    def _geng_xin_quyu_guangbiao(self, dian):
+        """鼠标挨着检测区域就把光标换成对应形状（离开换回系统箭头）"""
+        shou = self._quyu_shou_ming(dian)
+        if shou == self._quyu_shou:
+            return
+        self._quyu_shou = shou
+        if shou is None:
+            self.setCursor(Qt.ArrowCursor)
+        elif shou == "nei":
+            self.setCursor(Qt.SizeAllCursor)
+        elif ("t" in shou and "l" in shou) or ("b" in shou and "r" in shou):
+            self.setCursor(Qt.SizeFDiagCursor)
+        elif ("t" in shou and "r" in shou) or ("b" in shou and "l" in shou):
+            self.setCursor(Qt.SizeBDiagCursor)
+        elif "l" in shou or "r" in shou:
+            self.setCursor(Qt.SizeHorCursor)
+        else:
+            self.setCursor(Qt.SizeVerCursor)
+
     def _tuo_chu_de_qu(self):
         """拖出来的矩形 -> (x,y,w,h) 原始像素；太小当没拖"""
         if self._tuo_qi is None or self._tuo_dao is None:
@@ -2263,6 +2379,23 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
 
     # ---- 鼠标：框选 / 拖放 ----
     def mousePressEvent(self, event):
+        if not self._zai_kuang_xuan and event.button() == Qt.LeftButton:
+            # 已经画好的检测区域：鼠标压在它的边 / 角 / 框里就能直接拖着改，
+            # 不用再点一次「框选区域」重画一遍
+            shou = self._quyu_shou_ming(event.pos())
+            if shou is not None:
+                dian = self._dao_yuanshi(event.pos())
+                if dian is not None and self._quyu:
+                    self._zai_tuo_quyu = True
+                    self._quyu_shou = shou
+                    self._tuo_quyu_qi = {
+                        "shou": shou,
+                        "qu": tuple(self._quyu),
+                        "an_x": float(dian[0]),
+                        "an_y": float(dian[1]),
+                    }
+                    event.accept()
+                    return
         if self._zai_kuang_xuan and event.button() == Qt.LeftButton:
             dian = self._dao_yuanshi(event.pos())
             if dian is not None:
@@ -2301,6 +2434,13 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._zai_tuo_quyu:
+            dian = self._dao_yuanshi(event.pos())
+            if dian is not None:
+                self._tuo_quyu_dao(dian)
+                self.update()
+            event.accept()
+            return
         if self._zai_kuang_xuan and self._tuo_qi is not None:
             dian = self._dao_yuanshi(event.pos())
             if dian is not None:
@@ -2324,6 +2464,13 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
                 self.update()
             event.accept()
             return
+        if (
+            not self._zai_kuang_xuan
+            and not self._zai_tuo_kuang
+            and not self._zai_tuo_pos
+        ):
+            # 没在干别的：鼠标挨着检测区域就换光标，暗示这儿能拖
+            self._geng_xin_quyu_guangbiao(event.pos())
         super().mouseMoveEvent(event)
 
     @staticmethod
@@ -2342,6 +2489,10 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
 
         拖放模式不认双击 —— 那会儿鼠标是拿来拖锚点的；框选期间也不认。
         """
+        # 双击的头一下会先按一次左键，可能刚把"拖检测区域"点起来；双击这里收掉，
+        # 免得接着一动鼠标把检测区域也拖走了
+        self._zai_tuo_quyu = False
+        self._tuo_quyu_qi = None
         if (
             self._shu_biao_mo == "biaozhun"
             and not self._zai_kuang_xuan
@@ -2353,6 +2504,19 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._zai_tuo_quyu and event.button() == Qt.LeftButton:
+            # 松开才往外报：拖的过程中只在自己这儿动，松手这一下才真生效。
+            # 区域一点没变（只是点了一下）就不报，免得白记一条历史。
+            qi = self._tuo_quyu_qi
+            qu = tuple(self._quyu) if self._quyu else None
+            yuan = tuple(qi["qu"]) if qi else None
+            self._zai_tuo_quyu = False
+            self._tuo_quyu_qi = None
+            if qu and qu != yuan:
+                self.quyu_bian.emit(qu)
+            self.update()
+            event.accept()
+            return
         if self._zai_tuo_kuang and event.button() == Qt.LeftButton:
             self._zai_tuo_kuang = False
             self.setCursor(Qt.ArrowCursor)   # 照 AEG：松手也是系统箭头
@@ -2460,6 +2624,10 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         """更新检测框（视频原始像素坐标），空列表 = 清掉"""
         self._kuang = list(kuang or [])
         self.update()
+
+    def dangqian_kuang(self):
+        """画面现在正显示着的那几个检测框（跟随播放要用：没检测的帧别把它擦了）"""
+        return list(self._kuang)
 
     def qingkong_kuang(self):
         if self._kuang:
@@ -2903,7 +3071,11 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         return tu
 
     def _hua_quyu(self, huabi, mubiao):
-        """画检测区域：只有一圈虚线框，不动画面；正在拖的时候显示拖出来的框"""
+        """画检测区域：区域以外涂黑，只留检测区域那一块（跟 VideoSubFinder 一样）
+
+        没设检测区域（也没在拖）的时候整幅照旧显示，什么都不遮。
+        正在拖的时候显示拖出来的框，遮罩跟着一起动，所见即所得。
+        """
         qu = self._quyu
         se = YANSE_QUYU
         if self._zai_kuang_xuan and self._tuo_qi is not None:
@@ -2920,14 +3092,37 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         if iw <= 0:
             return
         bi = mubiao.width() / float(iw)
-        x1 = mubiao.left() + qu[0] * bi
-        y1 = mubiao.top() + qu[1] * bi
-        w = qu[2] * bi
-        h = qu[3] * bi
+        # 夹在画面里：拖出界也不让遮罩翻边
+        bian_you = float(mubiao.left() + mubiao.width())
+        bian_xia = float(mubiao.top() + mubiao.height())
+        x1 = max(float(mubiao.left()), min(bian_you, mubiao.left() + qu[0] * bi))
+        y1 = max(float(mubiao.top()), min(bian_xia, mubiao.top() + qu[1] * bi))
+        x2 = max(x1, min(bian_you, x1 + qu[2] * bi))
+        y2 = max(y1, min(bian_xia, y1 + qu[3] * bi))
+        w = x2 - x1
+        h = y2 - y1
+
+        # 检测区域以外涂黑：只留这一块画面看得见
+        huabi.setPen(Qt.NoPen)
+        huabi.setBrush(QtGui.QColor(0, 0, 0))
+        for kuai in (
+            QtCore.QRectF(
+                mubiao.left(), mubiao.top(), mubiao.width(), y1 - mubiao.top()
+            ),
+            QtCore.QRectF(
+                mubiao.left(), y2, mubiao.width(), bian_xia - y2
+            ),
+            QtCore.QRectF(mubiao.left(), y1, x1 - mubiao.left(), h),
+            QtCore.QRectF(x2, y1, bian_you - x2, h),
+        ):
+            if kuai.width() > 0 and kuai.height() > 0:
+                huabi.drawRect(kuai)
+        huabi.setBrush(Qt.NoBrush)
+
+        # 再框一圈虚线
         bi_hu = QtGui.QPen(QtGui.QColor(se), 2)
         bi_hu.setStyle(Qt.DashLine)
         huabi.setPen(bi_hu)
-        huabi.setBrush(Qt.NoBrush)
         huabi.drawRect(QtCore.QRectF(x1, y1, w, h))
 
     def _hua_kuang(self, huabi, mubiao):
@@ -6463,6 +6658,8 @@ class ShijianZhou(QtWidgets.QWidget):
 
         # 字幕块（硬字幕提取出来的），叠在波形下半截
         self._zimu = []                 # [(起ms, 止ms, 文字), ...]
+        self._jinxing = None            # 提取中「还没收尾」那一段：(起ms, 当前ms, 文字)
+                                        # 只画在实时层，不进 _zimu（不写 SRT / 不进撤销）
         self._zimu_tao = []             # 每块字幕摆在第几行（0 起，自己挪的）
         self._kuai_yanse = []           # 每块字幕的底色（外面按说话人用的样式色喂进来的）；None = 默认蓝
         self._xuan_zhong = -1           # 主选是第几段（跟右侧字幕列表对齐）
@@ -6548,6 +6745,22 @@ class ShijianZhou(QtWidgets.QWidget):
         self._zai_kuai = None       # 块变了，播放头压着哪几块重新认
         self.update()
 
+    def shezhi_jinxing(self, tiao):
+        """提取中「正在讲的这一段」：入点先把块画上，出点跟着往后长
+
+        tiao = (起ms, 当前ms, 文字) 或 None（收发尾那条 / 停了就传 None）。
+
+        这条只画在实时层，不进 _zimu —— 它每处理一帧就变一次，塞进真账
+        （字幕列表 / SRT / 撤销）会跟着乱；等收尾那条来了，真块才落下来。
+        """
+        xin = None
+        if tiao:
+            xin = (int(tiao[0]), int(tiao[1]), str(tiao[2] or ""))
+        if xin == self._jinxing:
+            return
+        self._jinxing = xin
+        self.update()
+
     def shezhi_kuai_yanse(self, men):
         """整表喂进每块字幕的底色（外面按说话人那个样式的主文字色算好）
 
@@ -6618,6 +6831,7 @@ class ShijianZhou(QtWidgets.QWidget):
         self.update()
 
     def qingkong_zimu(self):
+        self.shezhi_jinxing(None)
         if self._zimu:
             self._zimu = []
             self._zimu_tao = []
@@ -7195,7 +7409,9 @@ class ShijianZhou(QtWidgets.QWidget):
         # 先贴静层：背景、波形、刻度、字幕块、重叠标记这些不跟鼠标走的东西，
         # 全在这张现成的图里（Qt 只合成要擦的那一小块，所以擦一条窄带就只贴一条）
         huabi.drawPixmap(0, 0, self._jing_tu())
-        # 再画实时层：播放头、它正压着的那块、鼠标悬停的高亮、吸附线、鼠标处的时间线
+        # 再画实时层：提取中「正在讲的那一段」、播放头、它正压着的那块、
+        # 鼠标悬停的高亮、吸附线、鼠标处的时间线
+        self._hua_jinxing(huabi, qu)
         self._hua_kuai_zai(huabi, qu)
         self._hua_bofangtou(huabi, qu)
         self._hua_xuanfu_zimu(huabi, qu)
@@ -7679,6 +7895,67 @@ class ShijianZhou(QtWidgets.QWidget):
                     wen,
                 )
         huabi.setBrush(Qt.NoBrush)
+
+    def _hua_jinxing(self, huabi, qu):
+        """画「正在讲的这一段」：一条还在长的活块
+
+        跟真块一样压在波形上、走同一套行高位置，只是描边用主题色 —— 一眼
+        分得开「这条还在长」和「这条已经收尾了」。收尾那条一到就撤掉。
+        """
+        if self._jinxing is None or self._shichang <= 0 or qu.width() <= 0:
+            return
+        qi, zhi, wenben = self._jinxing
+        tiao = self._zimu_qu(qu)
+        hang_qu = self._zimu_hang_kuang(tiao, 0, max(1, self._zimu_hang_shu()))
+        x1 = self._ms_to_x(qi)
+        x2 = self._ms_to_x(zhi)
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if x2 - x1 < 3:
+            x2 = x1 + 3
+        kuai = QtCore.QRect(x1, hang_qu.top(), max(1, x2 - x1), hang_qu.height())
+        kuai = kuai.intersected(tiao)
+        if kuai.width() <= 0:
+            return
+        yanse = QtGui.QColor(YANSE_ZIMU)
+        yanse.setAlpha(ZIMU_TOUMING_DU)
+        huabi.setPen(Qt.NoPen)
+        huabi.fillRect(kuai, yanse)
+        # 描一圈主题色：跟已收尾的块（那两种深色描边）一眼分开
+        bian = QtGui.QColor(_ys()["zhuse"])
+        kuan_bi = self.ZIMU_BIAN_KUAN_DU + 1
+        huabi.fillRect(
+            QtCore.QRect(kuai.left(), kuai.top(), kuai.width(), kuan_bi), bian
+        )
+        huabi.fillRect(
+            QtCore.QRect(
+                kuai.left(), kuai.bottom() - kuan_bi + 1, kuai.width(), kuan_bi
+            ),
+            bian,
+        )
+        huabi.fillRect(
+            QtCore.QRect(kuai.left(), kuai.top(), kuan_bi, kuai.height()), bian
+        )
+        huabi.fillRect(
+            QtCore.QRect(
+                kuai.right() - kuan_bi + 1, kuai.top(), kuan_bi, kuai.height()
+            ),
+            bian,
+        )
+        if wenben and kuai.width() > 44 and kuai.height() >= 12:
+            jiu_ziti = huabi.font()
+            ziti = QtGui.QFont(jiu_ziti)
+            ziti.setPointSize(8)
+            huabi.setFont(ziti)
+            huabi.setPen(_kuai_zi_yanse(yanse))
+            huabi.drawText(
+                kuai.adjusted(3, 0, -3, 0),
+                Qt.AlignVCenter | Qt.AlignLeft,
+                huabi.fontMetrics().elidedText(
+                    wenben, Qt.ElideRight, kuai.width() - 6
+                ),
+            )
+            huabi.setFont(jiu_ziti)
 
     def _hua_qiepian_dian(self, huabi, qu):
         """预览切片点：在每块字幕内部画一根紫线，标出真正会截图的那一刻
@@ -9278,6 +9555,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 「播放当前块」先跳到块头，等这次定位落地了才开播（不然是接着老位置
         # 往下播，跳过去那一下的画面后面才出来 —— 重播时会先闪一下上一趟停的地方）
         self._deng_luo_bofang = False
+        # 这一趟「跟随播放」提取开始时的播放是不是我们自己开的：是的话，点停止
+        # 就顺手把视频也停了（用户按开始前视频本来就在播的，不动它）
+        self._wo_kai_de_bofang = False
         self._zimu_tiao_wen = None   # 字幕条现在显示的是哪句话（避免每帧重设）
         # 撤销 / 重做（照 AEG）：一步存一整版字幕的快照，Ctrl+Z 往回退、Ctrl+Y 再往前。
         # 栈里的元素 = (说明, 快照, 动作类别, 时刻)；快照 = (字幕表, 字段表, 选中行)。
@@ -12304,6 +12584,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
             return
         try:
             os.makedirs(shuchu, exist_ok=True)
+            # 上一轮留下的图和 JSON 先清了，这一轮重新生成 ——
+            # 不清就会一轮一轮往上堆（试一次多几百上千个文件）
+            qing_kong_shuchu(shuchu)
         except OSError as cuowu:
             QtWidgets.QMessageBox.critical(
                 self, "错误", f"建不了输出目录：\n{cuowu}"
@@ -12364,6 +12647,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self.shezhi_mianban.zhuangtai_shezhi("跟随播放中…")
             if not self.zhengzai_bofang:
                 self._bofang()
+                # 这一趟的播是我们替用户开的：点停止时一并停掉（见 _tingzhi_yunsuan）
+                self._wo_kai_de_bofang = bool(self.zhengzai_bofang)
         else:
             self._zanting()
             self.yunsuan = SaomiaoXiancheng(
@@ -12484,17 +12769,54 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._shoudao_zhen(zhen_rgb, zhen_hao)
         self.huamian.shezhi_kuang(kuang)
 
-    def _shoudao_tuili_jieguo(self, zhen_hao, kuang, xin_zimu):
-        """一帧处理完：画框 + 记字幕段"""
-        self.huamian.shezhi_kuang(kuang)
+    def _saomiao_pingmu_jingzhi(self):
+        """全片扫描 + 勾了「扫描时画面静止」：画面上不贴检测框
+
+        扫描线程那边已经不往画面上塞整帧图了，但每收一条字幕段还会单独
+        贴一次框、整幅重画。这里把这条也一并关掉，勾上静止就是真静止。
+        """
+        return isinstance(self.yunsuan, SaomiaoXiancheng) and bool(
+            getattr(self.yunsuan, "hua_mian_bu_dong", False)
+        )
+
+    def _shoudao_tuili_jieguo(self, zhen_hao, kuang, xin_zimu, jinxing=None):
+        """一帧处理完：先记字幕段，再画框
+
+        字幕段抢在最前头记：画框那两步万一出岔子，也不能连累字幕块。
+        jinxing = 正在讲的这一段（还没收尾）：拿它在入点把块先画上、出点跟着
+        往后长；收尾那条一到，jinxing 变回 None，那条预览就撤掉。
+        """
         if xin_zimu is not None:
-            self._jia_zimu_kuai(*xin_zimu)
+            self._shou_xin_zimu(xin_zimu)
+        try:
+            if self._saomiao_pingmu_jingzhi():
+                # 勾了「扫描时画面静止」：画面本来就不刷，这条活的块也没处看，撤掉
+                self.shijianzhou.shezhi_jinxing(None)
+            else:
+                self.shijianzhou.shezhi_jinxing(jinxing)
+        except Exception as cuowu:  # noqa
+            logger.error(f"视频工作台：更新进行中的字幕块失败 {cuowu}")
+        try:
+            if not self._saomiao_pingmu_jingzhi():
+                # 跟随播放：这一帧没检测出框，就接着显示上一次的框，一直显示到
+                # 下一次真检测出框才换掉。不这么办的话，没框的那一帧会顺手把
+                # 上一次的框擦掉 —— 画面上看着就是「框闪一下就没了」。
+                if self.yunsuan_moshi == "gensui" and not kuang:
+                    kuang = self.huamian.dangqian_kuang()
+                self.huamian.shezhi_kuang(kuang)
+        except Exception as cuowu:  # noqa
+            logger.error(f"视频工作台：画面上贴检测框失败 {cuowu}")
         if self.chuliqi is None:
             return
         if self.yunsuan_moshi == "gensui":
+            shu = 0
+            try:
+                shu = self.zimu_mianban.zimu_shu()
+            except Exception:  # noqa
+                pass
             self.shezhi_mianban.zhuangtai_shezhi(
                 f"跟随播放中 · 本帧 {len(kuang or [])} 个目标 · "
-                f"已存 {self.chuliqi.yi_cun} 张"
+                f"已存 {self.chuliqi.yi_cun} 张 · 字幕 {shu} 条"
             )
 
     # ---- 字幕编辑页的列表：样式 / 说话人从打开时那份 ASS 里认 ----
@@ -12940,6 +13262,33 @@ class VideoWorkDialog(QtWidgets.QDialog):
         )
         _hang, gs = _jie_ass_tiao(wen, ge, biao)
         return gs
+
+    def _shou_xin_zimu(self, xin_zimu):
+        """一段字幕出来了：新增一条，或者并回上一条
+
+        (起, 止, 文字)        -> 新增
+        (起, 止, 文字, True)  -> 提字幕那边说「跟上一段是同一句」（中途断了一下），
+                                 改上一条，不新增
+        """
+        if len(xin_zimu) >= 4 and xin_zimu[3]:
+            self._he_dao_shang_yi_tiao(xin_zimu[0], xin_zimu[1], xin_zimu[2])
+        else:
+            self._jia_zimu_kuai(*xin_zimu[:3])
+
+    def _he_dao_shang_yi_tiao(self, qi_ms, zhi_ms, wenben):
+        """把这一段的起止和文字改到上一条字幕上（提取时同一句被拆成两段走这儿）
+
+        不新增行、不写文件 —— 提取还在跑，SRT / ASS 跑完统一定。
+        """
+        shu = self.zimu_mianban.zimu_shu()
+        if shu <= 0:
+            self._jia_zimu_kuai(qi_ms, zhi_ms, wenben)
+            return
+        xu = shu - 1
+        self.zimu_mianban.gai_zimu_shijian(xu, qi_ms, zhi_ms)
+        self.zimu_mianban.gai_zimu_wenben(xu, wenben)
+        self.shijianzhou.shezhi_zimu(self.zimu_mianban.zimu_liebiao())
+        self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao(), xu)
 
     def _jia_zimu_kuai(self, qi_ms, zhi_ms, wenben):
         """新建一条字幕：三处（硬字幕列表 / 底部时间轴 / 字幕编辑列表）一起加
@@ -15255,16 +15604,31 @@ class VideoWorkDialog(QtWidgets.QDialog):
             # 线程真停了才丢引用：还在跑就被回收，Qt 会直接崩
             if not self.yunsuan.isRunning():
                 self.yunsuan = None
+
+        # 跟随播放：这一趟的播是开始提取时我们自己替用户开的，停止就一并停掉。
+        # 用户按开始前视频本来就在播的（不是我们开的），不动它。
+        if (
+            self.yunsuan_moshi == "gensui"
+            and self._wo_kai_de_bofang
+            and self.mpv is not None
+        ):
+            try:
+                self._zanting()
+            except Exception as cuowu:  # noqa
+                logger.error(f"视频工作台：停止时暂停播放失败 {cuowu}")
+        self._wo_kai_de_bofang = False
+
         self._tingzhi_tuili_qu()
         # 扫描时画面是一帧帧贴上去的（老路）；停了交还给 mpv
         self.huamian.qingkong()
+        self.shijianzhou.shezhi_jinxing(None)   # 停了：那条「正在长的块」撤掉
 
         # 跟随播放这一路的最后一段要在停止时补收尾
         if self.chuliqi is not None and self.yunsuan_moshi == "gensui":
             try:
                 xin = self.chuliqi.jie_shu()
                 if xin is not None:
-                    self._jia_zimu_kuai(*xin)
+                    self._shou_xin_zimu(xin)
                 if self.chuliqi.yong_ocr and self.chuliqi.shuchu_mulu:
                     self.chuliqi.xie_zimu_wenjian(self.chuliqi.shuchu_mulu)
             except Exception as cuowu:  # noqa
@@ -15296,11 +15660,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._tingzhi_tuili_qu()
         # 扫描时画面是一帧帧贴上去的（老路）；扫完交还给 mpv
         self.huamian.qingkong()
+        self.shijianzhou.shezhi_jinxing(None)   # 扫完：那条「正在长的块」撤掉
         yi_cun = self.chuliqi.yi_cun if self.chuliqi is not None else 0
         zimu = self.zimu_mianban.zimu_shu()
         chu = f"{shuoming} · 已存 {yi_cun} 张 · 字幕 {zimu} 条"
         if wenjian:
             chu += f" · 已写出 {len(wenjian)} 个字幕文件"
+        yong = self.shezhi_mianban.tiqu_yongshi()
+        if yong:
+            chu += f" · 用时 {yong}"
         self.shezhi_mianban.zhuangtai_shezhi(chu)
         if chenggong:
             # 跑完了响一声（开关和 WAV 路径都在设置面板「⑧ 提取完提示音」那块）

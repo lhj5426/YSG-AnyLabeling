@@ -25,6 +25,7 @@ import math
 import os
 import os.path as osp
 import re
+import shutil
 import time
 from collections import Counter
 
@@ -69,6 +70,17 @@ ZIMU_ZUI_DUAN_MIAO = 300        # 字幕段最短时长；比这短的丢掉（�
 ZHEN_CHA_YUZHI = 0.02           # 跳相似帧的阈值：低于它认为和上一张一样，不存（设 0 = 全存）
 JINGZHI_CHA_YUZHI = 0.002       # 静止画面阈值：和上一帧的差异低于它就当画面没动，
                                 # 这一帧不重复跑检测和 OCR（画面没动 = 字幕没动，结果必然一样）
+OCR_KUAI_CHA_YUZHI = 0.002      # 「框内那块图变没变」的阈值：差得低于它就算没变，
+                                # 直接把上次 OCR 的文字接上，这一步不再调 OCR
+OCR_KUAI_BIAN_CHANG = 64        # 框内小样缩成多宽（只看「换没换字」，不用看清笔画）
+OCR_KUAI_BIAN_GAO = 32          # 框内小样缩成多高
+CHUSHAI_JIAN_GE_ZHEN = 5        # 面板「兜底帧数」的默认值（面板上能改、会存 ini）：
+                                # 筛帧时字幕没变最多连跳几帧，就强制放行一帧跑 YOLO 兜底
+YOLO_JIANCE_JIANGE_MOREN = 10   # 面板「检测间隔」的默认值（面板上能改、会存 ini）：
+                                # 快速模式下 YOLO 每 N 帧至少跑一次（不看字幕在不在），
+                                # 全画面时新字幕冒头就靠它探到；调大更快、更容易漏
+HEBING_JIAN_GE_MS = 300         # 相邻两段字幕之间断开不超过这么多毫秒、文字又像，
+                                # 就当是同一句被拆成了两段，并回上一条（见 _jie_duan）
 TUPIAN_ZHILIANG = 95            # 存图 JPG 质量
 JIAO_BEN_HAO = "1.0.0"          # 写进 JSON 的 version
 RENGONG_BIANJI = False          # 写进 JSON 的 manually_edited
@@ -122,6 +134,9 @@ TIQU_JIANCE_JIANGE = "tiqu/jiance_jiange"  # ③ 每 N 帧
 TIQU_KUAISU = "tiqu/kuaisu"               # ⑤ 快速模式
 TIQU_TIAOXIANGSI = "tiqu/tiaoxiangsi"     # ⑤ 跳过相似帧
 TIQU_TIAOSHI = "tiqu/tiaoshi"             # ⑤ 调试模式
+TIQU_SHAIZHEN = "tiqu/shaizhen"           # ⑤ 筛帧加速（字幕没变就跳掉 YOLO/OCR）
+TIQU_DOUDI_ZHEN = "tiqu/doudi_zhen"       # ⑤ 筛帧的兜底帧数（最多连跳几帧）
+TIQU_YOLO_JIANCE_JIANGE = "tiqu/yolo_jiance_jiange"   # ⑤ 检测间隔（YOLO 每 N 帧至少跑一次）
 TIQU_PAOFA = "tiqu/paofa"                 # ⑦ 怎么跑：gensui 跟随播放 / saomiao 全片扫描
 TIQU_HUAMIAN_BUDONG = "tiqu/huamian_budong"   # ⑦ 扫描时画面静止
 CAOWEI_SHU = 12                 # 「说话人 + 样式」槽位个数（对 F1 ~ F12）
@@ -844,6 +859,41 @@ def shuchu_mulu(video_lujing):
     return osp.join(jiceng, f"{mingzi}{MULU_HOUZHUI}")
 
 
+def qing_kong_shuchu(mulu):
+    """开跑前把上一次提取出来的东西清掉，让这一轮重新生成
+
+    只认「XX + _字幕提取」这种输出目录（名字对不上一个字都不动）——
+    输出目录是能自己挑的，万一挑到桌面之类的地方，不能把人家的东西删了。
+    外面同级那份 XX字幕提取.srt / .ass 不在这儿，不受影响。
+    返回删掉了几项。
+    """
+    if not mulu:
+        return 0
+    juedui = osp.abspath(mulu)
+    mingzi = osp.basename(juedui.rstrip("/\\"))
+    if not mingzi.endswith(MULU_HOUZHUI):
+        logger.warning(f"字幕提取：输出目录名不对，不清理 {juedui}")
+        return 0
+    shan = 0
+    try:
+        xiangs = list(os.scandir(juedui))
+    except OSError as cuowu:
+        logger.warning(f"字幕提取：读不了输出目录 {juedui} {cuowu}")
+        return 0
+    for xiang in xiangs:
+        try:
+            if xiang.is_dir() and not xiang.is_symlink():
+                shutil.rmtree(xiang.path, ignore_errors=True)
+            else:
+                os.remove(xiang.path)
+            shan += 1
+        except OSError as cuowu:
+            logger.warning(f"字幕提取：清不掉 {xiang.path} {cuowu}")
+    if shan:
+        logger.info(f"字幕提取：已清空输出目录里 {shan} 项 {juedui}")
+    return shan
+
+
 # ---------------------------------------------------------------------
 # 小工具
 # ---------------------------------------------------------------------
@@ -1086,7 +1136,13 @@ def _dui_bi_wenben(s1, s2):
     if not a or not b:
         return 0.0
     if a in b or b in a:
-        return 1.0
+        # 「包含」只在一短一长差不太多的时候才算同一句。
+        # 画面里常驻的字（招牌、水印、器械上的商标）就那么几个字，
+        # 会被每一句字幕裹着带走 —— 要是照旧直接判 100%，所有句子都会
+        # 互相认成同一句，整片并成一条、文字还冻在那个短串上。
+        # 被包住的那截得占到长句的一半以上，才当真。
+        if min(len(a), len(b)) >= 0.5 * max(len(a), len(b)):
+            return 1.0
     gong = sum((Counter(a) & Counter(b)).values())
     return gong / max(len(a), len(b))
 
@@ -1096,6 +1152,21 @@ def _gan_jing_wenben(s):
     if not s:
         return 0
     return len(s.replace(" ", "").replace("　", ""))
+
+
+def _liang_kuai_xiangtong(a, b):
+    """两张「框内小样」是不是看着一样
+
+    有一张是 None、或者两张形状不同 —— 一律算不一样（宁可多跑一次，不蒙）。
+    差得低于 OCR_KUAI_CHA_YUZHI 才算一样：字幕换字必然差得远超它，
+    而静止字幕被视频压缩带出来的那点噪声远低于它，中间有很宽的缝。
+    """
+    if a is None or b is None or a.shape != b.shape:
+        return False
+    try:
+        return float(np.mean(cv2.absdiff(a, b))) / 255.0 < OCR_KUAI_CHA_YUZHI
+    except Exception:  # noqa
+        return False
 
 
 # =====================================================================
@@ -1296,6 +1367,13 @@ class ZhenChuli(object):
         self.leibie_id = list(c.get("leibie_id") or [])
         self.leibie_ming = dict(c.get("leibie_ming") or {})
         self.kuaisu = bool(c.get("kuaisu"))
+        self.shaizhen = bool(c.get("shaizhen", True))    # 筛帧加速（面板 ⑤）
+        self.doudi_zhen = max(
+            1, int(c.get("doudi_zhen") or CHUSHAI_JIAN_GE_ZHEN)
+        )
+        self.yolo_jiance_jiange = max(
+            1, int(c.get("yolo_jiance_jiange") or YOLO_JIANCE_JIANGE_MOREN)
+        )
         # OCR
         self.yong_ocr = bool(c.get("ocr"))
         self.ocr_moxing = c.get("ocr_moxing")
@@ -1330,6 +1408,10 @@ class ZhenChuli(object):
         self.shang_cun_zhen = None       # 上一次存下来的帧（逐帧模式跳相似帧用）
         self.jingzhi_jizhun_hui = None   # 静止判定的基准帧（64x64 灰度小图）
         self.shang_zhen_kuang = []       # 上一帧的框（画面没动时直接沿用）
+        self.shang_kuang_kuai = None     # 上次字幕框那一块的小样（粗筛拿它比）
+        self.chushai_lian_tiao = 0       # 粗筛连着跳了几帧
+        self.shang_ocr_kuai = None       # 上次真跑过 OCR 的那块「框内小样」
+        self.shang_ocr_jieguo = None     # 那块小样对应的结果 (文字, 是否跳过, 是否被过滤)
 
     # ------------------------------------------------------------------
     # 一帧
@@ -1337,9 +1419,11 @@ class ZhenChuli(object):
     def chuli(self, zhen_bgr, zhen_hao):
         """处理一帧
 
-        返回 (框列表, 刚完成的字幕段)
-            框列表   [(类别名, 分数, (x1,y1,x2,y2)), ...]  绝对像素
-            字幕段   (起ms, 止ms, 文字) 或 None
+        返回 (框列表, 刚完成的字幕段, 正在讲的这一段)
+            框列表     [(类别名, 分数, (x1,y1,x2,y2)), ...]  绝对像素
+            刚完成的   (起ms, 止ms, 文字) 或 None
+            正在讲的   (起ms, 当前ms, 文字) 或 None —— 还没收尾的那一段，
+                       界面拿它把块先画在入点上、出点跟着往后长
         """
         self.zhen_hao = int(zhen_hao)
 
@@ -1355,8 +1439,18 @@ class ZhenChuli(object):
             quyu_zhen = zhen_bgr[ry:ry + rh, rx:rx + rw]
 
         # ---------- 0. 画面根本没动：直接沿用上一帧，检测和 OCR 都不跑 ----------
-        if self._hua_mian_mei_dong(quyu_zhen):
-            return list(self.shang_zhen_kuang), None
+        if self._hua_mian_mei_dong(quyu_zhen, rx, ry):
+            # 三个值一个都不能少：第二个是「刚收尾的字幕段」（这里没有）；
+            # 第三个是「正在讲的这一段」——画面没动也得接着发，时间轴上那块
+            # 才会一直往后长。少给一个，跟随播放那个线程按 3 个解包就炸了。
+            jinxing = None
+            if self.dai_cun is not None:
+                jinxing = (
+                    int(self.dai_cun["qi_zhen"] * 1000 / self.fps),
+                    int(self.zhen_hao * 1000 / self.fps),
+                    self.dai_cun.get("wenben"),
+                )
+            return list(self.shang_zhen_kuang), None, jinxing
 
         # ---------- 1. 场景检测 ----------
         changjing_bian = self._changjing(quyu_zhen)
@@ -1367,10 +1461,19 @@ class ZhenChuli(object):
         yolo_pao_guo = False        # 这一帧 YOLO 实际跑了吗
         if self.yong_yolo and self.moxing is not None:
             pao = True
+            # 快速模式的闸门：平时只在场景变化时跑 YOLO，另加一道「定期探头」。
+            # 这一道是省算力的大头 —— 没有它，筛帧放行的每一帧都会跑一遍
+            # YOLO+OCR，速度直接翻倍。
             if self.kuaisu and self.yong_changjing:
-                # 快速模式：平时只在场景变化时跑；字幕还在时每 10 帧确认一次
                 pao = changjing_bian
-                if self.zimu_ke_jiandu and self.zhen_hao % 10 == 0:
+                if self.yong_ocr:
+                    # 硬字幕提取：每「检测间隔」帧必探一次，**不看**「上一帧有没有
+                    # 字幕」。全画面时新字幕刚冒头那一刻还没有框，旧条件（要求字幕
+                    # 还在）探不到 → 整段永远起不来。有框以后筛帧那一档就接管了，
+                    # 只盯「上次框住的那一块」变没变，比每帧跑省得多。
+                    if self.zhen_hao % self.yolo_jiance_jiange == 0:
+                        pao = True
+                elif self.zimu_ke_jiandu and self.zhen_hao % 10 == 0:
                     pao = True
             if pao:
                 yolo_pao_guo = True
@@ -1392,7 +1495,12 @@ class ZhenChuli(object):
             self.zimu_ke_jiandu = True
 
         # ---------- 4. 该不该存 ----------
-        if self.yong_yolo and self.yong_changjing:
+        if self.yong_ocr and self.yong_yolo:
+            # 硬字幕提取：有框就进段（全画面也照样建段）。重复靠上面两道闸挡着 ——
+            # 筛帧（字幕那块没变，整帧在跑 YOLO 之前就扔了）和相似度判据
+            # （跟当前这一段像就判同一句、接着往下延）。
+            ying_cun = yolo_you
+        elif self.yong_yolo and self.yong_changjing:
             ying_cun = changjing_bian and yolo_you
         elif self.yong_yolo:
             ying_cun = yolo_you
@@ -1419,23 +1527,101 @@ class ZhenChuli(object):
                 changjing_bian, zi_mu_xiao_shi,
             )
 
+        # 这一帧 YOLO 没真跑（快速模式跳过、画面又动了一点）：画面上的框别清空，
+        # 接着显示上一帧那几个，一直显示到下一次真检测出结果为止。
+        # （跟随播放帧号是跳着涨的，「每 10 帧确认一次」几乎撞不上，不然框就只闪一下）
+        xian_shi_kuang = kuang if yolo_pao_guo else list(self.shang_zhen_kuang)
+
         self.shang_zhen_kuang = list(kuang)
-        return kuang, xin_zimu
+        # 把「字幕框那一块」存成小样，下一帧先拿它比，字没动就整帧白扔
+        self.shang_kuang_kuai = (
+            self._kuang_xiao_yang(quyu_zhen, kuang, (rx, ry)) if kuang else None
+        )
+        self.chushai_lian_tiao = 0
+
+        # 正在讲的这一段（还没收尾）：起点 + 现在处理到哪一刻 + 现文字。
+        # 界面拿它在入点先把块画上、出点跟着往后长；收尾那条一到就不发了。
+        jinxing = None
+        if self.dai_cun is not None:
+            jinxing = (
+                int(self.dai_cun["qi_zhen"] * 1000 / self.fps),
+                int(self.zhen_hao * 1000 / self.fps),
+                self.dai_cun.get("wenben"),
+            )
+        return xian_shi_kuang, xin_zimu, jinxing
+
+    # ------------------------------------------------------------------
+    # 框内小样：把「框住的那一块」缩成小图，专门用来判「这块变没变」
+    # ------------------------------------------------------------------
+    def _kuang_xiao_yang(self, quyu_zhen, kuang, pian_yi):
+        """几个框的并集那一块，缩成 OCR_KUAI_BIAN_CHANG 宽的小灰度图
+
+        返回 None = 没框 / 框太小，这一帧不给拦（照旧老老实实跑）。
+        kuang 里的坐标是绝对像素（含区域偏移），这里减掉 pian_yi 换回区域图坐标。
+        """
+        if not kuang:
+            return None
+        h, w = quyu_zhen.shape[:2]
+        rx, ry = pian_yi
+        try:
+            x1 = max(0, int(min(k[2][0] for k in kuang) - rx))
+            y1 = max(0, int(min(k[2][1] for k in kuang) - ry))
+            x2 = min(w, int(max(k[2][2] for k in kuang) - rx))
+            y2 = min(h, int(max(k[2][3] for k in kuang) - ry))
+        except Exception as cuowu:  # noqa
+            logger.error(f"字幕提取：框内小样取框失败 {cuowu}")
+            return None
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return None
+        try:
+            kuai = quyu_zhen[y1:y2, x1:x2]
+            xiao = cv2.resize(
+                kuai,
+                (OCR_KUAI_BIAN_CHANG, OCR_KUAI_BIAN_GAO),
+                interpolation=cv2.INTER_AREA,
+            )
+            return cv2.cvtColor(xiao, cv2.COLOR_BGR2GRAY)
+        except Exception as cuowu:  # noqa
+            logger.error(f"字幕提取：框内小样缩放失败 {cuowu}")
+            return None
 
     # ------------------------------------------------------------------
     # 画面没动？没动就把这一帧白扔掉
     # ------------------------------------------------------------------
-    def _hua_mian_mei_dong(self, quyu_zhen):
-        """这一帧和「上次真正处理过的那一帧」是不是一模一样
+    def _hua_mian_mei_dong(self, quyu_zhen, rx=0, ry=0):
+        """这一帧是不是「白扔的」：字幕没变（大体上画面也没动）
 
-        字幕只要变了，画面必然跟着变；反过来画面纹丝没动，字幕就是没动。
-        所以没动的帧再跑一遍检测 + OCR，结果必定和上一帧相同 —— 纯粹白烧时间。
-        判定在 64x64 的缩略图上做，一帧不到一毫秒，换掉一次几十毫秒的识别。
+        两档判，先用省得多的那档：
+
+        1. 上一帧有字幕框（且面板上开着「筛帧加速」）—— 只盯「上次框住的那一块」：
+           字幕没动、背景在动（人物走、镜头摇）也能拦住，这是硬字幕最常见的情形。
+           为了不「一直闭着眼」，连跳「兜底帧数」那么多帧就强制放行一帧兜底。
+        2. 上一帧没框（或框太小）—— 退回看整块检测区域，跟老规矩一样：
+           整块纹丝没动才拦得住。
 
         基准取的是「上次真正处理过的那一帧」，不是紧挨着的上一帧：
-        画面慢慢淡入（每帧只变一点点）时，差异会一帧帧累加，
+        画面慢慢淡入 / 淡出（每帧只变一点点）时差异会一帧帧累加，
         累到超过阈值就重跑一次，绝不会因为"每帧都变得太少"而整句漏掉。
         """
+        # ---- 第 1 档：只盯上次字幕框那一块（「筛帧加速」关了就不走这档）----
+        if self.shaizhen and self.shang_zhen_kuang:
+            kuai = self._kuang_xiao_yang(
+                quyu_zhen, self.shang_zhen_kuang, (rx, ry)
+            )
+            if kuai is not None and _liang_kuai_xiangtong(
+                kuai, self.shang_kuang_kuai
+            ):
+                self.chushai_lian_tiao += 1
+                if self.chushai_lian_tiao < self.doudi_zhen:
+                    return True             # 字没动：这一帧白扔
+                self.chushai_lian_tiao = 0  # 连跳够了：放行一帧强制跑一次兜底
+                return False
+            self.chushai_lian_tiao = 0
+            if kuai is not None:
+                self.shang_kuang_kuai = kuai
+            return False
+
+        # ---- 第 2 档：没框，退回看整块检测区域 ----
         try:
             xiao = cv2.resize(
                 quyu_zhen, (64, 64), interpolation=cv2.INTER_AREA
@@ -1468,14 +1654,44 @@ class ZhenChuli(object):
         # OCR 去重
         wenben = None
         if self.ocr_moxing is not None and ying_cun:
-            wenben, tiaoguo, bei_guolv = self._ocr(quyu_zhen)
-            if tiaoguo:
-                ying_cun = False
-            if bei_guolv and self.dai_cun is not None:
-                # 被规则过滤的（纯省略号之类）：先给上一句收尾
-                duan = self._jie_duan(self.zhen_hao - 1)
-                if duan is not None:
-                    xin = duan
+            kuai = None
+            tiao_ocr = False
+            if self.shaizhen:
+                kuai = self._kuang_xiao_yang(quyu_zhen, kuang, pian_yi)
+                tiao_ocr = (
+                    self.shang_ocr_jieguo is not None
+                    and _liang_kuai_xiangtong(kuai, self.shang_ocr_kuai)
+                )
+            if tiao_ocr:
+                # 框内那块跟上次真跑过 OCR 的一模一样 —— 文字必然一样，
+                # 直接把上次的结果接上，这一步整个不调 OCR
+                wenben, tiaoguo, bei_guolv = self.shang_ocr_jieguo
+            else:
+                wenben, tiaoguo, bei_guolv = self._ocr(quyu_zhen)
+                if self.shaizhen:
+                    # 记住这次真跑的那块图 + 它的真实结果（tiaoguo 记真实值，
+                    # 别写死 True —— 写死会让「这一句后来被认全」永远进不来）
+                    self.shang_ocr_kuai = kuai
+                    self.shang_ocr_jieguo = (wenben, tiaoguo, bei_guolv)
+
+            # 「跟上文重复」不再否决这一段的存在。长句整条漏就是被这一票害的：
+            # 只要历史里（含最近记着的几条）有一句像它，这一段就永远起不来，
+            # 十几秒从头到尾一次都不建段。现在只在「跟当前这一段比」时才作数，
+            # 而且只用来判「是不是同一句」——同一句就把段接着往下延，不重开
+            # （重开会被最短时长切碎丢掉）；真换了句就老老实实起新段。
+            if bei_guolv:
+                ying_cun = False        # 没认出字（空的 / 纯省略号）：不建段
+            elif self.dai_cun is not None:
+                jiu_wen = self.dai_cun.get("wenben") or ""
+                xin_wen = wenben or ""
+                if jiu_wen and xin_wen and _dui_bi_wenben(
+                    xin_wen, jiu_wen
+                ) >= self.ocr_xiangsi:
+                    ying_cun = False    # 同一句：段继续往下延
+                    if self.ocr_youxian_chang and _gan_jing_wenben(
+                        xin_wen
+                    ) > _gan_jing_wenben(jiu_wen):
+                        self.dai_cun["wenben"] = wenben    # 认得更全就换上
 
         # 字幕消失：立刻收尾（用消失那一刻当结束时间）
         if zi_mu_xiao_shi and self.dai_cun is not None:
@@ -1496,7 +1712,10 @@ class ZhenChuli(object):
                     xin = duan
             if self.cun_tu:
                 self.dai_cun = {
-                    "qi_zhen": int(self.zimao_qi_zhen),
+                    # 新段的起点就是「看到它的这一帧」。原先用的是 zimao_qi_zhen，
+                    # 那个值在「筛帧加速」走缓存那条路上不刷新，会停在上一段的起点
+                    # 上 —— 时间轴于是冒出两条起止一模一样的字幕
+                    "qi_zhen": int(self.zhen_hao),
                     "zhen": quyu_zhen.copy(),
                     "kuang": list(kuang),
                     "wenben": wenben,
@@ -1696,7 +1915,12 @@ class ZhenChuli(object):
     # 收尾一段：存图 + 存 JSON + 出 SRT 条目
     # ------------------------------------------------------------------
     def _jie_duan(self, jie_zhen):
-        """把 dai_cun 这一段封口，返回 (起ms, 止ms, 文字) 或 None"""
+        """把 dai_cun 这一段封口
+
+        返回 None                  = 这一段不要（太短 / 没文字）
+        返回 (起, 止, 文字)         = 新增一条字幕
+        返回 (起, 止, 文字, True)   = 并进上一条（上一条的时间 / 文字要一起改）
+        """
         if self.dai_cun is None:
             return None
         qi_zhen = int(self.dai_cun["qi_zhen"])
@@ -1713,6 +1937,29 @@ class ZhenChuli(object):
         if chang < ZIMU_ZUI_DUAN_MIAO:
             # 太短，基本是误检或字幕淡出
             return None
+
+        # 跟刚记下的上一条挨着、文字又像 —— 那就是同一句被拆成了两段
+        # （中途有一帧没接上），并回上一条，别在时间轴上出两条。
+        # 「断开」按这一段的起点减上一条的终点算；断太久就说明真是两句台词，不并。
+        if self.yong_ocr and wenben and self.zimu_liebiao:
+            shang_qi, shang_zhi, shang_wen = self.zimu_liebiao[-1]
+            if (
+                shang_wen
+                and qi_ms - shang_zhi <= HEBING_JIAN_GE_MS
+                and _dui_bi_wenben(wenben, shang_wen) >= self.ocr_xiangsi
+            ):
+                he_zhi = max(shang_zhi, zhi_ms)
+                # 文字取更全的那条（长的），跟「优先长」那个开关一个取向
+                he_wen = (
+                    wenben
+                    if _gan_jing_wenben(wenben) >= _gan_jing_wenben(shang_wen)
+                    else shang_wen
+                )
+                self.zimu_liebiao[-1] = (shang_qi, he_zhi, he_wen)
+                # 最近文字也跟着换，不然下一条还会拿旧的去比
+                if self.jinqi_wenben and self.jinqi_wenben[-1] == shang_wen:
+                    self.jinqi_wenben[-1] = he_wen
+                return (shang_qi, he_zhi, he_wen, True)
 
         if self.cun_tu and self.shuchu_mulu and zhen is not None:
             self._cun_yi_zhang(zhen, kuang, wenben, qi_ms, zhi_ms, pian_yi)
@@ -1895,7 +2142,8 @@ class ZhenChuli(object):
 class TuiliXiancheng(QtCore.QThread):
     """跟着播放跑推理。槽位只留最新一帧，跑不过来自然丢帧，画面不卡。"""
 
-    jieguo = pyqtSignal(int, object, object)   # 帧号, 框列表, 字幕段或 None
+    # 帧号, 框列表, 刚完成的字幕段或 None, 正在讲的这一段或 None
+    jieguo = pyqtSignal(int, object, object, object)
 
     def __init__(self, chuliqi, parent=None):
         super().__init__(parent)
@@ -1919,11 +2167,11 @@ class TuiliXiancheng(QtCore.QThread):
                 self.msleep(KONGXIAN_HAO_MIAO)
                 continue
             try:
-                kuang, xin = self.chuli.chuli(zui[0], zui[1])
+                kuang, xin, jinxing = self.chuli.chuli(zui[0], zui[1])
             except Exception as cuowu:  # noqa
                 logger.error(f"视频工作台：单帧处理失败 {cuowu}")
                 continue
-            self.jieguo.emit(zui[1], kuang, xin)
+            self.jieguo.emit(zui[1], kuang, xin, jinxing)
         logger.info("视频工作台：实时推理线程结束")
 
     def tingzhi(self):
@@ -1939,7 +2187,8 @@ class SaomiaoXiancheng(QtCore.QThread):
 
     jindu = pyqtSignal(int, int, int)          # 当前帧, 总帧, 已存张数
     huamian = pyqtSignal(object, int, object)  # RGB帧, 帧号, 框列表（让画面跟着走）
-    jieguo = pyqtSignal(int, object, object)   # 帧号, 框列表, 字幕段
+    # 帧号, 框列表, 刚完成的字幕段或 None, 正在讲的这一段或 None
+    jieguo = pyqtSignal(int, object, object, object)
     jieshu = pyqtSignal(bool, str, object)     # 成功?, 说明, 写出的文件列表
 
     def __init__(self, lujing, chuliqi, xie_srt, hua_mian_bu_dong=False,
@@ -1973,19 +2222,23 @@ class SaomiaoXiancheng(QtCore.QThread):
                 if not cheng or zhen is None:
                     break
                 try:
-                    kuang, xin = self.chuli.chuli(zhen, zhen_hao)
+                    kuang, xin, jinxing = self.chuli.chuli(zhen, zhen_hao)
                 except Exception as cuowu:  # noqa
                     logger.error(f"视频工作台：第 {zhen_hao} 帧处理失败 {cuowu}")
-                    kuang, xin = [], None
+                    kuang, xin, jinxing = [], None, None
                 zui_hou = (zhen, zhen_hao, kuang)
                 if xin is not None:
-                    self.jieguo.emit(zhen_hao, kuang, xin)
+                    self.jieguo.emit(zhen_hao, kuang, xin, jinxing)
 
                 xian = time.perf_counter()
                 if xian - shang_bao >= JINDU_JIAN_GE_HAO_MIAO / 1000.0:
                     shang_bao = xian
                     self.jindu.emit(zhen_hao, self.chuli.zong_zhen,
                                     self.chuli.yi_cun)
+                    # 正在讲的这一段也顺手发一次（跟进度一个节拍）：界面把块先
+                    # 画上、跟着往后长。只发「正在讲的」，收尾那条走上面那行
+                    if jinxing is not None:
+                        self.jieguo.emit(zhen_hao, kuang, None, jinxing)
                     # 顺手把这一帧丢给界面显示（转成 RGB，界面直接贴）
                     # 勾了"画面静止"就不发：省掉整图转 RGB + 跨线程递给界面重画
                     if not self.hua_mian_bu_dong:
@@ -2017,7 +2270,7 @@ class SaomiaoXiancheng(QtCore.QThread):
         try:
             xin = self.chuli.jie_shu()
             if xin is not None:
-                self.jieguo.emit(max(0, zhen_hao - 1), [], xin)
+                self.jieguo.emit(max(0, zhen_hao - 1), [], xin, None)
         except Exception as cuowu:  # noqa
             logger.error(f"视频工作台：收尾失败 {cuowu}")
 
@@ -6179,6 +6432,45 @@ class ShezhiMianban(QtWidgets.QWidget):
         hang.addStretch(1)
         bu.addLayout(hang)
 
+        hang = QtWidgets.QHBoxLayout()
+        hang.setSpacing(6)
+        self.gou_shaizhen = QtWidgets.QCheckBox("筛帧加速")
+        self.gou_shaizhen.setChecked(True)
+        self.gou_shaizhen.setStyleSheet(_ys_xuanxiang())
+        self.gou_shaizhen.setToolTip(
+            "字幕那一块没变就直接沿用上一帧：YOLO 和 OCR 都省掉，快很多\n"
+            "取消勾：回到改动前那套（只按整块画面静止来跳，字幕部分照跑）"
+        )
+        self.gou_shaizhen.stateChanged.connect(self._cun_tiqu_shezhi)
+        hang.addWidget(self.gou_shaizhen)
+        hang.addStretch(1)
+        hang.addWidget(QtWidgets.QLabel("兜底帧数"))
+        self.doudi_zhen = QtWidgets.QSpinBox()
+        self.doudi_zhen.setRange(1, 60)
+        self.doudi_zhen.setValue(CHUSHAI_JIAN_GE_ZHEN)
+        self.doudi_zhen.setToolTip(
+            "筛帧时字幕没变最多连跳几帧，就强制放行一帧跑 YOLO 兜底\n"
+            "调大更快，但字幕在别处长出来时发现得晚一点"
+        )
+        self.doudi_zhen.setFixedWidth(58)
+        self.doudi_zhen.setStyleSheet(_ys_shuzi())
+        self.doudi_zhen.valueChanged.connect(self._cun_tiqu_shezhi)
+        hang.addWidget(self.doudi_zhen)
+        hang.addWidget(QtWidgets.QLabel("检测间隔"))
+        self.yolo_jiance_jiange = QtWidgets.QSpinBox()
+        self.yolo_jiance_jiange.setRange(1, 180)
+        self.yolo_jiance_jiange.setValue(YOLO_JIANCE_JIANGE_MOREN)
+        self.yolo_jiance_jiange.setToolTip(
+            "快速模式（⑤）下 YOLO 每 N 帧至少跑一次（不看有没有字幕）\n"
+            "全画面时新字幕刚冒头就靠它探到\n"
+            "调大更快，但字幕发现得晚一点；调小更准更慢"
+        )
+        self.yolo_jiance_jiange.setFixedWidth(58)
+        self.yolo_jiance_jiange.setStyleSheet(_ys_shuzi())
+        self.yolo_jiance_jiange.valueChanged.connect(self._cun_tiqu_shezhi)
+        hang.addWidget(self.yolo_jiance_jiange)
+        bu.addLayout(hang)
+
         # ---- 输出 ----
         bu.addWidget(_biaoti_wenben("⑥ 输出目录"))
         hang = QtWidgets.QHBoxLayout()
@@ -6376,6 +6668,16 @@ class ShezhiMianban(QtWidgets.QWidget):
     def zhuangtai_shezhi(self, wenben):
         self.zhuangtai.setText(wenben)
 
+    def tiqu_yongshi(self):
+        """这次跑的总用时（12:34 / 1:02:34），没开始过就给空串
+
+        起点是点「开始」那一下记的（含模型加载，跟底栏「已用」一个口径）。
+        """
+        qi = float(self._kaishi_shike or 0.0)
+        if qi <= 0:
+            return ""
+        return _haoshi_wenben(time.time() - qi)
+
     # ------------------------------------------------------------------
     # 参数快照
     # ------------------------------------------------------------------
@@ -6395,6 +6697,9 @@ class ShezhiMianban(QtWidgets.QWidget):
             "ocr_youxian_chang": self.gou_youxian_chang.isChecked(),
             "cun_tu": True,
             "tiao_xiangsi": self.gou_tiaoxiangsi.isChecked(),
+            "shaizhen": self.gou_shaizhen.isChecked(),
+            "doudi_zhen": self.doudi_zhen.value(),
+            "yolo_jiance_jiange": self.yolo_jiance_jiange.value(),
             "huamian_budong": self.gou_huamian_budong.isChecked(),
             "tiaoshi": self.gou_tiaoshi.isChecked(),
             "shuchu": self.shuchu_shuru.text().strip(),
@@ -6630,6 +6935,11 @@ class ShezhiMianban(QtWidgets.QWidget):
             pei.setValue(TIQU_KUAISU, bool(self.gou_kuaisu.isChecked()))
             pei.setValue(TIQU_TIAOXIANGSI, bool(self.gou_tiaoxiangsi.isChecked()))
             pei.setValue(TIQU_TIAOSHI, bool(self.gou_tiaoshi.isChecked()))
+            pei.setValue(TIQU_SHAIZHEN, bool(self.gou_shaizhen.isChecked()))
+            pei.setValue(TIQU_DOUDI_ZHEN, int(self.doudi_zhen.value()))
+            pei.setValue(
+                TIQU_YOLO_JIANCE_JIANGE, int(self.yolo_jiance_jiange.value())
+            )
             pei.setValue(
                 TIQU_PAOFA,
                 "saomiao" if self.xuan_saomiao.isChecked() else "gensui",
@@ -6669,6 +6979,7 @@ class ShezhiMianban(QtWidgets.QWidget):
         kao = (self.gou_yolo, self.zhixin_du, self.leibie_shuru,
                self.gou_changjing, self.changjing_yuzhi, self.jiance_jiange,
                self.gou_kuaisu, self.gou_tiaoxiangsi, self.gou_tiaoshi,
+               self.gou_shaizhen, self.doudi_zhen, self.yolo_jiance_jiange,
                self.xuan_gensui, self.xuan_saomiao,
                self.gou_huamian_budong)
         for w in kao:
@@ -6685,6 +6996,13 @@ class ShezhiMianban(QtWidgets.QWidget):
             self.gou_kuaisu.setChecked(_kai(TIQU_KUAISU, True))
             self.gou_tiaoxiangsi.setChecked(_kai(TIQU_TIAOXIANGSI, True))
             self.gou_tiaoshi.setChecked(_kai(TIQU_TIAOSHI, False))
+            self.gou_shaizhen.setChecked(_kai(TIQU_SHAIZHEN, True))
+            self.doudi_zhen.setValue(
+                _shu(TIQU_DOUDI_ZHEN, CHUSHAI_JIAN_GE_ZHEN, 1, 60)
+            )
+            self.yolo_jiance_jiange.setValue(
+                _shu(TIQU_YOLO_JIANCE_JIANGE, YOLO_JIANCE_JIANGE_MOREN, 1, 180)
+            )
             paofa = pei.value(TIQU_PAOFA, None)
             if paofa is not None:
                 if str(paofa).strip().lower() in ("saomiao", "quanpian",
