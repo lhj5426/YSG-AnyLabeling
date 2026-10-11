@@ -176,11 +176,14 @@ SHIPIN_FILTER = (
 # ---- 时间轴切片（把「拖拽ass来对视频进行截图…」那个脚本集成进来）----
 QIEPIAN_MOSHI_ZHONG = "zhong"       # 中间值模式：每条字幕截 1 张（取开始/结束的中点）
 QIEPIAN_MOSHI_QIANHOU = "qianhou"   # 前后轴模式：每条截 2 张（开始、结束各一张）
-QIEPIAN_JIA_ZHONG = "_切片"          # 中间值模式的输出文件夹后缀
-QIEPIAN_JIA_QIAN = "_前"             # 前后轴模式「开始点」的输出文件夹后缀
-QIEPIAN_JIA_HOU = "_后"              # 前后轴模式「结束点」的输出文件夹后缀
+QIEPIAN_JIA_ZHONG = "中间值切片"      # 中间值模式的输出文件夹名
+QIEPIAN_JIA_QIAN = "前轴切片"         # 前后轴模式「开始点」的输出文件夹名
+QIEPIAN_JIA_HOU = "后轴切片"          # 前后轴模式「结束点」的输出文件夹名
 # VideoSubFinder 的文件名尾巴（跟脚本里那串一致，方便沿用老流程）
 QIEPIAN_WENJIAN_WEI = "_0000007841440029614401080"
+# 切片取帧：要的那一帧比手上这帧往后不超过这么多帧，就一帧帧 grab 过去；
+# 超了、或者要往回，才做一次定位（定位 = 从关键帧重解，很贵）
+QIEPIAN_TUI_JIN_ZHEN = 240
 # 时间微调的几种模式（左边给界面看，右边是存进 ini 的值，跟脚本里的字符串一致）
 QIEPIAN_WEITIAO = (
     ("延后 N 帧", "delay_frames"),
@@ -9130,6 +9133,22 @@ def _qiepian_wenjian_ming(qi_ms, zhi_ms):
     return "%s__%s%s.jpeg" % (qi, zhi, QIEPIAN_WENJIAN_WEI)
 
 
+def _chang_lu(lu):
+    """Windows 上给路径套一个「长路径」前缀，绕开 260 字符上限。
+
+    视频名 + 目录名一长（日文片名那种），整条路径就超 260，建目录 / 存图会
+    一声不吭全失败。套上 \\\\?\\ 之后就没有这个限制了。别的系统原样返回。
+    """
+    if os.name != "nt":
+        return lu
+    lu = osp.abspath(lu)
+    if lu.startswith("\\\\?\\"):
+        return lu
+    if lu.startswith("\\\\"):       # 网络路径 \\主机\共享
+        return "\\\\?\\UNC\\" + lu[2:]
+    return "\\\\?\\" + lu
+
+
 def _qiepian_wei_tiao(ms, moshi, shu, fps):
     """一个时间点按「延后 / 提前 × 帧 / 秒」挪一下（跟脚本一个算法）"""
     shu = int(shu or 0)
@@ -9364,16 +9383,17 @@ class _QiepianXiancheng(QtCore.QThread):
     def run(self):
         p = self.peizhi
         zhong = str(p.get("moshi")) != QIEPIAN_MOSHI_QIANHOU
-        jia = osp.splitext(osp.basename(self.shipin))[0] or "切片"
         try:
             if zhong:
-                mu_zhong = osp.join(self.shuchu, jia + QIEPIAN_JIA_ZHONG)
-                os.makedirs(mu_zhong, exist_ok=True)
+                # 中间值模式：在用户选的目录里建「中间值切片」一个文件夹
+                mu_zhong = osp.join(self.shuchu, QIEPIAN_JIA_ZHONG)
+                os.makedirs(_chang_lu(mu_zhong), exist_ok=True)
             else:
-                mu_qian = osp.join(self.shuchu, jia + QIEPIAN_JIA_QIAN)
-                mu_hou = osp.join(self.shuchu, jia + QIEPIAN_JIA_HOU)
-                os.makedirs(mu_qian, exist_ok=True)
-                os.makedirs(mu_hou, exist_ok=True)
+                # 前后轴模式：就在用户选的目录里建「前轴」「后轴」两个文件夹
+                mu_qian = osp.join(self.shuchu, QIEPIAN_JIA_QIAN)
+                mu_hou = osp.join(self.shuchu, QIEPIAN_JIA_HOU)
+                os.makedirs(_chang_lu(mu_qian), exist_ok=True)
+                os.makedirs(_chang_lu(mu_hou), exist_ok=True)
         except Exception as cuowu:      # noqa
             self.wancheng.emit(False, f"建输出目录失败：{cuowu}")
             return
@@ -9388,37 +9408,41 @@ class _QiepianXiancheng(QtCore.QThread):
             if fps <= 0:
                 fps = 24.0
             zong = len(self.tiao) * (1 if zhong else 2)
-            wan = 0
-            cheng = 0
+
+            # ---------- 先把要切的点全列出来，按时间从小到大排队 ----------
+            # 原先是「一个点定位一次」：335 个块就是 335 次随机定位，每次都得
+            # 从关键帧往后重解一串帧，所以慢。改成从头顺着解一遍，解码器只管
+            # 往前走，走到要的那一帧就存 —— 总耗时约等于「把视频解一遍」。
+            ren = []
             for qi, zhi in self.tiao:
-                if self._ting:
-                    break
                 ming = _qiepian_wenjian_ming(qi, zhi)
                 if zhong:
                     ms = _qiepian_wei_tiao(
                         (qi + zhi) // 2, p.get("zhong_moshi"), p.get("zhong_zhi"), fps
                     )
-                    if self._cun(shipin, ms, osp.join(mu_zhong, ming)):
-                        cheng += 1
-                    wan += 1
-                    self.jindu.emit(wan, zong)
+                    ren.append((max(0, int(ms)), osp.join(mu_zhong, ming)))
                 else:
                     ms_q = _qiepian_wei_tiao(
                         qi, p.get("qian_moshi"), p.get("qian_zhi"), fps
                     )
-                    if self._cun(shipin, ms_q, osp.join(mu_qian, ming)):
-                        cheng += 1
-                    wan += 1
-                    self.jindu.emit(wan, zong)
-                    if self._ting:
-                        break
                     ms_h = _qiepian_wei_tiao(
                         zhi, p.get("hou_moshi"), p.get("hou_zhi"), fps
                     )
-                    if self._cun(shipin, ms_h, osp.join(mu_hou, ming)):
-                        cheng += 1
-                    wan += 1
-                    self.jindu.emit(wan, zong)
+                    ren.append((max(0, int(ms_q)), osp.join(mu_qian, ming)))
+                    ren.append((max(0, int(ms_h)), osp.join(mu_hou, ming)))
+            ren.sort(key=lambda dian: dian[0])
+
+            wan = 0
+            cheng = 0
+            zhen_hao = -1        # 手上这帧是视频里第几帧；-1 = 还没读过
+            for ms, lu in ren:
+                if self._ting:
+                    break
+                zhen_hao, zhen = self._qu_zhen(shipin, ms, fps, zhen_hao)
+                if self._cun(zhen, lu):
+                    cheng += 1
+                wan += 1
+                self.jindu.emit(wan, zong)
         finally:
             shipin.release()
 
@@ -9427,20 +9451,59 @@ class _QiepianXiancheng(QtCore.QThread):
                 f"已取消：切到一半停了，{cheng} 张已存进 {self.shuchu}"
             )
             return
-        # 按模式说清楚：中间值一个块一张；前后轴一个块头尾各一张
+        # 按实际存成功的张数报，别拿「块数」冒充张数（一张没存也报完成）
         kuai = len(self.tiao)
+        if cheng <= 0:
+            self.wancheng.emit(
+                False,
+                f"切片失败：{kuai} 个块一张都没存成。看看输出目录能不能写、"
+                f"路径是不是太长。目录：{self.shuchu}",
+            )
+            return
         if zhong:
-            shuo = f"切片完成：中间切片 {kuai} 张，存到 {self.shuchu}"
+            shuo = f"切片完成：共存 {cheng} 张（{kuai} 个块），存到 {mu_zhong}"
         else:
-            shuo = f"切片完成：前后切片各 {kuai} 张，存到 {self.shuchu}"
+            shuo = (
+                f"切片完成：共存 {cheng} 张（{kuai} 个块，"
+                f"「{QIEPIAN_JIA_QIAN}」「{QIEPIAN_JIA_HOU}」各一张），"
+                f"存到 {self.shuchu}"
+            )
         self.wancheng.emit(True, shuo)
 
-    def _cun(self, shipin, ms, lu):
-        """跳到一个时间点、读一帧、按框选区域裁一下、存 jpeg"""
+    def _qu_zhen(self, shipin, ms, fps, shang_hao):
+        """把播放头挪到 ms 那一帧并读出来。
+
+        只往后走就一帧帧 grab 过去（解码器只管往前，最省）；要往回、或者隔得
+        太远（超过 QIEPIAN_TUI_JIN_ZHEN 帧）才做一次定位。原来是每个点都定位，
+        所以才慢。
+        返回 (这一帧的序号, 帧图)；挪不过去给 (shang_hao, None)。
+        """
         try:
-            shipin.set(cv2.CAP_PROP_POS_MSEC, float(ms))
+            hao = int(round(max(0.0, float(ms)) / 1000.0 * fps))
+            if (
+                shang_hao < 0
+                or hao <= shang_hao
+                or (hao - shang_hao) > QIEPIAN_TUI_JIN_ZHEN
+            ):
+                shipin.set(cv2.CAP_PROP_POS_FRAMES, hao)
+                shang_hao = hao
+            else:
+                for _ in range(hao - shang_hao - 1):
+                    if not shipin.grab():
+                        return shang_hao, None
+                shang_hao = hao
             cheng, zhen = shipin.read()
             if not cheng or zhen is None:
+                return shang_hao, None
+            return shang_hao, zhen
+        except Exception as cuowu:      # noqa
+            logger.error(f"视频工作台：切片取帧失败 {ms} {cuowu}")
+            return shang_hao, None
+
+    def _cun(self, zhen, lu):
+        """把一帧按框选区域裁一下、存 jpeg"""
+        try:
+            if zhen is None:
                 return False
             if self.quyu:
                 x, y, w, h = self.quyu
@@ -9455,7 +9518,7 @@ class _QiepianXiancheng(QtCore.QThread):
             hao, bian = cv2.imencode(".jpeg", zhen)
             if not hao:
                 return False
-            bian.tofile(lu)
+            bian.tofile(_chang_lu(lu))
             return True
         except Exception as cuowu:      # noqa
             logger.error(f"视频工作台：切片存图失败 {lu} {cuowu}")
