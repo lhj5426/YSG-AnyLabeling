@@ -97,6 +97,10 @@ ZIMU_BIANJI_ZIHAO_MOREN = 13    # 「字幕编辑」编辑框的字号（px）�
 ZIMU_BIANJI_ZIHAO_ZUI_XIAO = 10  # Ctrl+滚轮 能缩到多小
 ZIMU_BIANJI_ZIHAO_ZUIDA = 100    # Ctrl+滚轮 能放到多大
 ZIMU_BIANJI_ZIHAO_PEIZHI = "jiemian/bianji_zihao"   # 记住编辑框字号用的配置项名
+# 编辑框「锁定代码」：锁上之后框里照原样显示整行，全选删除重写时代码不会真丢
+ZIMU_SUODING_PEIZHI = "jiemian/bianji_suoding"
+ZIMU_SUODING_SE = (232, 176, 75)    # 锁定时编辑框那圈边框的颜色（淡琥珀）
+ZIMU_SUODING_TOUMING = 170          # 那圈边框的透明度（0~255，越小越淡）
 ZIMU_HUANHANG_SE = "#33C33C"    # 编辑框里换行标签 \N 的字色（绿，一眼看出断在哪儿）
 BIANJI_ZITI = "新兰圆-B"        # 编辑框用的字体（照 ASS 里那个名字写）；系统没装就退回默认字体
 _BIANJI_ZITI_JI = None          # 查过的结果（None = 还没查）
@@ -139,6 +143,21 @@ TIQU_DOUDI_ZHEN = "tiqu/doudi_zhen"       # ⑤ 筛帧的兜底帧数（最多�
 TIQU_YOLO_JIANCE_JIANGE = "tiqu/yolo_jiance_jiange"   # ⑤ 检测间隔（YOLO 每 N 帧至少跑一次）
 TIQU_PAOFA = "tiqu/paofa"                 # ⑦ 怎么跑：gensui 跟随播放 / saomiao 全片扫描
 TIQU_HUAMIAN_BUDONG = "tiqu/huamian_budong"   # ⑦ 扫描时画面静止
+TIQU_YANSE_MOXING = "tiqu/yanse_moxing"   # ⑨ 文字颜色提取用的模型 YAML
+TIQU_YANSE_BIAN_SE = "tiqu/yanse_bian_se"     # ⑨ 取色回写时的描边颜色（#RRGGBB）
+TIQU_YANSE_BIAN_TOU = "tiqu/yanse_bian_tou"   # ⑨ 描边的透明度（0=不透 255=全透）
+TIQU_YANSE_BIAN_KUAN = "tiqu/yanse_bian_kuan"  # ⑨ 取色回写时的描边宽度
+YANSE_BIAN_SE_MOREN = "#FFFFFF"               # 出厂默认描边色：白
+YANSE_BIAN_TOU_MOREN = 0                      # 出厂默认描边透明 = 0（不透明）
+YANSE_BIAN_KUAN_MOREN = 5                     # 出厂默认描边宽度
+YANSE_BIAN_KUAN_ZUI_DA = 20                   # 描边宽度最多给到多少
+YANSE_BIAN_TOU_ZUI_DA = 255                   # 描边透明度最多给到多少
+# ⑨ 文字颜色提取的出厂默认模型：软件自带那个 Manga-OCR (DBNet+48px)
+_ZHAN_MULU = osp.dirname(osp.dirname(osp.dirname(osp.dirname(
+    osp.abspath(__file__)))))
+YANSE_MOXING_MOREN = osp.join(
+    _ZHAN_MULU, "anylabeling", "configs", "auto_labeling", "manga_ocr.yaml"
+)
 CAOWEI_SHU = 12                 # 「说话人 + 样式」槽位个数（对 F1 ~ F12）
 KUOHAO_PAI_CHU_ZI = "旁白"      # 批量加「」：说话人 / 样式里含这几个词的，不套「」
 KUOHAO_PAI_CHU_FU = "「」『』（）()"   # 批量加「」：文本里已经有这些符号的，不再套「」
@@ -306,6 +325,29 @@ def xie_bianji_zihao(zihao):
     try:
         q = buju_qsettings()
         q.setValue(ZIMU_BIANJI_ZIHAO_PEIZHI, int(zihao))
+        q.sync()
+    except Exception:  # noqa
+        pass
+
+
+def du_bianji_suoding():
+    """编辑框「锁定代码」开没开；没存过就是不锁"""
+    try:
+        zhi = buju_qsettings().value(ZIMU_SUODING_PEIZHI, None)
+    except Exception:  # noqa
+        return False
+    if zhi is None:
+        return False
+    if isinstance(zhi, str):
+        return str(zhi).strip().lower() in ("1", "true", "yes", "on")
+    return bool(zhi)
+
+
+def xie_bianji_suoding(kai):
+    """把「锁定代码」的状态记下来"""
+    try:
+        q = buju_qsettings()
+        q.setValue(ZIMU_SUODING_PEIZHI, bool(kai))
         q.sync()
     except Exception:  # noqa
         pass
@@ -643,18 +685,28 @@ def _ys_zihao_ti():
     """
 
 
-def _ys_bianji_kuang(zihao=None):
-    """编辑框样式；zihao 是字号（px），不给就用默认的"""
+def _ys_bianji_kuang(zihao=None, suoding=False):
+    """编辑框样式；zihao 是字号（px），不给就用默认的
+
+    suoding=True（「锁定代码」开着）时边框换成 2 像素的淡琥珀色 —— 一眼看出
+    这个框锁着（锁着的时候全选删除重写，代码也丢不了）。
+    """
     if zihao is None:
         zihao = ZIMU_BIANJI_ZIHAO_MOREN
     c = _ys()
     ziti = _bianji_ziti_ming()
     zi = f'font-family: "{ziti}";\n        ' if ziti else ""
+    bian = (
+        f"2px solid rgba({ZIMU_SUODING_SE[0]}, {ZIMU_SUODING_SE[1]}, "
+        f"{ZIMU_SUODING_SE[2]}, {ZIMU_SUODING_TOUMING})"
+        if suoding
+        else f"1px solid {c['biankuang_liang']}"
+    )
     return f"""
     QPlainTextEdit {{
         background-color: {c['beijing2']};
         color: {c['wenzi']};
-        border: 1px solid {c['biankuang_liang']};
+        border: {bian};
         border-radius: 6px;
         padding: 4px 8px;
         font-size: {int(zihao)}px;
@@ -2732,6 +2784,23 @@ def _kuang_chu(wen):
     return str(wen or "").replace("\n", "")
 
 
+def _suoding_chun_wen(wenben):
+    """「锁定代码」开着时该显示的写法：第一个 { 到最后一个 } 那一整段不摆
+
+    规矩就一条 —— 最开始的 { 到最结尾的 }，中间夹着的东西（两块代码之间夹的
+    字，比如 {\\fn..}—{\\r}{\\c..&} 里那个 —）一起算进去；} 之后剩下的才是台词。
+    跟字幕编辑框、时间轴块一个规矩。
+    """
+    wen = str(wenben or "")
+    qi = wen.find("{")
+    if qi < 0:
+        return wen
+    zhi = wen.rfind("}")
+    if zhi < qi:
+        return wen
+    return wen[:qi] + wen[zhi + 1:]
+
+
 def _xuanzhong_shuzi_ma(shi):
     """圈中的这一段是不是一个纯数字（整数 / 小数，可带正负号；前后空格不算）"""
     return bool(re.fullmatch(r"\s*[-+]?\d+(\.\d+)?\s*", shi or ""))
@@ -2774,11 +2843,20 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
 
     likai = pyqtSignal()
     xiayitiao = pyqtSignal()        # 回车：换到下一条字幕
+    suoding_gaile = pyqtSignal(bool)   # 「锁定代码」开关变了一下（列表 / 时间轴跟着换显示）
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._zihao = du_bianji_zihao()
-        self.setStyleSheet(_ys_bianji_kuang(self._zihao))
+        # 「锁定代码」：锁上之后框里只摆台词 —— 从行里第一个 { 到最后一个 }
+        # 那一整段（含夹在中间的字）都不摆进框，改字 / 全选重写都不会把它删掉
+        # （右键菜单里开关，状态记在 ini 里）
+        self._suoding = du_bianji_suoding()
+        self._suoding_qian = ""     # 藏起来那段前头的字（一般没有）
+        self._suoding_hide = ""     # 从第一个 { 到最后一个 } 那一整段
+        self._suoding_yuan = ""     # 锁定时整行原文（一个字没动过就整行还回去）
+        self._suoding_chun = ""     # 藏完之后该显示的样子（拿它比用户动没动过字）
+        self.setStyleSheet(_ys_bianji_kuang(self._zihao, self._suoding))
         self._gaoliang = _AssGaoliang(self.document())
 
         # Ctrl+滚轮 调字号时，框右上角闪一个小浮标报当前数值，免得瞎调
@@ -2815,7 +2893,7 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
         )
         if zihao != self._zihao:
             self._zihao = zihao
-            self.setStyleSheet(_ys_bianji_kuang(zihao))
+            self.setStyleSheet(_ys_bianji_kuang(zihao, self._suoding))
             xie_bianji_zihao(zihao)      # 记住，下次开软件还是这个大小
         return self._zihao
 
@@ -2907,26 +2985,120 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
         super().focusOutEvent(event)
         self.likai.emit()
 
+    # ---- 锁定代码 ----
+    def suoding(self):
+        """「锁定代码」开着没开"""
+        return bool(self._suoding)
+
+    def shezhi_suoding(self, kai):
+        """开 / 关「锁定代码」：框里当场重摆一遍
+
+        重摆前用 wenben() 取一次 —— 锁定态下它会把该接的代码接回来，
+        所以不管从哪边切，字都不会丢。
+        """
+        kai = bool(kai)
+        if kai == self._suoding:
+            return
+        wen = self.wenben()
+        self._suoding = kai
+        # 锁定时边框套一圈淡琥珀色（一眼看出这个框只摆台词）
+        self.setStyleSheet(_ys_bianji_kuang(self._zihao, kai))
+        # 重摆这一下是"换显示"，不是用户改字 —— 挡住 textChanged 别往外发
+        self.blockSignals(True)
+        self.shezhi_wenben(wen)
+        self.blockSignals(False)
+        self.moveCursor(QtGui.QTextCursor.End)
+        xie_bianji_suoding(kai)
+        self.suoding_gaile.emit(kai)
+
+    def _qiehuan_suoding(self):
+        """右键菜单里点了那一下"""
+        self.shezhi_suoding(not self._suoding)
+
+    def contextMenuEvent(self, event):
+        """右键：框本来那几项照旧，末尾再加一条「锁定代码」"""
+        cai = self.createStandardContextMenu()
+        cai.addSeparator()
+        xiang = cai.addAction(
+            "解锁代码（把藏起来的代码显示出来）" if self._suoding
+            else "锁定代码（藏起代码，只留台词）"
+        )
+        xiang.setCheckable(True)
+        xiang.setChecked(bool(self._suoding))
+        xiang.triggered.connect(lambda _=False: self._qiehuan_suoding())
+        cai.exec_(event.globalPos())
+
     # ---- 框里的显示写法 <-> 字幕文本 ----
     def shezhi_wenben(self, wen):
-        """把一条字幕的文字填进框（框里是带 \\N 标记的显示写法）"""
-        self.setPlainText(_kuang_jin(wen))
+        """把一条字幕的文字填进框（框里是带 \\N 标记的显示写法）
+
+        「锁定代码」开着时：从行里第一个 { 到最后一个 } 那一整段（含夹在中间的
+        字）都不摆进框，只摆台词；顺手把这段和整行原文记下来 —— 全选删除重写
+        的时候靠它们把代码接回去。
+        """
+        wen = str(wen or "")
+        if self._suoding:
+            self._suoding_yuan = wen
+            qi = wen.find("{")
+            zhi = wen.rfind("}") if qi >= 0 else -1
+            if qi >= 0 and zhi >= qi:
+                self._suoding_qian = wen[:qi]
+                self._suoding_hide = wen[qi:zhi + 1]
+                wen_xian = self._suoding_qian + wen[zhi + 1:]
+            else:
+                self._suoding_qian = ""
+                self._suoding_hide = ""
+                wen_xian = wen
+            self._suoding_chun = wen_xian    # 没动过字就整行还回去
+        else:
+            self._suoding_yuan = ""
+            self._suoding_qian = ""
+            self._suoding_hide = ""
+            self._suoding_chun = ""
+            wen_xian = wen
+        self.setPlainText(_kuang_jin(wen_xian))
 
     def wenben(self):
-        """取框里的文字，按字幕文本给出去（换行认 \\N，没有真换行）"""
-        return _kuang_chu(self.toPlainText())
+        """取框里的文字，按字幕文本给出去（换行认 \\N，没有真换行）
+
+        「锁定代码」开着时：框里只看得见台词，但全选删掉重写也不会真丢 ——
+        藏起来那一段自动接回去；整行一个字没动过就照原文整行还回去。
+        """
+        xian = _kuang_chu(self.toPlainText())
+        if not self._suoding:
+            return xian
+        if xian == self._suoding_chun:      # 一个字没动过：整行照搬，标签一个不丢
+            return self._suoding_yuan
+        return self._suoding_qian + self._suoding_hide + xian
 
     def _kuang_wei(self, wei):
-        """字幕文本里的位置 -> 框里的位置"""
+        """字幕文本里的位置 -> 框里的位置
+
+        「锁定代码」开着时藏着的那段不在框里，位置得把它刨掉。
+        """
         wen = self.wenben()
         wei = max(0, min(int(wei), len(wen)))
-        return wei + wen[:wei].count("\\N")
+        jian = wen[:wei]
+        if self._suoding and self._suoding_hide:
+            qi = len(self._suoding_qian)
+            zhi = qi + len(self._suoding_hide)
+            if wei <= qi:
+                jian = wen[:wei]
+            elif wei >= zhi:
+                jian = wen[:qi] + wen[zhi:wei]
+            else:
+                jian = wen[:qi]        # 落在藏起来那段上的，就认框里的开头
+        return len(jian) + jian.count("\\N")    # 每个 \N 在框里多带一个真换行
 
     def shuju_wei(self, wei):
         """框里的位置 -> 字幕文本里的位置（工具栏往选中那段加标签要用）"""
-        wen = self.toPlainText()
-        wei = max(0, min(int(wei), len(wen)))
-        return wei - wen[:wei].count("\n")
+        kuang = self.toPlainText()
+        wei = max(0, min(int(wei), len(kuang)))
+        jian = wei - kuang[:wei].count("\n")
+        if self._suoding and self._suoding_hide:
+            if jian > len(self._suoding_qian):
+                jian += len(self._suoding_hide)
+        return jian
 
     def dingwei_shuju(self, qi, zhi):
         """按字幕文本的位置在框里圈出这一段（搜索定位用）"""
@@ -3957,6 +4129,21 @@ class ShuohuaCaoweiDialog(QtWidgets.QDialog):
             }
             for i in range(CAOWEI_SHU)
         ]
+
+    def chong_tian(self, cao):
+        """外面改写了槽位配置（比如按颜色分完说话人）：把界面重填一遍"""
+        cao = [dict(x) for x in (cao or [])]
+        while len(cao) < CAOWEI_SHU:
+            cao.append({"shuohua": "", "yangshi": "Default"})
+        self._cao = cao[:CAOWEI_SHU]
+        for i in range(CAOWEI_SHU):
+            shuo = str(self._cao[i].get("shuohua") or "")
+            yang = str(self._cao[i].get("yangshi") or "Default")
+            self.shuru[i].setText(shuo)
+            xia = self.xia[i]
+            if yang and xia.findText(yang) < 0:
+                xia.addItem(yang)
+            xia.setCurrentText(yang)
 
 
 class DazijiDialog(QtWidgets.QDialog):
@@ -5687,6 +5874,7 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
     bianji_wancheng = pyqtSignal(int, str)  # 离开编辑框：这一条改完了
     gongju_gaile = pyqtSignal(str, object)  # 工具栏改了哪一样（见 _ZimuGongjulan）
     yao_yidong = pyqtSignal(int)            # 列表里 Alt+↑ / Alt+↓：选中的行整批挪一格
+    suoding_gaile = pyqtSignal(bool)        # 「锁定代码」开关变了（时间轴那边跟着换显示）
 
     LIE = ("#", "开始时间", "结束时间", "字/秒", "样式", "说话人", "文本")
     LIE_ZHEN = ("#", "开始帧", "结束帧", "字/秒", "样式", "说话人", "文本")
@@ -5757,6 +5945,8 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         self.kuang.textChanged.connect(self._wenben_bian)
         self.kuang.likai.connect(self._bianji_wancheng)
         self.kuang.xiayitiao.connect(self._xia_yi_tiao)
+        # 「锁定代码」开关一变：列表里的文本列当场重写一遍，再往外说一声
+        self.kuang.suoding_gaile.connect(self._suoding_bian)
         # 上排那些按钮得能看到编辑框里选中了哪一段（选了就只改那一段）
         self.gongjulan.shezhi_wenben_kuang(self.kuang)
         xia_bu.addWidget(self.kuang, 1)
@@ -5853,6 +6043,14 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         """按当前模式把每一行的时间列重写一遍"""
         for i, (qi, zhi, wenben) in enumerate(self._zimu):
             self._xie_hang(i, qi, zhi, wenben)
+
+    def _suoding_bian(self, kai):
+        """「锁定代码」开关变了一下：列表文本列当场重写，再往外说一声
+
+        （顺手走 _xie_hang 那一套，时间列跟着重写一遍，不碍事。）
+        """
+        self._chong_xie_shijian()
+        self.suoding_gaile.emit(bool(kai))
 
     # ---- 外部接口 ----
     def shezhi_zimu(self, zimu, xuan=None, fujia=None):
@@ -6023,6 +6221,10 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         """现在编辑的是第几条；没选中给 -1"""
         return self._xu
 
+    def suoding(self):
+        """「锁定代码」开着没开（编辑框右键那个开关）"""
+        return bool(self.kuang.suoding())
+
     def xia_yi_tiao(self):
         """换到下一条字幕（时间轴上按回车时外面喊这个），跟编辑区回车一个走法"""
         self._xia_yi_tiao()
@@ -6062,6 +6264,12 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         else:
             qi_wen = _ass_shi_jian_wenben(qi)
             zhi_wen = _ass_shi_jian_wenben(zhi)
+        # 「锁定代码」开着时，列表的文本列也只摆台词（第一个 { 到最后一个 } 那段不摆）
+        xian = (
+            _suoding_chun_wen(wenben)
+            if self.kuang.suoding()
+            else str(wenben or "")
+        )
         zi = (
             str(i + 1),
             qi_wen,
@@ -6069,7 +6277,7 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
             str(_zishu_miao(qi, zhi, wenben)),
             yang,
             shuo,
-            str(wenben or "").replace("\n", "\\N"),
+            xian.replace("\n", "\\N"),
         )
         for lie, t in enumerate(zi):
             xiang = self.biao.item(i, lie)
@@ -6204,6 +6412,9 @@ class ShezhiMianban(QtWidgets.QWidget):
     kuang_xuan_qingqiu = pyqtSignal()   # 请求在工作台的视频画面上框选
     quyu_biangeng = pyqtSignal(object)  # 区域变了 -> 让画面区重画
     huamian_jingzhi = pyqtSignal(bool)  # 「扫描时画面静止」被改了 -> 正在扫描的话马上生效
+    yanse_qingqiu = pyqtSignal()        # ⑨ 文字颜色提取：独立跑，不掺和硬字幕提取
+    yanse_xuan_qingqiu = pyqtSignal()   # ⑨ 文字颜色提取：只跑时间轴上选中的那几条
+    shuohua_qingqiu = pyqtSignal()      # ⑨ 按颜色分说话人：扫全片的颜色 + 括号，分好说话人/样式
 
     def __init__(self, zhu=None, parent=None):
         super().__init__(parent)
@@ -6216,6 +6427,12 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.quyu = None                # (x,y,w,h) 或 None
         self.moxing_lu = ""             # 检测模型 YAML
         self.ocr_lu = ""                # OCR 模型 YAML
+        # ⑨ 文字颜色提取的模型 YAML：默认就指软件自带那个 Manga-OCR
+        self.yanse_moxing_lu = (
+            YANSE_MOXING_MOREN if osp.isfile(YANSE_MOXING_MOREN) else ""
+        )
+        # ⑨ 文字颜色提取：回写时那条描边的颜色（宽度那个在下面，是个数字框）
+        self.yanse_bian_se = QtGui.QColor(YANSE_BIAN_SE_MOREN)
         self.ocr_guolv = []
         self.zhengzai = False
         self._kaishi_shike = 0.0        # 这次跑起来的时刻（算已用 / 预计完成）
@@ -6550,6 +6767,92 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.tishiyin_wenben = _zici_wenben("")
         bu.addWidget(self.tishiyin_wenben)
 
+        # ---- ⑨ 文字颜色提取（独立功能：跟硬字幕提取没关系，单独跑）----
+        bu.addWidget(_biaoti_wenben("⑨ 文字颜色提取"))
+        hang = QtWidgets.QHBoxLayout()
+        hang.setSpacing(6)
+        self.a_xuan_yanse = QtWidgets.QPushButton("选择模型 YAML…")
+        self.a_xuan_yanse.setStyleSheet(_ys_ci_anniu())
+        self.a_xuan_yanse.setToolTip(
+            "选 Manga-OCR (DBNet+48px) 那个模型：它只出文字颜色，不出文字"
+        )
+        self.a_xuan_yanse.clicked.connect(self._xuan_yanse_moxing)
+        hang.addWidget(self.a_xuan_yanse)
+        self.yanse_moxing_wenben = _zici_wenben("")
+        hang.addWidget(self.yanse_moxing_wenben, 1)
+        bu.addLayout(hang)
+
+        hang = QtWidgets.QHBoxLayout()
+        hang.setSpacing(6)
+        self.a_yanse = QtWidgets.QPushButton("提取全部")
+        self.a_yanse.setStyleSheet(_ys_ci_anniu())
+        self.a_yanse.setToolTip(
+            "给时间轴上每条字幕取一次文字颜色，写到每条开头 {\\c&H......&}\n"
+            "取图跟切片一个走法：切片设置里的「中间值」那一帧\n"
+            "取色范围跟硬字幕的「② 检测区域」走：整图就整图，框了区域就只取那块\n"
+            "跟硬字幕提取无关：不勾 OCR 也能单独跑"
+        )
+        self.a_yanse.clicked.connect(lambda *_: self.yanse_qingqiu.emit())
+        hang.addWidget(self.a_yanse)
+        self.a_yanse_xuan = QtWidgets.QPushButton("提取选中")
+        self.a_yanse_xuan.setStyleSheet(_ys_ci_anniu())
+        self.a_yanse_xuan.setToolTip(
+            "只给时间轴上「选中」的那几条字幕取颜色，用来单步试一小段\n"
+            "取色口径跟批量那个完全一样（切片「中间值」那一帧 + ② 检测区域）\n"
+            "先在时间轴上选中字幕块，再点这个"
+        )
+        self.a_yanse_xuan.clicked.connect(
+            lambda *_: self.yanse_xuan_qingqiu.emit()
+        )
+        hang.addWidget(self.a_yanse_xuan)
+        self.a_shuohua = QtWidgets.QPushButton("用颜色设置样式和说话人")
+        self.a_shuohua.setStyleSheet(_ys_ci_anniu())
+        self.a_shuohua.setToolTip(
+            "扫时间轴上每条字幕的文字颜色，把颜色相近的合成一个人\n"
+            "带「」或（）的算对话 → 说话人1 / 说话人2 …（每种颜色一个）\n"
+            "没带括号的算旁白 → 说话人就叫「旁白」\n"
+            "点开先弹个预览框给你过目（色块 / 条数 / 名字 / 样式都能改）\n"
+            "确定才写进每条的字幕样式 + 说话人，并重写 ASS"
+        )
+        self.a_shuohua.clicked.connect(
+            lambda *_: self.shuohua_qingqiu.emit()
+        )
+        hang.addWidget(self.a_shuohua)
+        hang.addStretch(1)
+        bu.addLayout(hang)
+
+        # 取色回写时那条描边：颜色 + 宽度，都在这儿自己定
+        hang = QtWidgets.QHBoxLayout()
+        hang.setSpacing(6)
+        self.a_yanse_bian_se = QtWidgets.QPushButton("描边颜色")
+        self.a_yanse_bian_se.setStyleSheet(_ys_ci_anniu())
+        self.a_yanse_bian_se.setToolTip(
+            "取色写进字幕时，文字的描边用哪个颜色\n"
+            "点一下弹调色板，选完就在这个按钮上显示出来"
+        )
+        self.a_yanse_bian_se.clicked.connect(self._xuan_yanse_bian_se)
+        hang.addWidget(self.a_yanse_bian_se)
+        hang.addWidget(QtWidgets.QLabel("描边宽度"))
+        self.yanse_bian_kuan = QtWidgets.QSpinBox()
+        self.yanse_bian_kuan.setRange(0, YANSE_BIAN_KUAN_ZUI_DA)
+        self.yanse_bian_kuan.setValue(YANSE_BIAN_KUAN_MOREN)
+        self.yanse_bian_kuan.setToolTip(
+            "取色写进字幕时那条描边多粗\n"
+            "0 = 不要描边；出厂默认 5"
+        )
+        self.yanse_bian_kuan.setFixedWidth(58)
+        self.yanse_bian_kuan.setStyleSheet(_ys_shuzi())
+        self.yanse_bian_kuan.valueChanged.connect(self._cun_tiqu_shezhi)
+        hang.addWidget(self.yanse_bian_kuan)
+        hang.addStretch(1)
+        bu.addLayout(hang)
+        self._she_yanse_bian_se(QtGui.QColor(YANSE_BIAN_SE_MOREN), ji_ini=False)
+
+        bu.addWidget(_zici_wenben(
+            "单独跑的功能。先有视频 + 检测区域 + 时间轴字幕块（硬字幕提取出来的，"
+            "或拖一份 ASS / SRT 进来），再点「提取全部」。"
+        ))
+
         hang = QtWidgets.QHBoxLayout()
         hang.setSpacing(6)
         self.a_kaishi = QtWidgets.QPushButton("开始")
@@ -6580,7 +6883,8 @@ class ShezhiMianban(QtWidgets.QWidget):
         # 开始/停止是同一个按钮，跑起来之后它就是停止按钮，任何时候都得能点
         self.a_kaishi.setEnabled(you)
         for w in (self.a_xuan_moxing, self.a_kuang_xuan, self.quyu_xiala,
-                  self.a_quan_hua, self.a_xuan_ocr):
+                  self.a_quan_hua, self.a_xuan_ocr,
+                  self.a_xuan_yanse, self.a_yanse):
             w.setEnabled(you and not self.zhengzai)
 
     def _shuaxin_lian_dong(self):
@@ -6714,6 +7018,70 @@ class ShezhiMianban(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # 选择模型 / 区域 / 目录
     # ------------------------------------------------------------------
+    def _xuan_yanse_moxing(self):
+        """⑨ 文字颜色提取：挑模型 YAML（要 Manga-OCR 那个）"""
+        lujing, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择文字颜色模型 YAML", "",
+            "YAML 配置 (*.yaml *.yml);;所有文件 (*)",
+        )
+        if not lujing:
+            return
+        self._she_yanse_moxing(lujing)
+
+    def _she_yanse_moxing(self, lujing, ji_ini=True):
+        """摆好 ⑨ 用的模型路径 + 文字；ji_ini=False 时不往回存（载入界面那会儿用）"""
+        self.yanse_moxing_lu = str(lujing or "")
+        if self.yanse_moxing_lu:
+            self.yanse_moxing_wenben.setText(
+                "模型：" + osp.basename(self.yanse_moxing_lu)
+            )
+            self.yanse_moxing_wenben.setToolTip(self.yanse_moxing_lu)
+        else:
+            self.yanse_moxing_wenben.setText("没选模型（要 Manga-OCR 那个）")
+            self.yanse_moxing_wenben.setToolTip("")
+        if ji_ini:
+            self._cun_tiqu_shezhi()
+
+    def _xuan_yanse_bian_se(self):
+        """⑨ 描边颜色：弹主界面「边框颜色」点开的那一个调色板
+
+        跟主界面那个一模一样：不带透明度那一栏（alpha=False），就一个色板 +
+        色条 + RGB/HSL/HSV 数字 + ASS/HTML + 取色器 + 最近用过。
+        """
+        yan, hao = YsgColorDialog.tiao(
+            self, self.yanse_bian_se, alpha=False, biaoti="选颜色"
+        )
+        if not hao or yan is None:
+            return
+        self._she_yanse_bian_se(yan)
+
+    def _she_yanse_bian_se(self, se, ji_ini=True):
+        """摆好 ⑨ 那条描边的颜色：按钮本身当色块，上面写上色号
+
+        ji_ini=False 时不往回存（载入界面那会儿用）。
+        """
+        se = QtGui.QColor(se) if se is not None else QtGui.QColor(255, 255, 255)
+        se.setAlpha(255)                    # 主界面那个调色板不带透明度，一律不透明
+        self.yanse_bian_se = se
+        se_hao = se.name().upper()          # #RRGGBB
+        self.a_yanse_bian_se.setText(f"描边颜色 {se_hao}")
+        # 按钮底就是这条描边色：底色亮就写黑字，暗就写白字，保证看得清
+        liang = (se.red() * 299 + se.green() * 587 + se.blue() * 114) / 1000.0
+        se_zi = "#000000" if liang > 140 else "#FFFFFF"
+        self.a_yanse_bian_se.setStyleSheet(
+            _ys_ci_anniu()
+            + "QPushButton {"
+            + f" background-color: {se_hao}; color: {se_zi};"
+            + f" border: 1px solid {se_hao};"
+            + "}"
+        )
+        self.a_yanse_bian_se.setToolTip(
+            f"取色写进字幕时，文字的描边用这个颜色（{se_hao}）\n"
+            "点一下弹主界面「边框颜色」那个调色板"
+        )
+        if ji_ini:
+            self._cun_tiqu_shezhi()
+
     def _xuan_moxing(self):
         lujing, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "选择检测模型 YAML", "",
@@ -6947,6 +7315,18 @@ class ShezhiMianban(QtWidgets.QWidget):
             pei.setValue(
                 TIQU_HUAMIAN_BUDONG, bool(self.gou_huamian_budong.isChecked())
             )
+            pei.setValue(TIQU_YANSE_MOXING, str(self.yanse_moxing_lu or ""))
+            pei.setValue(
+                TIQU_YANSE_BIAN_SE,
+                QtGui.QColor(self.yanse_bian_se).name().upper(),
+            )
+            pei.setValue(
+                TIQU_YANSE_BIAN_TOU,
+                255 - QtGui.QColor(self.yanse_bian_se).alpha(),
+            )
+            pei.setValue(
+                TIQU_YANSE_BIAN_KUAN, int(self.yanse_bian_kuan.value())
+            )
             pei.sync()
         except Exception as cuowu:      # noqa
             logger.warning(f"视频工作台：存提取设置失败 {cuowu}")
@@ -7015,6 +7395,37 @@ class ShezhiMianban(QtWidgets.QWidget):
             )
         finally:
             for w in kao:
+                w.blockSignals(False)
+
+        # ⑨ 文字颜色提取的模型：存过的用存的，没存过就用软件自带那个 Manga-OCR
+        lu = pei.value(TIQU_YANSE_MOXING, None)
+        lu = str(lu).strip() if lu else ""
+        if not lu:
+            lu = YANSE_MOXING_MOREN if osp.isfile(YANSE_MOXING_MOREN) else ""
+        self._she_yanse_moxing(lu, ji_ini=False)
+
+        # ⑨ 取色回写时那条描边：颜色 + 透明度 + 宽度（都没存过就用出厂的白/不透/5）
+        se_hao = pei.value(TIQU_YANSE_BIAN_SE, None)
+        se_hao = str(se_hao).strip() if se_hao else ""
+        se = QtGui.QColor(se_hao if se_hao else YANSE_BIAN_SE_MOREN)
+        if not se.isValid():
+            se = QtGui.QColor(YANSE_BIAN_SE_MOREN)
+        se.setAlpha(
+            255 - _shu(TIQU_YANSE_BIAN_TOU, YANSE_BIAN_TOU_MOREN,
+                       0, YANSE_BIAN_TOU_ZUI_DA)
+        )
+        for w in (self.yanse_bian_kuan,):
+            w.blockSignals(True)
+        try:
+            self._she_yanse_bian_se(se, ji_ini=False)
+            self.yanse_bian_kuan.setValue(
+                _shu(
+                    TIQU_YANSE_BIAN_KUAN, YANSE_BIAN_KUAN_MOREN,
+                    0, YANSE_BIAN_KUAN_ZUI_DA,
+                )
+            )
+        finally:
+            for w in (self.yanse_bian_kuan,):
                 w.blockSignals(False)
 
     def _kuang_xuan(self):

@@ -208,10 +208,13 @@ def _load_model_from_yaml(yaml_path):
         config = yaml.safe_load(f)
     config['config_file'] = osp.abspath(yaml_path)
     config_dir = osp.dirname(yaml_path)
-    for key in ['model_path', 'det_model_path', 'rec_model_path', 'rec_char_dict_path']:
-        if key in config and not osp.isabs(str(config[key])):
-            config[key] = osp.abspath(osp.join(config_dir, config[key]))
     model_type = config.get('type', '')
+    # manga_ocr 的模型路径是按「项目根目录」写的（跟主界面一致），它自己有解析；
+    # 这里再按 YAML 所在目录补全就补错了（configs\auto_labeling\models\...），跳过。
+    if model_type != 'manga_ocr':
+        for key in ['model_path', 'det_model_path', 'rec_model_path', 'rec_char_dict_path']:
+            if key in config and not osp.isabs(str(config[key])):
+                config[key] = osp.abspath(osp.join(config_dir, config[key]))
     def _on_message(msg):
         logger.info(f"[{model_type}] {msg}")
     # 类型 → 模块、类名 映射（与 model_manager 一致）
@@ -230,6 +233,7 @@ def _load_model_from_yaml(yaml_path):
         "rfdetr": ("anylabeling.services.auto_labeling.rfdetr", "RFDETR"),
         "ppocr_v4": ("anylabeling.services.auto_labeling.ppocr_v4", "PPOCRv4"),
         "ppocr_v6": ("anylabeling.services.auto_labeling.ppocr_v6", "PPOCRv6"),
+        "manga_ocr": ("anylabeling.services.auto_labeling.manga_ocr", "MangaOCR"),
     }
     try:
         if model_type in TYPE_MAP:
