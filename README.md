@@ -67,7 +67,9 @@ https://github.com/lhj5426/YSG
 
 
 
-同时支持 Motion Anime 动态漫 的硬字幕提取
+同时支持 Motion Anime 动态漫 的硬字幕提取 
+
+另外我的  Motion Anime 里番频道 https://t.me/galgameonHCG 
 
 <img width="1920" height="1050" alt="image" src="https://github.com/user-attachments/assets/0ac38548-6768-4862-9b8d-bca6134bdbea" />
 
