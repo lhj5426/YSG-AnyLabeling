@@ -4135,6 +4135,29 @@ SHUOHUA_GUIZE_MING = {
     SHUOHUA_GUIZE_YANSE: "按颜色（旁白也拆）",
 }
 
+# ⑨「边距 / 对齐」：所有样式共用一套（在预览框右键菜单里设）。⑨点确定时建的
+# 每个样式都照这套写 MarginL / MarginR / MarginV + Alignment；想给某一个样式
+# 单独微调，事后进样式编辑器改。出厂值跟 AEG 新建样式一个样（对齐 2 = 底部
+# 居中，三个边距 0）；实际打开预览框时先照基准样式的值来（不去动就是老样子）。
+SHUOHUA_DUIQI_MOREN = {"an": 2, "ml": 0, "mr": 0, "mv": 0}
+SHUOHUA_DUIQI_MING = {
+    7: "左上", 8: "中上", 9: "右上",
+    4: "左中", 5: "居中", 6: "右中",
+    1: "左下", 2: "中下", 3: "右下",
+}
+
+
+def _duiqi_ming(zhi):
+    """这套边距 / 对齐说成一句人话：「中下（左10 右10 垂138）」"""
+    zhi = dict(zhi or {})
+    an = int(zhi.get("an") or 2)
+    return "{}（左{} 右{} 垂{}）".format(
+        SHUOHUA_DUIQI_MING.get(an, str(an)),
+        int(zhi.get("ml") or 0),
+        int(zhi.get("mr") or 0),
+        int(zhi.get("mv") or 0),
+    )
+
 
 def _shuohua_ming(k):
     """第 k 个颜色组的默认说话人名：带上槽位快捷键（旁白占 F1，这组从 F2 起）
@@ -9776,6 +9799,93 @@ class _LiushiBuJu(QtWidgets.QLayout):
         return y + hang_gao - kuang.y()
 
 
+class BianjuDuiqiDialog(QtWidgets.QDialog):
+    """⑨里的「边距 / 对齐」：左 / 右 / 垂直三个数 + 九宫格对齐
+
+    跟样式编辑器那块一模一样（数字键盘那种排法：7 8 9 / 4 5 6 / 1 2 3）。
+    改的是一套公用值 —— ⑨点确定时建的每一个样式都照这套写边距和对齐，所以
+    这部片子出来的样式位置是一致的。想给某一个样式单独挪，事后进样式编辑器。
+    """
+
+    def __init__(self, zhi, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("边距 / 对齐")
+        self.setMinimumWidth(360)
+        self._zhi = dict(SHUOHUA_DUIQI_MOREN)
+        self._zhi.update(dict(zhi or {}))
+
+        zong = QtWidgets.QVBoxLayout(self)
+        zong.setContentsMargins(14, 12, 14, 12)
+        zong.setSpacing(10)
+
+        he = QtWidgets.QHBoxLayout()
+        he.setSpacing(14)
+        self.shuzi = {}
+        for jian, zi in (("ml", "左"), ("mr", "右"), ("mv", "垂直")):
+            lie = QtWidgets.QVBoxLayout()
+            biao = QtWidgets.QLabel(zi)
+            biao.setAlignment(Qt.AlignCenter)
+            lie.addWidget(biao)
+            kuang = QtWidgets.QSpinBox()
+            kuang.setRange(-9999, 99999)
+            kuang.setValue(int(self._zhi.get(jian) or 0))
+            kuang.setFixedWidth(72)
+            kuang.setToolTip(f"{zi}边距（像素）")
+            lie.addWidget(kuang)
+            he.addLayout(lie)
+            self.shuzi[jian] = kuang
+
+        wang = QtWidgets.QGridLayout()
+        wang.setSpacing(2)
+        self.duiqi = {}
+        dang = int(self._zhi.get("an") or 2)
+        for i, zhi_an in enumerate((7, 8, 9, 4, 5, 6, 1, 2, 3)):
+            qian = QtWidgets.QRadioButton(str(zhi_an))
+            qian.setToolTip(f"对齐 {zhi_an}（数字键盘那种排法）")
+            qian.setChecked(zhi_an == dang)
+            wang.addWidget(qian, i // 3, i % 3)
+            self.duiqi[zhi_an] = qian
+        he.addLayout(wang)
+        he.addStretch(1)
+        zong.addLayout(he)
+
+        tishi = QtWidgets.QLabel(
+            "⑨建的每个样式都照这套边距 / 对齐写一份，所有样式共用这一个。\n"
+            "想给某一个样式单独微调，事后进样式编辑器改。"
+        )
+        tishi.setWordWrap(True)
+        zong.addWidget(tishi)
+
+        an = QtWidgets.QHBoxLayout()
+        an.addStretch(1)
+        qu = QtWidgets.QPushButton("取消")
+        qu.setStyleSheet(_ys_ci_anniu())
+        ding = QtWidgets.QPushButton("确定")
+        ding.setStyleSheet(_ys_zhu_anniu())
+        for x in (qu, ding):
+            x.setFixedHeight(26)
+            x.setMinimumWidth(80)
+            an.addWidget(x)
+        zong.addLayout(an)
+        qu.clicked.connect(self.reject)
+        ding.clicked.connect(self.accept)
+
+    def jieguo(self):
+        """确定之后的这套值：{"an":…, "ml":…, "mr":…, "mv":…}"""
+        zhi = {
+            "ml": int(self.shuzi["ml"].value()),
+            "mr": int(self.shuzi["mr"].value()),
+            "mv": int(self.shuzi["mv"].value()),
+        }
+        for zhi_an, qian in self.duiqi.items():
+            if qian.isChecked():
+                zhi["an"] = int(zhi_an)
+                break
+        else:
+            zhi["an"] = int(SHUOHUA_DUIQI_MOREN["an"])
+        return zhi
+
+
 class ShuohuaFenpeiDialog(QtWidgets.QDialog):
     """⑨「用颜色设置样式和说话人」的预览框（非阻塞：show 不是 exec）
 
@@ -9794,14 +9904,17 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         点某个号就跳到那条字幕去（选中 + 播放头挪过去），外面去干活
       · 点序号格：整行选中；在表上点右键 -> 「并入到…」可以把这一组并进别的
         组（提取时同一个人被拆成两组的那种，手动合起来）；并入后这一组就没了
+      · 表上右键还有「设置边距对齐…」：一套公用的文字位置（左 / 右 / 垂直边距
+        + 对齐 1~9），⑨建的每个样式都照它写；想单独微调进样式编辑器
     """
 
     tiao_dao = pyqtSignal(int)      # 点了某个行号 -> 第几条（外面跳过去）
 
-    def __init__(self, tiao, yang_men, parent=None):
+    def __init__(self, tiao, yang_men, bianju=None, parent=None):
         """
         tiao = [(色 or None, 是不是对话), ...]，跟时间轴字幕一条对一条
         yang_men = 当前字幕的样式名（样式下拉的候选）
+        bianju = 这一套「边距 / 对齐」（外面拿基准样式的值传进来；不给就用出厂值）
 
         说话人 / 样式自带一套默认名字（F1旁白、F2说话人1、F3说话人2…，就是槽位
         那 12 个键位）。点确定之后，这份分组反过来写回「设置说话人+样式」那 12
@@ -9819,6 +9932,9 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         self.setMinimumSize(680, 520)
         self._tiao = list(tiao or [])
         self._yang_men = list(yang_men or [])
+        # 这一套「边距 / 对齐」所有样式共用（右键菜单里设，见 _she_bianju）
+        self._bianju = dict(SHUOHUA_DUIQI_MOREN)
+        self._bianju.update(dict(bianju or {}))
         self._hang = []
         self._jieguo = []
         self._zhankai = set()       # 展开了哪几组（组下标）
@@ -9941,6 +10057,18 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         """开框时那份字幕有多少条（外面点确定时拿它对一下时间轴动没动过）"""
         return len(self._tiao)
 
+    def bianju(self):
+        """这套「边距 / 对齐」（外面建样式时照它写边距 + 对齐，所有样式共用）"""
+        return dict(self._bianju)
+
+    def _she_bianju(self):
+        """右键「设置边距对齐…」：改这一套公用值（⑨建的样式都照它写位置）"""
+        kuang = BianjuDuiqiDialog(self._bianju, self)
+        if kuang.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        self._bianju = kuang.jieguo()
+        self._shua_tishi()
+
     # ---- 重新分组 ----
     def _rong_gai(self, zhi):
         self.rong_wen.setText(str(int(zhi)))
@@ -9988,14 +10116,19 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         self._chong_fen()
 
     def _shua_tishi(self):
-        """底下那行小字：一共几条、旁白几条几组、对话几条几组"""
+        """底下那行小字：一共几条、旁白几条几组、对话几条几组、边距对齐是多少
+
+        边距对齐也写这儿 —— 右键设完得有个地方看得见（不然设了什么自己都不知道）。
+        """
         pang_shu = sum(1 for _se, dui in self._tiao if not dui)
         dui_shu = sum(1 for _se, dui in self._tiao if dui)
         pang_zu = sum(1 for h in self._hang if h.get("pang"))
         dui_zu = sum(1 for h in self._hang if not h.get("pang"))
         self.tishi.setText(
             f"共 {len(self._tiao)} 条：旁白 {pang_shu} 条（{pang_zu} 组）"
-            f"，对话 {dui_shu} 条（{dui_zu} 组）"
+            f"，对话 {dui_shu} 条（{dui_zu} 组）\n"
+            f"边距对齐 {_duiqi_ming(self._bianju)}"
+            f"（右键「设置边距对齐…」改，所有样式共用这一个）"
         )
 
     def _tian_biao(self):
@@ -10269,10 +10402,12 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         return None
 
     def _you_jian_cai_dan(self, wei):
-        """表上点右键：给个「并入到…」菜单
+        """表上点右键：给「设置边距对齐…」和「并入到…」两样
 
-        并进去之后这一组就没了 —— 它的字幕全归目标组，颜色 / 说话人 / 样式都
-        照目标组的来（意思就是"这几条其实是同一个人在说"，提取时被拆开了）。
+        「设置边距对齐…」是全局的 —— 所有样式共用这一套（点哪儿都能用，不用
+        先选中哪一组）。「并入到…」只在你点到某一组时才有：并进去之后这一组
+        就没了 —— 它的字幕全归目标组，颜色 / 说话人 / 样式都照目标组的来
+        （意思就是"这几条其实是同一个人在说"，提取时被拆开了）。
 
         认哪一组：先认你选中的那一行（点序号选中的那行），没选中才看鼠标右键
         落在哪一行 —— 不然"点了第 7 组选中、右键时鼠标一歪压到第 6 组"，并的
@@ -10285,10 +10420,17 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         if zu is None:
             r = self.biao.rowAt(int(dian.y()))
             zu = self._zu_zai_hang(r) if r >= 0 else None
+        cai = QtWidgets.QMenu(self)
+        she = cai.addAction(
+            f"设置边距对齐…（现在：{_duiqi_ming(self._bianju)}）"
+        )
+        she.setToolTip("⑨建的每个样式都照这套写文字位置（左 / 右 / 垂直边距 + 对齐）")
+        she.triggered.connect(self._she_bianju)
         if zu is None or not (0 <= zu < len(self._hang)):
+            cai.exec_(self.biao.viewport().mapToGlobal(dian))
             return
         self.biao.selectRow(self._biao_hang.get(zu, zu))
-        cai = QtWidgets.QMenu(self)
+        cai.addSeparator()
         biaoti = cai.addAction(
             f"第 {zu + 1} 组：{self._hang[zu]['ming']}（{self._hang[zu]['shu']} 条）"
         )
@@ -14501,17 +14643,27 @@ class VideoWorkDialog(QtWidgets.QDialog):
         return True
 
     def ym_jiao_shan(self, ming_men):
-        """从当前字幕的样式表里删掉这几条（照 AEG 的 OnCurrentDelete）"""
+        """从当前字幕的样式表里删掉这几条（照 AEG 的 OnCurrentDelete）
+
+        样式删了，还挂在这条样式上的字幕行一并改回 Default —— 不然字幕块上
+        还顶着那个已经没了的样式名。
+        """
         if self._ass_yuan is None:
             return False
         tou = list(self._ass_yuan.get("tou") or [])
+        xia = {str(m or "").strip().lower() for m in (ming_men or [])}
         dong = False
         for ming in ming_men or []:
             dong = _shan_yangshi_hang(tou, ming) or dong
         if not dong:
             return False
         self._ass_yuan["tou"] = tou
+        # 事件行上挂着被删样式的，改回 Default
+        for h in (self._ass_yuan.get("hang") or []):
+            if str(h.get("Style") or "").strip().lower() in xia:
+                h["Style"] = "Default"
         self._zimu_hua_ji = None
+        self._ass_qing_jilu = None      # 行解析缓存重来，不然还是旧样式名
         return True
 
     def ym_jiao_pai(self, ming_men):
@@ -14889,6 +15041,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
             # 「样式库」：开样式管理器（入口在样式编辑器里，这条留着兜底）
             self._kai_yangshi_guanli()
             return
+        if jian == "bianji":
+            # 「编辑」：不看有没有选中字幕 —— 没选中也能开（载入 Default），
+            # 管理器左侧那条列表想编哪个样式点哪个，不用先去列表里选字幕块
+            self._kai_yangshi_bianji()
+            return
         xu = self.bianji_mianban.dangqian_xu()
         zimu = self.zimu_mianban.zimu_liebiao()
         if jian == "zhushi":
@@ -14899,9 +15056,6 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 self._piliang_zhushi(duo, bool(zhi))
                 return
         if not (0 <= xu < len(zimu)):
-            return
-        if jian == "bianji":
-            self._kai_yangshi_bianji()
             return
         if jian == "xiayihang":
             self._tiao_xiayitiao()
@@ -15028,7 +15182,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         一个，主色就是这组的代表色）；没抠到颜色的那些单独一组。
         每组当场建一个同名样式；同名样式已经存在就整条替换，不留旧的。
         新建 / 替换的样式一律照面板 ⑨ 的提取设置走：描边颜色、描边宽度用面板
-        上的值，阴影 0。
+        上的值，阴影 0；文字位置（边距 + 对齐）照预览框右键设的那一套，所有
+        样式共用。
         分组先在预览框里过目，点确定才写进去。
         """
         zimu = self.zimu_mianban.zimu_liebiao()
@@ -15058,7 +15213,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
             kuang.raise_()
             kuang.activateWindow()
             return
-        dlg = ShuohuaFenpeiDialog(tiao, self._zimu_yangshi_ming(), self)
+        # 预览框里那套「边距 / 对齐」的出场值照基准样式（Default）来 —— 不去
+        # 动它，建出来的样式位置就跟原来一模一样
+        ji_zhun = self._shuohua_ji_zhun_yangshi() or {}
+        bianju = {
+            k: ji_zhun[k]
+            for k in ("an", "ml", "mr", "mv")
+            if ji_zhun.get(k) is not None
+        }
+        dlg = ShuohuaFenpeiDialog(tiao, self._zimu_yangshi_ming(), bianju, self)
         dlg.accepted.connect(lambda: self._shuohua_fenpei_ding(dlg))
         dlg.finished.connect(lambda _=0: self._wang_fenpei_kuang(dlg))
         dlg.tiao_dao.connect(self._fenpei_kuang_tiao_dao)
@@ -15106,6 +15269,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._xie_hui_caowei(dlg.caowei_pei())
         ji_zhun = self._shuohua_ji_zhun_yangshi()
 
+        # 预览框里那套「边距 / 对齐」（右键设的）——所有样式共用这一个，建每个
+        # 样式都照它写位置，不再照抄基准样式的位置
+        bianju = dlg.bianju()
+
         # 1) 每行（对话组 / 旁白 / 没取到色的）都照这次的设置建一个样式：
         #    同名样式已经存在就整条替换掉 —— 每部片子都要重新提取一遍，样式
         #    必须跟着这次的色和提取设置走，留着上一部留下的旧的会对不上
@@ -15116,6 +15283,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 continue
             zi = dict(ji_zhun)
             zi["name"] = ming
+            zi.update(bianju)               # 文字位置：左 / 右 / 垂直边距 + 对齐
             if zu["se"] is not None:
                 zi["c1"] = _se_hao(zu["se"])    # 主色 = 这组的代表色
                                                 # （旁白 = 旁白里最多的那个色）
@@ -15157,6 +15325,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         xie = self._chong_xie_zimu_wenjian("分说话人")
         self.shezhi_mianban.zhuangtai_shezhi(
             f"分好 {len(fen)} 组（样式 {jian_le} 个，同名的已替换），共 {gai} 条"
+            f"，边距对齐 {_duiqi_ming(bianju)}"
             + ("，SRT / ASS 已重写" if xie else "")
             + "（Ctrl+S 保存字幕）"
         )
@@ -15425,31 +15594,37 @@ class VideoWorkDialog(QtWidgets.QDialog):
         )
 
     def _kai_yangshi_bianji(self):
-        """点了「编辑」：弹样式编辑器，改当前这条用的那个样式
+        """点了「编辑」：弹样式编辑管理器
 
+        选中了字幕就编它用的那个样式；没选中就编 Default —— 有没有选中都能开
+        （管理器左侧那份「全部样式」列表，想编哪条点哪条）。
         改的时候先只改内存里的样式表，画面立刻能看到效果；点「确定 / 应用」
-        才写回 ASS。点「取消」就把这次改的全退回去，文件也跟着退回去。
+        才写回 ASS。点「取消」就把这次改的退回去，文件也跟着退回去。
         """
         xu = self.bianji_mianban.dangqian_xu()
         zimu = self.zimu_mianban.zimu_liebiao()
-        if not (0 <= xu < len(zimu)):
-            self.shezhi_mianban.zhuangtai_shezhi("先选一条字幕，再点编辑")
-            return
+        you = 0 <= xu < len(zimu)
         jiu_chuang = getattr(self, "_yangshi_chuang", None)
         if jiu_chuang is not None:
             jiu_chuang.showNormal()
             jiu_chuang.raise_()
             jiu_chuang.activateWindow()
             return
-        fu_men = self._zimu_fu_ji
-        if len(fu_men) != len(zimu):
-            fu_men = self._zimu_fujia(zimu)
-        fu = fu_men[xu] if xu < len(fu_men) else {}
-        yang = str(fu.get("yang") or "Default")
+        yang = "Default"
+        if you:
+            fu_men = self._zimu_fu_ji
+            if len(fu_men) != len(zimu):
+                fu_men = self._zimu_fujia(zimu)
+            fu = fu_men[xu] if xu < len(fu_men) else {}
+            yang = str(fu.get("yang") or "Default")
         _jizhun, biao = self._ass_geshi_biao()
         ge = dict(biao.get(yang.strip().lower()) or _ASS_MOREN_YANGSHI)
         ge["name"] = yang
         jiu = dict(ge)
+        # 管理器左侧那份「全部样式」：当前字幕样式表里的每一条
+        zi_biao = [
+            (m, self.ym_jiao_du(m)) for m in self._zimu_yangshi_ming()
+        ]
         dlg = YangshiBianjiDialog(
             ge, self, _ziti_ming_men(), _jizhun,
             # 预览里造字体跟画面里同一个函数：字号 / 粗档 / 字距全都一样
@@ -15458,11 +15633,16 @@ class VideoWorkDialog(QtWidgets.QDialog):
             yang_men=self._zimu_yangshi_ming_quan(),
             # 编辑器底下那个「样式库」按钮 -> 开样式管理器
             kai_ku=self._kai_yangshi_guanli,
+            # 左侧「全部样式」列表（点了就切过去编它）
+            yang_biao=zi_biao,
         )
         self._yangshi_chuang = dlg
-        dlg.gaile.connect(lambda z: self._yulan_yangshi(z, yang))
+        # 正编的那条会随左侧切换变，预览跟着走 —— 别钉在开窗时那条名字上
+        dlg.gaile.connect(lambda z: self._yulan_yangshi(z, dlg.yuan_ming()))
         # 「自动化脚本 ▸ 打字机」点了确定：拿参数去给字幕加逐字淡入标签
         dlg.daziji.connect(self._daziji_tao)
+        # 编辑器底部「删除样式」：把这一个样式从 [V4+ Styles] 里拿掉
+        dlg.shanchu.connect(self._yangshi_shan_le)
         # 这个窗口开着时按 Ctrl+Z / Ctrl+Y：转过来撤字幕（照 AEG 自动化跑完
         # 还能接着撤销那个行为）
         dlg.chexiao.connect(self._chexiao)
@@ -15483,6 +15663,42 @@ class VideoWorkDialog(QtWidgets.QDialog):
 
         dlg.finished.connect(_guan_le)
         dlg.show()
+
+    def _yangshi_shan_le(self, ming):
+        """样式编辑管理器里点了「删除样式」：从 [V4+ Styles] 里拿掉那一条
+
+        还挂着这条样式的字幕行一并改回 Default（编辑区上方手动设过的那份也算），
+        不然字幕块上还顶着已经没了的样式名。
+        """
+        ming = str(ming or "").strip()
+        if not ming or self._ass_yuan is None:
+            return
+        if not self.ym_jiao_shan([ming]):
+            self.shezhi_mianban.zhuangtai_shezhi(f"样式「{ming}」没删掉")
+            return
+        self._zimu_hua_ji = None
+        # 字幕面板里手动设过这条样式的行，也改回 Default
+        yao = ming.lower()
+        for i, fu in enumerate(self.zimu_mianban.hang_fu_liebiao()):
+            if str((fu or {}).get("yang") or "").strip().lower() != yao:
+                continue
+            xin = dict(fu or {})
+            xin["yang"] = "Default"
+            self.zimu_mianban.shezhi_hang_fu(i, xin)
+        # 字段缓存重算：长度跟字幕条数一样的话不会自己重算，得手动作废
+        self._zimu_fu_ji = []
+        self._zimu_pei_ji = []
+        self._zimu_fujia(self.zimu_mianban.zimu_liebiao())
+        self._shuaxin_huamian_zimu()
+        # 下拉候选跟着更新，别让刚删掉的名字还留在选单里
+        self.bianji_mianban.shezhi_yangshi_ming(self._zimu_yangshi_ming_xia())
+        self._shuaxin_gongju()
+        self._shuaxin_kuai_yanse()
+        xie = self._chong_xie_zimu_wenjian("删样式")
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"样式「{ming}」已删除"
+            + ("，SRT / ASS 已重写" if xie else "")
+        )
 
     def _yulan_yangshi(self, zi, yang):
         """样式编辑器里改一下：先只改内存里的样式表，画面上立刻能看到"""

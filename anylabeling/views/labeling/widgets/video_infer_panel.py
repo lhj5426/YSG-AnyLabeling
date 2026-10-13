@@ -3708,11 +3708,14 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         try:
             you = bool(fu)
             for kuang in (
-                self.gou_zhushi, self.xia_yang, self.an_yang, self.xia_shuo,
+                self.gou_zhushi, self.xia_yang, self.xia_shuo,
                 self.shuzi_ceng, self.shuru_kaishi, self.shuru_jieshu,
                 self.lian_shichang, self.an_fn, self.an_xiayihang,
             ):
                 kuang.setEnabled(you)
+            # 「编辑」不看有没有选中字幕：没选中也能开样式编辑管理器
+            # （里面左侧那份「全部样式」列表想编哪条点哪条）
+            self.an_yang.setEnabled(True)
             for an in list(self._zi_anniu.values()) + list(
                 self._yanse_anniu.values()
             ):
@@ -4399,22 +4402,36 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
     gaile = pyqtSignal(object)
     queren = pyqtSignal(object)
     daziji = pyqtSignal(object)     # 「打字机」点了确定：参数交给外面去套用
+    shanchu = pyqtSignal(str)       # 「删除样式」：要删的样式名，交给外面去删
     chexiao = pyqtSignal()          # 这个窗口里按了 Ctrl+Z：转给工作台去撤字幕
     chongzuo = pyqtSignal()         # Ctrl+Y
 
     def __init__(self, ziduan, parent=None, ziti_men=None,
                  jizhun=None, ziti_gongchang=None, yang_men=None,
-                 ming_jian_cha=None, kai_ku=None):
+                 ming_jian_cha=None, kai_ku=None, yang_biao=None):
         super().__init__(parent)
-        self.setWindowTitle("样式编辑器")
+        self.setWindowTitle("样式编辑管理器")
         self.setModal(False)        # 非模态：开着这个窗口照样能操作工作台
         # 能最小化，不挡路；关掉就销毁
         self.setWindowFlags(self.windowFlags() | Qt.WindowMinimizeButtonHint)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
-        self.setMinimumWidth(600)
+        self.setMinimumWidth(780)
         self._ziduan = dict(ziduan or {})
         # 打开编辑器时那条样式的名字：新建 / 复制出来的新名字就挂在它后面
         self._yuan_ming = str(self._ziduan.get("name") or "").strip() or "Default"
+        # 左侧「全部样式」列表：[(名字, 字段), ...]，就是这份字幕现在的样式表。
+        # 点列表里一条就切过去编它 —— 不用先回主界面选字幕块、再回编辑器选样式。
+        self._yang_biao = {}
+        for _xiang in (yang_biao or []):
+            if isinstance(_xiang, (list, tuple)) and len(_xiang) == 2:
+                _ming = str(_xiang[0] or "").strip()
+                if _ming and _ming.lower() not in {
+                    x.lower() for x in self._yang_biao
+                }:
+                    self._yang_biao[_ming] = dict(_xiang[1] or {})
+        if self._yuan_ming.lower() not in {x.lower() for x in self._yang_biao}:
+            # 手上这条不在表里（新建 / 没开字幕）：补一条，别让列表空着
+            self._yang_biao[self._yuan_ming] = dict(self._ziduan)
         # 样式名候选（给下面「自动化脚本」里的槽位配置用）
         self._yang_men = [str(x) for x in (yang_men or []) if str(x) != ""]
         # 名字检查：外面拿它拦「撞名 / 名字空」（返回 False 就不关窗口）。
@@ -4431,6 +4448,22 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
         wai.setContentsMargins(10, 10, 10, 10)
         wai.setSpacing(8)
 
+        shen = QtWidgets.QHBoxLayout()
+        shen.setSpacing(8)
+
+        # ---- 左侧：全部样式（点一条就切过去编它）----
+        ce = QtWidgets.QGroupBox("全部样式")
+        ce.setFixedWidth(150)
+        cg = QtWidgets.QVBoxLayout(ce)
+        cg.setSpacing(6)
+        self.lie_yangshi = QtWidgets.QListWidget()
+        self.lie_yangshi.setToolTip(
+            "这份字幕里的样式都列在这儿：点一条就切过去编它\n"
+            "（切之前，手上这份会先「应用」出去）"
+        )
+        cg.addWidget(self.lie_yangshi, 1)
+        shen.addWidget(ce)
+
         zhu = QtWidgets.QHBoxLayout()
         zhu.setSpacing(8)
         zuo = QtWidgets.QVBoxLayout()
@@ -4439,7 +4472,8 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
         you.setSpacing(8)
         zhu.addLayout(zuo, 3)
         zhu.addLayout(you, 2)
-        wai.addLayout(zhu, 1)
+        shen.addLayout(zhu, 1)
+        wai.addLayout(shen, 1)
 
         # ---- 样式名 ----
         he = QtWidgets.QGroupBox("样式名")
@@ -4638,7 +4672,13 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
             "照 AEG 的 Copy：照现在这份复制一份，名字自动加「 - Copy」\n"
             "（重名就往后排序号）"
         )
-        for x in (self.an_xin, self.an_fuzhi):
+        self.an_shan = QtWidgets.QPushButton("删除样式")
+        self.an_shan.setStyleSheet(_ys_ci_anniu())
+        self.an_shan.setToolTip(
+            "把手上正编的这条样式删掉\n"
+            "（这条要是还有字幕行在用，那些行会回到 Default）"
+        )
+        for x in (self.an_xin, self.an_fuzhi, self.an_shan):
             x.setFixedHeight(26)
             x.setMinimumWidth(72)
             an.addWidget(x)
@@ -4679,6 +4719,10 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
         self.an_queding.clicked.connect(self._queding)
         self.an_xin.clicked.connect(self._xin_jian_yangshi)
         self.an_fuzhi.clicked.connect(self._fuzhi_yangshi)
+        self.an_shan.clicked.connect(self._shan_yangshi)
+        # 左侧列表：换条 = 切过去编它（高亮挪动是高亮，不是用户点，blockSignals 挡了）
+        self.lie_yangshi.currentRowChanged.connect(self._lie_huan_le)
+        self._chong_liebiao()
 
     def _shuzi_biao(self, wang, hang, zi, tishi, moren,
                     zui_xiao=0.0, zui_da=10000.0):
@@ -4932,7 +4976,19 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
         zi = self._shou_ji()
         if self._ming_jian_cha is not None and not self._ming_jian_cha(zi):
             return False
+        jiu = self._yuan_ming            # 出去之前先记住这条原来叫什么
         self.queren.emit(zi)
+        # 左侧列表跟着改：改了名就把旧的摘掉，新名（或改过的这份）记上。
+        # 名字没动、表里本来就有 —— 不重铺列表（省得把鼠标点的那条清掉）
+        ming = str(zi.get("name") or "").strip() or jiu
+        zai = any(k.lower() == ming.lower() for k in self._yang_biao)
+        gai_ming = bool(jiu) and jiu.lower() != ming.lower()
+        if gai_ming:
+            for k in [k for k in self._yang_biao if k.lower() == jiu.lower()]:
+                self._yang_biao.pop(k, None)
+        self._yang_biao[ming] = dict(zi)
+        if gai_ming or not zai:
+            self._chong_liebiao()
         return True
 
     def _queding(self):
@@ -4973,6 +5029,73 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
         self._sheng_cheng.add(ming.strip().lower())
         return ming
 
+    # ---- 左侧「全部样式」列表 ----
+    def _chong_liebiao(self):
+        """按 _yang_biao 重铺左侧列表，高亮正编的那条（挪高亮不算用户点）"""
+        bang = getattr(self, "lie_yangshi", None)
+        if bang is None:
+            return
+        bang.blockSignals(True)
+        try:
+            bang.clear()
+            for ming in self._yang_biao:
+                bang.addItem(ming)
+            self._liang_dangqian()
+        finally:
+            bang.blockSignals(False)
+
+    def _liang_dangqian(self):
+        """把高亮挪到正编的那条；这条不在列表里就取消高亮"""
+        bang = getattr(self, "lie_yangshi", None)
+        if bang is None:
+            return
+        zhao = -1
+        for r in range(bang.count()):
+            xiang = bang.item(r)
+            if xiang is not None and (
+                xiang.text().strip().lower() == self._yuan_ming.strip().lower()
+            ):
+                zhao = r
+                break
+        bang.blockSignals(True)
+        try:
+            bang.setCurrentRow(zhao)
+        finally:
+            bang.blockSignals(False)
+
+    def _lie_huan_le(self, hang):
+        """左侧列表点到另一条：切过去编它"""
+        if self._tian:
+            return
+        try:
+            xiang = self.lie_yangshi.item(int(hang))
+        except (TypeError, ValueError):
+            xiang = None
+        if xiang is None:
+            return
+        self._qie_yangshi(str(xiang.text() or "").strip())
+
+    def _qie_yangshi(self, ming):
+        """点左侧列表里另一条样式：手上这份先「应用」出去，再切过去编它
+
+        手上这份名字不合法（空的 / 撞名）就原地不动 —— 跟点「应用」一个规矩，
+        免得切过去把没落地的改动丢了。
+        """
+        ming = str(ming or "").strip()
+        if not ming or ming.lower() == self._yuan_ming.strip().lower():
+            self._liang_dangqian()
+            return
+        if not self._yingyong():        # 先把手上这份交出去
+            self._liang_dangqian()
+            return
+        zi = dict(self._yang_biao.get(ming) or self._ziduan)
+        zi["name"] = ming
+        self._yuan_ming = ming
+        self._quan_xin = False          # 切的这条是改，不是新建
+        self._chong_liebiao()
+        self._tian_quanbu(zi)
+        self._liang_dangqian()
+
     def _tian_quanbu(self, ziduan):
         """把一整份样式字段重新填回各个控件（新建 / 复制样式时用）"""
         self._ziduan = dict(ziduan or {})
@@ -5011,6 +5134,46 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
         zi = self._shou_ji()
         zi["name"] = self._wei_yi_ming(self._yuan_ming, "复制")
         self._quan_xin = True       # 这是新增一条，不是改原来那条
+        self._tian_quanbu(zi)
+
+    def _shan_yangshi(self):
+        """「删除样式」：把手上正编的这条从样式表里拿掉
+
+        先问一句 —— 这条可能还有字幕行在用，删了那些行会回到 Default。
+        删完自动切到列表里剩下的一条（一条不剩就摆一份 Default 出来）。
+        """
+        ming = str(self._yuan_ming or "").strip()
+        if not ming:
+            return
+        if len(self._yang_biao) <= 1:
+            QtWidgets.QMessageBox.information(
+                self, "就剩这一条了",
+                f"这份字幕只剩「{ming}」一条样式，删了就没样式可用了。",
+            )
+            return
+        if not wen_shi_fou(
+            self, "删除样式",
+            f"把样式「{ming}」删掉？",
+            "用到这条样式的字幕行会回到 Default。",
+            shi="是", fou="否", moren_shi=True,
+        ):
+            return
+        # 删表里这条，再叫外面把样式表里的那一行也拿掉
+        for k in [k for k in self._yang_biao if k.lower() == ming.lower()]:
+            self._yang_biao.pop(k, None)
+        self.shanchu.emit(ming)
+        # 切到列表里剩下的一条；一条不剩就摆一份 Default
+        xin = next(iter(self._yang_biao), "")
+        if not xin:
+            zi = dict(_YS_XIN_YANGSHI)
+            zi["name"] = "Default"
+            self._yang_biao["Default"] = zi
+            xin = "Default"
+        zi = dict(self._yang_biao.get(xin) or {})
+        zi["name"] = xin
+        self._yuan_ming = xin
+        self._quan_xin = False
+        self._chong_liebiao()
         self._tian_quanbu(zi)
 
     def quan_xin(self):
@@ -5596,15 +5759,18 @@ class YangshiGuanliDialog(QtWidgets.QDialog):
         """名字检查：空的 / 跟同一边别的样式撞了就拦下来（照 AEG 的 Apply）
 
         返回一个函数给样式编辑器，它返回 False 就不关窗口、让他改名字。
+        jiu_ming 可以给个函数（延迟取编辑器「现在正编的那条」）—— 编辑器左侧
+        能切换样式，正编的那条会变，名字检查得跟着走。
         """
         def _cha(z):
+            jiu = jiu_ming() if callable(jiu_ming) else jiu_ming
             xin = str(z.get("name") or "").strip()
             if not xin:
                 QtWidgets.QMessageBox.warning(
                     self, "名字不能空", "样式名不能是空的，随便起一个。"
                 )
                 return False
-            if xin.lower() == str(jiu_ming or "").strip().lower() and jiu_ming:
+            if xin.lower() == str(jiu or "").strip().lower() and jiu:
                 return True
             if ku_bian:
                 yi = [x for x, _z in self._ku_men]
@@ -5632,14 +5798,26 @@ class YangshiGuanliDialog(QtWidgets.QDialog):
             [x for x, _z in self._ku_men] if ku_bian
             else list(self._jiekou.ym_jiao_lie())
         )
+        # 编辑器左侧那份「全部样式」：库那边就是库里的，字幕那边是当前字幕的
+        zi_biao = (
+            [(x, z) for x, z in self._ku_men] if ku_bian
+            else [(x, self._jiekou.ym_jiao_du(x)) for x in yi]
+        )
         dlg = YangshiBianjiDialog(
             zi, self, self._ziti_men, self._jizhun, self._ziti_gongchang,
-            yang_men=yi, ming_jian_cha=self._ming_jian_cha(ku_bian, jiu_ming),
+            yang_men=yi,
+            # 正编的那条会随左侧切换变：这俩都延迟取，别钉在开窗时的名字上
+            ming_jian_cha=self._ming_jian_cha(ku_bian, lambda: dlg.yuan_ming()),
+            yang_biao=zi_biao,
         )
         self._bianji_chuang = dlg
         dlg.queren.connect(
-            lambda z: self._luo_ku(jiu_ming, z) if ku_bian
-            else self._luo_jiao(jiu_ming, z)
+            lambda z: self._luo_ku(dlg.yuan_ming(), z) if ku_bian
+            else self._luo_jiao(dlg.yuan_ming(), z)
+        )
+        # 编辑器底部「删除样式」：库那边删库里的，字幕那边删当前字幕的
+        dlg.shanchu.connect(
+            lambda m: self._shan_ku(m) if ku_bian else self._shan_jiao(m)
         )
         dlg.finished.connect(lambda _=0: setattr(self, "_bianji_chuang", None))
         dlg.show()
@@ -5675,6 +5853,27 @@ class YangshiGuanliDialog(QtWidgets.QDialog):
         self._chong_jiao_liebiao([xin])
         self.gaile.emit()
         self._shuo(f"字幕的样式「{xin}」{'改好了' if jiu_ming else '加上了'}")
+
+    def _shan_ku(self, ming):
+        """样式编辑器里点了「删除样式」：从库里删掉那一条"""
+        ming = str(ming or "").strip()
+        if not ming:
+            return
+        hang = [
+            self._zuo_hang(x, z) for x, z in self._ku_men
+            if x.strip().lower() != ming.lower()
+        ]
+        self._ku_cun_hang(hang, shuo=f"库里删掉样式「{ming}」")
+
+    def _shan_jiao(self, ming):
+        """样式编辑器里点了「删除样式」：从当前字幕的样式表里删掉那一条"""
+        ming = str(ming or "").strip()
+        if not ming:
+            return
+        if self._jiekou.ym_jiao_shan([ming]):
+            self._chong_jiao_liebiao()
+            self.gaile.emit()
+            self._shuo(f"字幕里删掉样式「{ming}」")
 
 
 class _ZimuLiebiaoBiao(QtWidgets.QTableWidget):
