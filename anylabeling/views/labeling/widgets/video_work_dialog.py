@@ -7495,6 +7495,7 @@ class ShijianZhou(QtWidgets.QWidget):
         self._xuan_zhong = self._xuan_duo[-1] if self._xuan_duo else -1
         self._miao_dian = xu
         self.update()
+        self._xuan_le_shuo()
 
     def _lian_xuan(self, xu):
         """Shift 点击：从锚点到这条，中间整片一起选上"""
@@ -7506,6 +7507,21 @@ class ShijianZhou(QtWidgets.QWidget):
         self._xuan_duo = list(range(qi, zhi + 1))
         self._xuan_zhong = xu
         self.update()
+        self._xuan_le_shuo()
+
+    def _xuan_le_shuo(self):
+        """选完喊外面一声（Ctrl 点 / Shift 连选用）
+
+        选到 2 条以上按"多选"发（跟框选一个信号），外面把字幕列表整批选上、
+        编辑区那句写"选中了 N 个字幕"；只选到 1 条按单选发；一条不剩就发 -1。
+        """
+        hang = list(self._xuan_duo)
+        if len(hang) >= 2:
+            self.kuang_xuan.emit(hang)
+        elif len(hang) == 1:
+            self.xuan_zhong.emit(int(hang[0]))
+        else:
+            self.xuan_zhong.emit(-1)
 
     def quan_xuan_kuai(self):
         """Ctrl+A：整条轨道上的块全选上
@@ -15055,6 +15071,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
             if len(duo) >= 2:
                 self._piliang_zhushi(duo, bool(zhi))
                 return
+        if jian in ("yang", "shuo"):
+            # 多选着的时候挑样式 / 说话人：一次把这批全改（跟注释一个路子）。
+            # 单选还是走下面那条老路。
+            duo = self.bianji_mianban.xuan_zhong_hang()
+            if len(duo) >= 2:
+                self._piliang_hang_fu(duo, jian, zhi)
+                return
         if not (0 <= xu < len(zimu)):
             return
         if jian == "xiayihang":
@@ -15152,6 +15175,39 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shezhi_mianban.zhuangtai_shezhi(
             f"已把 {len(hang)} 条设成"
             + ("注释（画面上不显示）" if kai else "普通字幕（照常显示）")
+            + ("，SRT / ASS 已重写" if xie else "")
+            + "（Ctrl+S 保存字幕）"
+        )
+
+    def _piliang_hang_fu(self, hang, jian, zhi):
+        """把选中的这几条一起改同一行的字段（样式 / 说话人）
+
+        多选着的时候在上面挑样式，等于给这批全换样式（Ctrl+A 全选再挑 =
+        整屏换一个样式）；说话人同理。只改这一样，别的字段原样留着。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        hang = [int(x) for x in (hang or []) if 0 <= int(x) < len(zimu)]
+        if not hang:
+            return
+        if jian == "yang":
+            # 选了只有样式库里才有的样式：先搬进当前字幕的样式表，
+            # 不然这几行在 ASS 里查不到样式，画面会退回 Default
+            self._ku_yangshi_bu_jin(zhi)
+        for i in hang:
+            fu = dict(self.bianji_mianban.hang_fu(i))
+            fu.update(self.zimu_mianban.hang_fu(i))
+            fu[jian] = zhi
+            self.zimu_mianban.shezhi_hang_fu(i, fu)
+        self._shezhi_bianji_zimu(zimu, self.bianji_mianban.dangqian_xu())
+        # 整表重建会把多选冲掉，重新选回原来这一批
+        self.bianji_mianban.shezhi_xuan_zhong_duo(hang)
+        self._zimu_tiao_wen = None
+        self._shuaxin_huamian_zimu()
+        xie = self._chong_xie_zimu_wenjian("批量改字段", "gongju")
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"已把 {len(hang)} 条的"
+            + ("样式" if jian == "yang" else "说话人")
+            + f"改成「{zhi}」"
             + ("，SRT / ASS 已重写" if xie else "")
             + "（Ctrl+S 保存字幕）"
         )

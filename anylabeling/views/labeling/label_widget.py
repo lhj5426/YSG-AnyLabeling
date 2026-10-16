@@ -3073,6 +3073,28 @@ class LabelingWidget(QtWidgets.QWidget):
             tip=self.tr("导入 Manga109 数据集的 XML 标注文件"),
         )
 
+        upload_ass_annotation = action(
+            self.tr("导入 ASS 字幕"),
+            lambda: utils.upload_zimu_annotation(self, "ass"),
+            None,
+            icon="format_coco",
+            tip=self.tr(
+                "按文件名里的时间段把字幕文字填进切片图；\n"
+                "图上没框就按图片尺寸建一个全图框"
+            ),
+        )
+
+        upload_srt_annotation = action(
+            self.tr("导入 SRT 字幕"),
+            lambda: utils.upload_zimu_annotation(self, "srt"),
+            None,
+            icon="format_coco",
+            tip=self.tr(
+                "按文件名里的时间段把字幕文字填进切片图；\n"
+                "图上没框就按图片尺寸建一个全图框"
+            ),
+        )
+
         # Export
         export_yolo_hbb_annotation = action(
             self.tr("&Export YOLO-Hbb Annotations"),
@@ -3464,6 +3486,8 @@ class LabelingWidget(QtWidgets.QWidget):
             upload_imagetrans_annotation=upload_imagetrans_annotation,
             upload_labelplus_annotation=upload_labelplus_annotation,
             upload_manga109_annotation=upload_manga109_annotation,
+            upload_ass_annotation=upload_ass_annotation,
+            upload_srt_annotation=upload_srt_annotation,
             export_yolo_hbb_annotation=export_yolo_hbb_annotation,
             export_yolo_obb_annotation=export_yolo_obb_annotation,
             export_yolo_seg_annotation=export_yolo_seg_annotation,
@@ -3771,6 +3795,9 @@ class LabelingWidget(QtWidgets.QWidget):
                 upload_imagetrans_annotation,
                 upload_labelplus_annotation,
                 upload_manga109_annotation,
+                None,
+                upload_ass_annotation,
+                upload_srt_annotation,
             ),
         )
         utils.add_actions(

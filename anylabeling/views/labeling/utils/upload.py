@@ -2,6 +2,7 @@ import json
 import jsonlines
 import os
 import os.path as osp
+import re
 from anylabeling.services.importers import convert_itp_to_anylabel, convert_manga_translator_folder_to_anylabel, convert_anylabel_folder_to_manga_translator
 import time
 import yaml
@@ -2493,3 +2494,306 @@ def upload_manga109_annotation(self):
             icon=new_icon_path("error", "svg"),
         )
         popup.show_popup(self, position="center")
+
+
+# ---------------------------------------------------------------------
+# 导入字幕（SRT / ASS）—— 就是「导出 OCR 字幕」的反向操作
+#   切片图 / 标注文件的名字里本来就带着时间段（起__止），从字幕文件里把落在
+#   这一段里的那条字幕文字取出来，写进图里那个框的 description（原文）。
+#   原来有的框：位置、标签、别的字段一律不动，只改 description。
+#   图里本来没框（连标注文件都没有）：按图片尺寸造一个铺满全图的矩形框。
+#   文件名长这样：0_00_48_330__0_00_51_300_0000007841440029614401080.jpeg
+# ---------------------------------------------------------------------
+_ZIMU_SHIJIAN = re.compile(
+    r"(\d{1,2}_\d{2}_\d{2}_\d{3})__(\d{1,2}_\d{2}_\d{2}_\d{3})"
+)
+
+ZIMU_XIN_KUANG_LABEL = "changfangtiao"   # 新造的框用什么标签；想换【只改这一行】
+
+_ZIMU_TUPIAN_KUO = (".jpeg", ".jpg", ".png", ".bmp", ".webp", ".tif", ".tiff")
+
+
+def _zimu_shi_2_miao(shi):
+    """文件名里那段 0_00_48_330 -> 48.33 秒；不是这个格式给 None"""
+    bu = str(shi).split("_")
+    if len(bu) != 4:
+        return None
+    try:
+        return (
+            int(bu[0]) * 3600
+            + int(bu[1]) * 60
+            + int(bu[2])
+            + int(bu[3]) / 1000.0
+        )
+    except ValueError:
+        return None
+
+
+def _zimu_biao_2_miao(shi):
+    """字幕里的时间串 -> 秒：SRT 的 00:00:48,330 / ASS 的 0:00:48.33 都吃"""
+    shi = str(shi).strip().replace(",", ".")
+    bu = shi.split(":")
+    try:
+        if len(bu) == 3:
+            return int(bu[0]) * 3600 + int(bu[1]) * 60 + float(bu[2])
+        if len(bu) == 2:
+            return int(bu[0]) * 60 + float(bu[1])
+        return float(shi or 0)
+    except ValueError:
+        return None
+
+
+def _zimu_chun_wen(wen):
+    """去掉 ASS 的行内标签 {\\...}；\\N \\n 换成换行，\\h 换成空格"""
+    wen = re.sub(r"\{[^{}]*\}", "", str(wen or ""))
+    wen = wen.replace("\\h", " ")
+    wen = re.sub(r"\\[Nn]", "\n", wen)
+    return wen.strip()
+
+
+def _du_srt(lu):
+    """读 SRT：[(起秒, 止秒, 文本), ...]"""
+    dan = []
+    with open(lu, "r", encoding="utf-8-sig", errors="ignore") as f:
+        quan = f.read().replace("\r\n", "\n").replace("\r", "\n")
+    for kuai in re.split(r"\n\s*\n", quan):
+        hang = [x for x in kuai.split("\n") if x.strip()]
+        if not hang:
+            continue
+        zai = -1
+        for i, x in enumerate(hang[:3]):
+            if "-->" in x:
+                zai = i
+                break
+        if zai < 0:
+            continue
+        pi = hang[zai].split("-->")
+        if len(pi) != 2:
+            continue
+        qi = _zimu_biao_2_miao(pi[0])
+        zhi = _zimu_biao_2_miao(pi[1])
+        wen = "\n".join(hang[zai + 1:]).strip()
+        if qi is None or zhi is None or not wen:
+            continue
+        dan.append((qi, zhi, wen))
+    return dan
+
+
+def _du_ass(lu):
+    """读 ASS / SSA 的 Dialogue 行：[(起秒, 止秒, 文本), ...]"""
+    dan = []
+    with open(lu, "r", encoding="utf-8-sig", errors="ignore") as f:
+        for hang in f:
+            if not hang.startswith("Dialogue:"):
+                continue
+            bu = hang.split(":", 1)[1].split(",", 9)
+            if len(bu) < 10:
+                continue
+            qi = _zimu_biao_2_miao(bu[1])
+            zhi = _zimu_biao_2_miao(bu[2])
+            wen = _zimu_chun_wen(bu[9])
+            if qi is None or zhi is None or not wen:
+                continue
+            dan.append((qi, zhi, wen))
+    return dan
+
+
+def _zhao_zimu_wenben(dan, qi, zhi):
+    """挑与 [qi, zhi]（秒）重叠最多的那条字幕文字；一条都搭不上给 None"""
+    zui, zui_chong = None, 0.0
+    for s_qi, s_zhi, wen in dan:
+        chong = min(zhi, s_zhi) - max(qi, s_qi)
+        if chong > zui_chong:
+            zui_chong, zui = chong, wen
+    return zui
+
+
+def _zimu_tu_chicun(tu_lu, shu=None):
+    """图片宽高：同名标注里记着就直接用，没有就读图片本身；读不到给 (0, 0)"""
+    if isinstance(shu, dict):
+        try:
+            w = int(shu.get("imageWidth") or 0)
+            h = int(shu.get("imageHeight") or 0)
+            if w > 0 and h > 0:
+                return w, h
+        except (TypeError, ValueError):
+            pass
+    try:
+        from PIL import Image
+
+        with Image.open(tu_lu) as tu:
+            return int(tu.width), int(tu.height)
+    except Exception:
+        return 0, 0
+
+
+def _zimu_quan_tu_kuang(w, h, wenben, biaoqian):
+    """照标注格式造一个铺满整张图的矩形框（图里本来没框时用）"""
+    return {
+        "kie_linking": [],
+        "label": str(biaoqian or ""),
+        "score": None,
+        "points": [
+            [0.0, 0.0],
+            [float(w), 0.0],
+            [float(w), float(h)],
+            [0.0, float(h)],
+        ],
+        "group_id": None,
+        "description": str(wenben or ""),
+        "translation": "",
+        "difficult": False,
+        "shape_type": "rectangle",
+        "flags": {},
+        "attributes": {},
+        "is_edited": False,
+        "is_manually_locked": False,
+    }
+
+
+def _zimu_kong_biaozhu(tu_ming, w, h, kuang):
+    """一份空的标注文件（只有那一个全图框）"""
+    return {
+        "version": "1.0.0",
+        "flags": {},
+        "shapes": [kuang],
+        "imagePath": tu_ming,
+        "imageData": None,
+        "imageHeight": int(h),
+        "imageWidth": int(w),
+        "manually_edited": True,
+        "description": "",
+    }
+
+
+def upload_zimu_annotation(self, geshi="srt"):
+    """导入 SRT / ASS 字幕：按文件名里的时间段，把字幕文字填进切片图
+
+    无痛操作：选完字幕文件就干活，不弹确认。扫当前图片所在目录（含子目录）
+    里所有名字带时间段的图片：在字幕里找那一段的字幕写进框的 description。
+    图上原来有框 → 位置 / 标签原样，只改 description；
+    图上没框（连标注文件都没有）→ 按图片尺寸造一个铺满全图的矩形框，
+    标签用 ZIMU_XIN_KUANG_LABEL。
+    """
+    if not _check_filename_exist(self):
+        return
+
+    shi_ass = str(geshi).lower() == "ass"
+    guolv = (
+        self.tr("ASS 字幕 (*.ass *.ssa);;All Files (*)")
+        if shi_ass
+        else self.tr("SRT 字幕 (*.srt);;All Files (*)")
+    )
+    input_file, _ = QtWidgets.QFileDialog.getOpenFileName(
+        self, self.tr("选择要导入的字幕文件"), "", guolv
+    )
+    if not input_file:
+        return
+
+    dan = _du_ass(input_file) if shi_ass else _du_srt(input_file)
+    if not dan:
+        popup = Popup(
+            self.tr("这个字幕文件里没读到可用的字幕（空的，或者格式不对）"),
+            self,
+            icon=new_icon_path("warning", "svg"),
+        )
+        popup.show_popup(self, position="center")
+        return
+
+    gen = osp.dirname(self.filename)
+    tian = 0              # 填上文字的张数
+    xin = 0               # 里面有几张是这次新造的框
+    cuo = 0               # 读写失败的
+    dui_bu_shang = []     # 时间跟字幕对不上的
+    try:
+        for dirpath, _, filenames in os.walk(gen):
+            for fname in filenames:
+                if not fname.lower().endswith(_ZIMU_TUPIAN_KUO):
+                    continue
+                pi = _ZIMU_SHIJIAN.search(fname)
+                if not pi:
+                    continue
+                qi = _zimu_shi_2_miao(pi.group(1))
+                zhi = _zimu_shi_2_miao(pi.group(2))
+                if qi is None or zhi is None:
+                    continue
+                wenben = _zhao_zimu_wenben(dan, qi, zhi)
+                if wenben is None:
+                    dui_bu_shang.append(fname)
+                    continue
+
+                tu_lu = os.path.join(dirpath, fname)
+                biao_lu = osp.splitext(tu_lu)[0] + ".json"
+                shu = None
+                if osp.isfile(biao_lu):
+                    try:
+                        with open(biao_lu, "r", encoding="utf-8-sig") as f:
+                            shu = json.load(f)
+                    except Exception:
+                        cuo += 1
+                        continue
+                    if not isinstance(shu, dict):
+                        shu = None
+                shapes = (shu or {}).get("shapes") or []
+
+                if shapes:
+                    # 有框：只改 description，位置 / 标签全都留着
+                    dong = False
+                    for xing in shapes:
+                        if str(xing.get("description") or "") != wenben:
+                            xing["description"] = wenben
+                            dong = True
+                    if not dong:
+                        tian += 1
+                        continue
+                else:
+                    # 没框（连标注文件都没有）：按图片尺寸造一个铺满全图的框
+                    w, h = _zimu_tu_chicun(tu_lu, shu)
+                    if w <= 0 or h <= 0:
+                        cuo += 1
+                        continue
+                    kuang = _zimu_quan_tu_kuang(
+                        w, h, wenben, ZIMU_XIN_KUANG_LABEL
+                    )
+                    if isinstance(shu, dict):
+                        shu["shapes"] = [kuang]
+                        shu.setdefault("imagePath", fname)
+                        shu["imageWidth"] = int(w)
+                        shu["imageHeight"] = int(h)
+                    else:
+                        shu = _zimu_kong_biaozhu(fname, w, h, kuang)
+                    xin += 1
+
+                try:
+                    with open(biao_lu, "w", encoding="utf-8") as f:
+                        json.dump(shu, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    cuo += 1
+                    continue
+                tian += 1
+    except Exception as e:
+        logger.error(f"导入字幕失败: {e}")
+        popup = Popup(
+            self.tr("导入字幕失败：%s") % str(e),
+            self,
+            icon=new_icon_path("error", "svg"),
+        )
+        popup.show_popup(self, position="center")
+        return
+
+    # 界面跟着换一份（当前这张图被改了的话，重载一下就看见新文字）
+    self.import_image_folder(gen, load=True)
+
+    hua = "字幕已导入：填了 %d 张" % tian
+    if xin:
+        hua += "（%d 张新造了全图框）" % xin
+    if dui_bu_shang:
+        hua += "，%d 张时间对不上" % len(dui_bu_shang)
+    if cuo:
+        hua += "，%d 张读写失败" % cuo
+    popup = Popup(
+        self.tr(hua),
+        self,
+        icon=new_icon_path("copy-green" if tian else "warning", "svg"),
+    )
+    popup.show_popup(self, popup_height=60, position="center")

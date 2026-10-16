@@ -84,6 +84,7 @@ from .upload import (
     upload_imagetrans_annotation,
     upload_labelplus_annotation,
     upload_manga109_annotation,
+    upload_zimu_annotation,
     upload_manga_translator_folder_annotation,
     export_manga_translator_folder_annotation,
 )

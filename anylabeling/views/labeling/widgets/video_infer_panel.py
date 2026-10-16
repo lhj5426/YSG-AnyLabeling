@@ -6128,7 +6128,7 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         xia_bu.setContentsMargins(12, 10, 12, 10)
         xia_bu.setSpacing(6)
 
-        self.shi_wenben = QtWidgets.QLabel("（没选中字幕块）")
+        self.shi_wenben = QtWidgets.QLabel("（没有选中字幕）")
         self.shi_wenben.setObjectName("YsgHint")
         xia_bu.addWidget(self.shi_wenben)
 
@@ -6386,14 +6386,26 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
                     self.biao.scrollToItem(
                         xiang, QtWidgets.QAbstractItemView.EnsureVisible
                     )
+        self._tian_dangqian(xu)
+
+    def _tian_dangqian(self, xu, duo=0):
+        """把编辑区换成第 xu 条的文字 / 字段（左侧列表的选择不动）
+
+        多选时也走这儿：拿这批的最后一条当"当前条"，上面那排（样式下拉、字符
+        按钮…）才好使 —— 但列表的高亮还是整批，不会改成单选。duo 是这批的
+        条数，2 条以上就把那句写成"选中了 N 个字幕"。
+        """
+        xu = int(xu)
+        if not (0 <= xu < len(self._zimu)):
+            xu = -1
+        self._xu = xu
         wenben = "" if xu < 0 else str(self._zimu[xu][2])
-        if xu < 0:
-            self.shi_wenben.setText("（没选中字幕块）")
+        if int(duo) >= 2:
+            self.shi_wenben.setText(f"选中了 {int(duo)} 个字幕")
+        elif xu < 0:
+            self.shi_wenben.setText("（没有选中字幕）")
         else:
-            qi, zhi = self._zimu[xu][0], self._zimu[xu][1]
-            self.shi_wenben.setText(
-                f"{_shi_jian_wenben(qi)} → {_shi_jian_wenben(zhi)}"
-            )
+            self.shi_wenben.setText(f"第 {xu + 1} 条")
         self.kuang.setEnabled(xu >= 0)
         if self.kuang.wenben() != wenben:
             self._tian = True
@@ -6513,7 +6525,11 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         return sorted(int(i.row()) for i in mo.selectedRows())
 
     def shezhi_xuan_zhong_duo(self, hang):
-        """外部（批量改完注释 / 别处选了）要把列表整批选中：只动高亮，编辑区不动"""
+        """外部（时间轴框选 / Ctrl+A 全选 / 别处选了）要把列表整批选中
+
+        列表高亮整批跟；编辑区那边拿这批的最后一条当"当前条"，让上面那排
+        （样式下拉、字符按钮…）照样能点、能改。
+        """
         hang = sorted(
             {int(x) for x in (hang or []) if 0 <= int(x) < len(self._zimu)}
         )
@@ -6529,6 +6545,19 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         )
         self.biao.blockSignals(False)
         self._shuaxin_zhushi_kuang(hang)
+        self._tian_dangqian(hang[-1], len(hang))
+        # 跟列表里 Ctrl+A 一样：落一下再按最终选择重写一遍那句提示
+        QtCore.QTimer.singleShot(0, self._shua_duo_tishi)
+
+    def _shua_duo_tishi(self):
+        """按列表现在的选择，把编辑区那句提示重写一遍（多选才写）
+
+        Ctrl+A 的过程中选择会变好几下发信号，中间那几下的刷新可能把"选中了
+        N 个字幕"压回"第 N 条"，所以选择落定后再按最终状态写一次。
+        """
+        hang = self.xuan_zhong_hang()
+        if len(hang) >= 2:
+            self._tian_dangqian(hang[-1], len(hang))
 
     def _shuaxin_zhushi_kuang(self, hang):
         """多选时把「注释」勾选框按这一批的状态显示：全都已经是注释才勾上
@@ -6555,6 +6584,12 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         if len(hang) >= 2:
             self._shuaxin_zhushi_kuang(hang)
             self.xuan_zhong_duo.emit(hang)
+            # 编辑区跟着切到这批的最后一条：上面那排（样式下拉…）才好使，
+            # 那句提示写"选中了 N 个字幕"（Ctrl+A 全选也是走这儿）
+            self._tian_dangqian(hang[-1], len(hang))
+            # Ctrl+A 会让选择变好几下（先一行、再全选），中间那几下按单选刷过
+            # 的提示可能把计数压回去 —— 落一下再按最终选择重写一遍，稳
+            QtCore.QTimer.singleShot(0, self._shua_duo_tishi)
             return
         if not hang:
             self.shezhi_xuan_zhong(-1)
