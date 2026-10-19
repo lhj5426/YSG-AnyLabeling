@@ -3357,6 +3357,8 @@ def _jiexi_ass(wenben):
         zhi = (int(m2.group(1)) * 3600 + int(m2.group(2)) * 60
                + int(m2.group(3))) * 1000 + int(m2.group(4)) * 10
         wen = bu[9].replace("\\N", "\n").replace("\\n", "\n")
+        # 带 \1fg(hui) 的是发光线 —— 现在它是**真的一条字幕**（设渐变发光时就
+        # 生成好了，见 _faguang_wenben），照样列进列表，不再像以前那样跳过。
         # 原样留着 {\pos(75,705)} 这些行内标签：编辑区要照着 ASS 显示全代码，
         # 画面里叠字幕也直接拿这一串去认（要去干净文字用 _ass_chun_wen）
         zimu.append((qi, zhi, wen.strip()))
@@ -4557,6 +4559,25 @@ def _ass_yanse(wen, moren=None):
     return ("#%02X%02X%02X" % (r, g, b), max(0, min(255, a)))
 
 
+def _ass_sijiao(wen):
+    """\\1vc(左上,右上,左下,右下) 的四个颜色 -> ["#RRGGBB", ...]
+
+    只认正好四个；有一个认不出来就返回 None（整条当没写，画纯色）。
+    """
+    s = str(wen or "").strip()
+    if s.startswith("("):
+        s = s[1:]
+    if s.endswith(")"):
+        s = s[:-1]
+    chu = []
+    for bu in s.split(","):
+        y = _ass_yanse(bu)
+        if not y:
+            return None
+        chu.append(y[0])
+    return chu if len(chu) == 4 else None
+
+
 def _ass_shuzi(wen, moren=0.0):
     try:
         return float(str(wen).strip())
@@ -5212,6 +5233,24 @@ def _yi_ge_biaoqian(pian, g, jichu, yangshi_biao):
         y = _ass_yanse(zhi)
         if y:
             g["c4"], g["a4"] = y
+    elif m in ("vc", "1vc", "2vc", "3vc", "4vc"):
+        # \1vc(左上,右上,左下,右下)：VSFilterMod 的四角渐变色。
+        # 1/2/3/4 分别管主填充 / 次填充 / 边框 / 阴影，跟 \1c \2c \3c \4c 一样
+        se_men = _ass_sijiao(zhi)
+        if se_men:
+            g[{"vc": "vc1", "1vc": "vc1", "2vc": "vc2",
+               "3vc": "vc3", "4vc": "vc4"}.get(m, "vc1")] = se_men
+    elif m == "1fg":
+        # \1fg(宽, 模糊, 浓度)：视频工作台自己的外发光（Aegisub 不认识，会忽略）。
+        # 浓度 0-255，越小越淡。画的时候据此在字底下先糊一层白边；
+        # 存 ASS 时拆成两条标准 Dialogue，Aegisub 那边也能看到。
+        shu = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", str(zhi or ""))]
+        if len(shu) >= 3:
+            g["fg"] = (
+                max(0.0, shu[0]),
+                max(0.0, shu[1]),
+                max(0, min(255, int(shu[2]))),
+            )
     elif m == "alpha":
         t = _ass_touming(zhi)
         if t is not None:
@@ -6223,7 +6262,68 @@ def _gs_yanse(gs, jian, a_jian, bei=1.0):
     return y
 
 
-def _hua_yi_hang_nei(huabi, lu, gs, bi, fscx, zhong_x, bei=1.0, ceng="quan"):
+def _vc_bijiao(gs, kuang, bei=1.0):
+    """\\1vc 的四角色 -> 一支渐变画笔；没写或框不成立就给 None
+
+    上下渐变：左上=右上、左下=右下（颜色沿竖着走）
+    左右渐变：左上=左下、右上=右下（颜色沿横着走）
+    四个角都不一样：按左上 -> 右下做一条对角渐变（中间取两色平均，近似）
+    kuang 是整条文字的包围盒 —— 渐变按整块算，不是每个字各渐变一遍，
+    跟 VSFilterMod 一个意思。
+    """
+    se = gs.get("vc1")
+    if not se or len(se) != 4 or kuang is None or kuang.isEmpty():
+        return None
+    tou = _ass_shuzi(gs.get("a1"), 255) * max(0.0, min(1.0, bei))
+    tou = max(0, min(255, int(round(tou))))
+    zuo_shang = QtGui.QColor(str(se[0]))
+    you_shang = QtGui.QColor(str(se[1]))
+    zuo_xia = QtGui.QColor(str(se[2]))
+    you_xia = QtGui.QColor(str(se[3]))
+    for y in (zuo_shang, you_shang, zuo_xia, you_xia):
+        y.setAlpha(tou)
+
+    def _san(c):
+        return (c.red(), c.green(), c.blue())
+
+    x1 = float(kuang.left())
+    y1 = float(kuang.top())
+    x2 = float(kuang.right() + 1)
+    y2 = float(kuang.bottom() + 1)
+    if _san(zuo_shang) == _san(you_shang) and _san(zuo_xia) == _san(you_xia):
+        jian = QtGui.QLinearGradient(x1, y1, x1, y2)
+        jian.setColorAt(0.0, zuo_shang)
+        jian.setColorAt(1.0, zuo_xia)
+    elif _san(zuo_shang) == _san(zuo_xia) and _san(you_shang) == _san(you_xia):
+        jian = QtGui.QLinearGradient(x1, y1, x2, y1)
+        jian.setColorAt(0.0, zuo_shang)
+        jian.setColorAt(1.0, you_shang)
+    elif _san(you_shang) == _san(zuo_xia):
+        # 右上 = 左下（另外两角是头尾）：走 左上 -> 右下 这条对角线
+        jian = QtGui.QLinearGradient(x1, y1, x2, y2)
+        jian.setColorAt(0.0, zuo_shang)
+        jian.setColorAt(1.0, you_xia)
+    elif _san(zuo_shang) == _san(you_xia):
+        # 左上 = 右下：走 右上 -> 左下 那条对角线
+        jian = QtGui.QLinearGradient(x2, y1, x1, y2)
+        jian.setColorAt(0.0, you_shang)
+        jian.setColorAt(1.0, zuo_xia)
+    else:
+        jian = QtGui.QLinearGradient(x1, y1, x2, y2)
+        zhong = QtGui.QColor(
+            (zuo_shang.red() + you_xia.red()) // 2,
+            (zuo_shang.green() + you_xia.green()) // 2,
+            (zuo_shang.blue() + you_xia.blue()) // 2,
+            tou,
+        )
+        jian.setColorAt(0.0, zuo_shang)
+        jian.setColorAt(0.5, zhong)
+        jian.setColorAt(1.0, you_xia)
+    return QtGui.QBrush(jian)
+
+
+def _hua_yi_hang_nei(huabi, lu, gs, bi, fscx, zhong_x, bei=1.0, ceng="quan",
+                     vc_kuang=None):
     """画一段：先阴影、再描边、最后填字（跟 ASS 的层次一样）
 
     ceng="quan" 全画；"kuang" 只画阴影+描边；"zi" 只画填充 —— xy-VSFilter 把
@@ -6253,7 +6353,11 @@ def _hua_yi_hang_nei(huabi, lu, gs, bi, fscx, zhong_x, bei=1.0, ceng="quan"):
             bi_bi.setCapStyle(Qt.RoundCap)
             huabi.strokePath(lu, bi_bi)
     if ceng in ("quan", "zi"):
-        huabi.fillPath(lu, _gs_yanse(gs, "c1", "a1", bei))
+        bian = _vc_bijiao(gs, vc_kuang, bei) if vc_kuang is not None else None
+        if bian is not None:
+            huabi.fillPath(lu, bian)      # 写了 \1vc：整块四角渐变
+        else:
+            huabi.fillPath(lu, _gs_yanse(gs, "c1", "a1", bei))
     huabi.restore()
 
 
@@ -6623,8 +6727,28 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
                 lu_da = QtGui.QPainterPath()
                 lu_da.addText(x_dang * fangda, di * fangda, ziti_d, wen_d)
             lu = QtGui.QTransform().scale(1.0 / fangda, 1.0 / fangda).map(lu_da)
+            fg = gs_hua.get("fg")
+            if fg:
+                # 外发光：同一条字先垫一层"粗白边 + 模糊 + 填充全透明"。排在本体
+                # 前面就是画在下面，本体再盖上去 —— 光晕在字外圈，字本身不糊。
+                gs_g = dict(gs_hua)
+                gs_g["bord"] = float(fg[0])
+                gs_g["blur"] = float(fg[1])
+                gs_g["c3"] = "#FFFFFF"
+                gs_g["a3"] = 255 - int(fg[2])   # 浓度 -> alpha（ASS 的 alpha 反着来）
+                gs_g["a1"] = 0
+                gs_g["shad"] = 0.0
+                gs_g.pop("vc1", None)
+                wen_duan.append((lu, gs_g, ju_dang, zhong_x))
             wen_duan.append((lu, gs_hua, ju_dang, zhong_x))
             x_dang += kuan_d
+
+    # 整条文字的包围盒：\1vc 四角渐变按它算（整块一块渐变，不是每个字各来一遍）
+    vc_kuang = None
+    if any((g.get("vc1") for _l, g, _j, _z in wen_duan)):
+        for lu_k, _g, _j, _z in wen_duan:
+            k_k = lu_k.boundingRect()
+            vc_kuang = k_k if vc_kuang is None else vc_kuang.united(k_k)
 
     # 第一遍：写了 \blur 的段，按糊的量分组，每组的"阴影+描边"合进一张位图
     # 糊一次再贴回（VSFilter 的 PaintFromBluredOverlay 就是整层糊一次；
@@ -6662,7 +6786,7 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
             # 描边阴影全没有的（\bord0\shad0），照 VSFilter 整字一起糊
             _hua_yi_hang_nei(
                 tb, lu, gs_hua, 1.0, fscx, zhong_x, bei,
-                "kuang" if you_bian else "quan",
+                "kuang" if you_bian else "quan", vc_kuang,
             )
         tb.end()
         _mo_tu(tu, sigma)
@@ -6691,7 +6815,9 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
             huabi.setClipPath(lu_huamian)
         else:
             huabi.setClipPath(ju_lu)
-        _hua_yi_hang_nei(huabi, lu, gs_hua, 1.0, fscx, zhong_x, bei, "zi")
+        _hua_yi_hang_nei(
+            huabi, lu, gs_hua, 1.0, fscx, zhong_x, bei, "zi", vc_kuang
+        )
     # 第四遍：矢量绘图段照原来的次序画（它那份 \blur 柔边是自带的）
     for lu_h, gs_hua, ju_lu in hui_duan:
         if ju_lu is lu_huamian:
@@ -6967,6 +7093,94 @@ def _tou_cha_jilu(tou, jilu):
     return chu[:cha] + [""] + duan + chu[hou:]
 
 
+def _du_faguang(wen):
+    """从一行文字里读 \\1fg(宽, 模糊, 浓度) -> (宽, 模糊, 浓度) 或 None"""
+    m = re.search(r"\\1fg\(([^)]*)\)", str(wen or ""))
+    if not m:
+        return None
+    shu = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", m.group(1))]
+    if len(shu) < 3:
+        return None
+    return (
+        max(0.0, shu[0]),
+        max(0.0, shu[1]),
+        max(0, min(255, int(shu[2]))),
+    )
+
+
+def _faguang_wenben(wen, kuan, mo, nong):
+    """拿本体那行做出光晕那行：锚点 / 对齐照抄，字身换成"粗白边 + 大模糊"
+
+    照 Aegisub 手工做发光的写法：\\bord 放到发光宽度、\\blur 给足、\\3c 纯白、
+    \\1a&HFF& 让字身全透明 —— 只剩那圈被糊开的描边，就是外发光。全标准标签，
+    Aegisub / libass / VSFilterMod 都认，不依赖工作台自己的私有标签。
+
+    末尾留个 \\1fg(hui) 记号：只是给工作台认出"这条是发光线"用的（重设时靠它
+    找回配对，不再多插一条），Aegisub 里当未知标签原样留着，不影响显示。
+    """
+    s = str(wen or "")
+    pi = re.match(r"^\{([^{}]*)\}", s)
+    nei = pi.group(1) if pi else ""
+    wei = s[pi.end():] if pi else s
+    for zheng in (
+        r"\\1vc\([^)]*\)",              # 渐变色：光晕不要
+        r"\\1fg\([^)]*\)",              # 上一次的发光参数 / 记号
+        r"\\bord-?\d+(?:\.\d+)?",
+        r"\\blur-?\d+(?:\.\d+)?",
+        r"\\shad-?\d+(?:\.\d+)?",
+        r"\\3c&?H?[0-9A-Fa-f]{6,8}&?",
+        r"\\1c&?H?[0-9A-Fa-f]{6,8}&?",
+        r"\\1a&?H?[0-9A-Fa-f]{2,8}&?",
+        r"\\3a&?H?[0-9A-Fa-f]{2,8}&?",
+    ):
+        nei = re.sub(zheng, "", nei)
+    jia = "\\bord%g\\blur%g\\3c&HFFFFFF&\\3a&H%02X&\\1a&HFF&\\shad0\\1fg(hui)" % (
+        max(0.0, float(kuan)),
+        max(0.0, float(mo)),
+        255 - max(0, min(255, int(nong))),
+    )
+    return "{%s%s}%s" % (nei, jia, wei)
+
+
+def _du_jianbian_wenzi(wen):
+    """从一行文字里把「渐变 / 描边 / 发光」现在的设置读回来（弹框回显用）
+
+    返回的键都是"有才给"：si=四角色、fangxiang=上下/左右、bord=描边宽度、
+    bian=描边颜色、fg=外发光三元组。什么都没写就给空字典。
+    """
+    s = str(wen or "")
+    chu = {}
+    m = re.search(r"\\1vc\(([^)]*)\)", s)
+    if m:
+        si = _ass_sijiao(m.group(1))
+        if si:
+            chu["si"] = si
+            a, b, c, d = [x.lower() for x in si]
+            if a == b and c == d:
+                chu["fangxiang"] = "上下"
+            elif a == c and b == d:
+                chu["fangxiang"] = "左右"
+            elif b == c:
+                chu["fangxiang"] = "左上→右下"
+            elif a == d:
+                chu["fangxiang"] = "右上→左下"
+            else:
+                chu["fangxiang"] = "上下"
+    m = re.search(r"\\bord(-?\d+(?:\.\d+)?)", s)
+    if m:
+        chu["bord"] = max(0, int(float(m.group(1))))
+    m = re.search(r"\\3c(&?H?[0-9A-Fa-f]{6,8}&?)", s)
+    if m:
+        y = _ass_yanse(m.group(1))
+        if y:
+            chu["bian"] = y[0]
+    fg = _du_faguang(s)
+    if fg:
+        chu["fg"] = fg
+    return chu
+
+
+
 def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None, jilu=None, gui=None):
     """按原 ASS 的结构写出去：骨架 / 样式表 / 每行的字段原样带过去
 
@@ -7047,6 +7261,21 @@ def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None, jilu=None, gui=None):
         for jian in ("Layer", "MarginL", "MarginR", "MarginV"):
             if not str(bu.get(jian, "") or "").strip().isdigit():
                 bu[jian] = "0"
+        # 外发光：\1fg 是工作台自己的标签，Aegisub 不认。写出去时拆成两条标准
+        # Dialogue（光晕 + 本体），Aegisub 打开也能看到一样的效果。
+        # 光晕那条带 \1fg(hui) 记号，再打开时靠它认出来（_jiexi_ass 里跳过），
+        # 不会每存一次就多出一条字幕。
+        fg = _du_faguang(bu.get("Text"))
+        if fg:
+            bu["Text"] = re.sub(r"\\1fg\([^)]*\)", "", str(bu.get("Text") or ""))
+            guang = dict(bu)
+            wen_g = re.sub(r"\\1vc\([^)]*\)", "", str(guang.get("Text") or ""))
+            guang["Text"] = _jia_biaoqian(
+                wen_g,
+                "\\bord%g\\blur%g\\3c&HFFFFFF&\\3a&H%02X&\\1a&HFF&\\shad0\\1fg(hui)"
+                % (fg[0], fg[1], 255 - fg[2]),
+            )
+            hang_xin.append(guang)
         hang_xin.append(bu)
 
     lei_zhi = str(hang_xin[0].get("_lei") or "Dialogue") if hang_xin else ""
@@ -7128,6 +7357,7 @@ class ShijianZhou(QtWidgets.QWidget):
     shuohua_fenpei = pyqtSignal()           # 空白处右键「用颜色设置样式和说话人」-> 外面弹预览框
     shuohua_fen_gui = pyqtSignal()          # 空白处右键「按说话人分轨道」-> 外面重排行号
     hebing_gui = pyqtSignal()               # 空白处右键「合并到一条轨道」-> 外面收回第 1 轨
+    jianbian_zi = pyqtSignal(object)        # 选中块右键「设置渐变发光」-> 外面弹设置框
     xinjian_xuanzhong_gai = pyqtSignal(bool)  # 空白处右键切「创建字幕块后选中字幕块」-> 外面存 ini
     j_qu_gai = pyqtSignal(int)              # 按住 J 拖动 -> 范围这头跟到鼠标那一毫秒
     j_qu_tuo = pyqtSignal()                 # 按住 J 又按了鼠标 -> 外面先停下播放
@@ -8509,6 +8739,37 @@ class ShijianZhou(QtWidgets.QWidget):
             self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
             self.update()
         return gai
+
+    def kong_hang_gei(self, xu, tiaoguo=None):
+        """给第 xu 块在它**下面**找一条空轨（这段时间里没别的块占着）
+
+        发光那条要摆在本体下面又不挡人：先看紧挨着下面那条，这段时间空着就用
+        它；被别人占了就继续往下找。一条空的都找不着就顺延到最后，时间轴自己
+        会把新行开出来（字幕带就是个能摞好几层的轨道）。
+        tiaoguo = 不算进去的那一条（新插进来的光晕条自己，不然它就算占位了）。
+        """
+        tao = self._zimu_hang()
+        n = min(len(self._zimu), len(tao))
+        xu = int(xu)
+        if not (0 <= xu < n):
+            return 0
+        qi = int(self._zimu[xu][0])
+        zhi = int(self._zimu[xu][1])
+        ben = int(tao[xu])
+        for k in range(1, 10):
+            hang = ben + k
+            zhan = False
+            for i in range(n):
+                if tiaoguo is not None and i == int(tiaoguo):
+                    continue
+                if int(tao[i]) != hang:
+                    continue
+                if int(self._zimu[i][1]) > qi and int(self._zimu[i][0]) < zhi:
+                    zhan = True
+                    break
+            if not zhan:
+                return hang
+        return ben + 9
 
     def _yi_zimu_hang(self, fangxiang):
         """选中的块整批往上 / 往下挪一行（-1 上移，+1 下移）
@@ -9911,6 +10172,7 @@ class ShijianZhou(QtWidgets.QWidget):
 
         cai = QtWidgets.QMenu(self)
         a_shang = a_xia = a_he = a_shan = a_yanse = a_yanse_quan = None
+        a_jianbian = None
         a_shuohua_fenpei = None
         a_shuohua_fen_gui = None
         a_hebing_gui = None
@@ -9935,6 +10197,12 @@ class ShijianZhou(QtWidgets.QWidget):
             a_shan = cai.addAction(
                 "删除字幕块（Delete）" if len(xuan) <= 1
                 else f"删除这 {len(xuan)} 段字幕块（Delete）"
+            )
+            cai.addSeparator()
+            # 渐变发光：给选中的块套 \1vc 四角渐变 / \bord 描边 / \1fg 外发光
+            a_jianbian = cai.addAction(
+                "设置渐变发光" if len(xuan) <= 1
+                else f"设置这 {len(xuan)} 段字幕的渐变发光"
             )
             cai.addSeparator()
             # ⑨ 取色：选中的块（一或多）重新提取文字颜色
@@ -10008,6 +10276,8 @@ class ShijianZhou(QtWidgets.QWidget):
             self.shuohua_fen_gui.emit()
         elif dian_xuan is a_hebing_gui:
             self.hebing_gui.emit()
+        elif dian_xuan is a_jianbian:
+            self.jianbian_zi.emit(list(xuan))
         elif dian_xuan is a_xinjian_xuan:
             kai = bool(a_xinjian_xuan.isChecked())
             self.xinjian_xuanzhong = kai
@@ -10468,6 +10738,191 @@ class BianjuDuiqiDialog(QtWidgets.QDialog):
         else:
             zhi["an"] = int(SHUOHUA_DUIQI_MOREN["an"])
         return zhi
+
+
+class JianbianZiKuang(QtWidgets.QDialog):
+    """渐变发光：渐变（两色 + 方向）、描边、外发光，三样各管各的
+
+    渐变 / 发光都能单开、单关、或者一起开。只负责"拼标签"，字幕文本怎么改由
+    外面做。确定后调 biaoqian() 拿那串标签。
+    """
+
+    def __init__(
+        self,
+        you_jianbian=True,
+        se_shang="#000000",
+        se_xia="#FF0000",
+        fangxiang="上下",
+        bi_kuan=5,
+        bi_se="#FFFFFF",
+        fa_guang=True,
+        fa_kuan=10,
+        fa_mo=22,
+        fa_nong=150,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("渐变发光")
+        self.setModal(True)
+        self._se = {
+            "a": QtGui.QColor(se_shang),
+            "b": QtGui.QColor(se_xia),
+            "bian": QtGui.QColor(bi_se),
+        }
+
+        zong = QtWidgets.QVBoxLayout(self)
+        zong.setContentsMargins(16, 14, 16, 12)
+        zong.setSpacing(10)
+
+        biao = QtWidgets.QFormLayout()
+        biao.setSpacing(8)
+
+        # 渐变：勾上才写 \1vc；不勾就保持原来的字色，只做后面的描边 / 发光
+        self.you_jianbian = QtWidgets.QCheckBox("加渐变（两种颜色）")
+        self.you_jianbian.setChecked(bool(you_jianbian))
+        biao.addRow("", self.you_jianbian)
+
+        self._an_a = self._se_an("a")
+        self._an_b = self._se_an("b")
+        self._an_bian = self._se_an("bian")
+        biao.addRow("颜色 A（上 / 左）", self._an_a)
+        biao.addRow("颜色 B（下 / 右）", self._an_b)
+
+        self.fangxiang = QtWidgets.QComboBox()
+        # \1vc 是"四角各一个颜色"，所以除了正上下 / 正左右，还能走两条对角线
+        self._fangxiang_ming = ["上下", "左右", "左上→右下", "右上→左下"]
+        self.fangxiang.addItems(self._fangxiang_ming)
+        self.fangxiang.setCurrentText(
+            fangxiang if fangxiang in self._fangxiang_ming else "上下"
+        )
+        biao.addRow("渐变方向", self.fangxiang)
+
+        self.bi_kuan = QtWidgets.QSpinBox()
+        self.bi_kuan.setRange(0, 30)
+        self.bi_kuan.setValue(int(bi_kuan))
+        biao.addRow("描边宽度（0 = 不要描边）", self.bi_kuan)
+        biao.addRow("描边颜色", self._an_bian)
+
+        # 外发光：勾上才画，参数存在 \1fg(宽, 模糊, 浓度) 里
+        self.fa_guang = QtWidgets.QCheckBox("加白色外发光")
+        self.fa_guang.setChecked(bool(fa_guang))
+        biao.addRow("", self.fa_guang)
+        self.fa_kuan = QtWidgets.QSpinBox()
+        self.fa_kuan.setRange(1, 40)
+        self.fa_kuan.setValue(int(fa_kuan))
+        biao.addRow("发光宽度（要比描边宽）", self.fa_kuan)
+        self.fa_mo = QtWidgets.QSpinBox()
+        self.fa_mo.setRange(0, 60)
+        self.fa_mo.setValue(int(fa_mo))
+        biao.addRow("发光模糊（越大越散）", self.fa_mo)
+        self.fa_nong = QtWidgets.QSpinBox()
+        self.fa_nong.setRange(0, 255)
+        self.fa_nong.setValue(int(fa_nong))
+        biao.addRow("发光浓度（越大越白，255 最浓）", self.fa_nong)
+        zong.addLayout(biao)
+
+        # 没勾的那一摊灰掉，省得以为改了却没生效
+        self.you_jianbian.toggled.connect(self._genxin_kai)
+        self.fa_guang.toggled.connect(self._genxin_kai)
+        self._genxin_kai()
+
+        tishi = QtWidgets.QLabel(
+            "渐变按整条文字的外框算，两色填一样就是纯色。\n"
+            "只想要发光就关掉渐变，只想要渐变色就关掉发光。"
+        )
+        tishi.setWordWrap(True)
+        zong.addWidget(tishi)
+
+        an = QtWidgets.QHBoxLayout()
+        an.addStretch(1)
+        qu = QtWidgets.QPushButton("取消")
+        qu.setStyleSheet(_ys_ci_anniu())
+        ding = QtWidgets.QPushButton("确定")
+        ding.setStyleSheet(_ys_zhu_anniu())
+        for x in (qu, ding):
+            x.setFixedHeight(26)
+            x.setMinimumWidth(80)
+            an.addWidget(x)
+        zong.addLayout(an)
+        qu.clicked.connect(self.reject)
+        ding.clicked.connect(self.accept)
+
+    def _genxin_kai(self):
+        """按两个勾选框把对应的控件灰掉 / 放开"""
+        jian = self.you_jianbian.isChecked()
+        for k in (self._an_a, self._an_b, self.fangxiang):
+            k.setEnabled(jian)
+        guang = self.fa_guang.isChecked()
+        for k in (self.fa_kuan, self.fa_mo, self.fa_nong):
+            k.setEnabled(guang)
+
+    def _zhong_se(self):
+        """A、B 的正中间色：走对角线时另外两个角填它，四个角的插值才顺"""
+        a = self._se["a"]
+        b = self._se["b"]
+        return QtGui.QColor(
+            (a.red() + b.red()) // 2,
+            (a.green() + b.green()) // 2,
+            (a.blue() + b.blue()) // 2,
+        )
+
+
+    def _se_an(self, jian):
+        an = QtWidgets.QPushButton()
+        an.setFixedSize(70, 24)
+        an.setCursor(Qt.PointingHandCursor)
+        an.clicked.connect(lambda: self._xuan_se(jian, an))
+        self._shua(an, jian)
+        return an
+
+    def _shua(self, an, jian):
+        an.setStyleSheet(
+            "background:%s;border:1px solid #555;border-radius:3px;"
+            % self._se[jian].name()
+        )
+
+    def _xuan_se(self, jian, an):
+        se = QtWidgets.QColorDialog.getColor(
+            self._se[jian], self, "选一个颜色"
+        )
+        if se.isValid():
+            self._se[jian] = se
+            self._shua(an, jian)
+
+    def biaoqian(self):
+        """拼出要往字幕文本里插的那串标签（不带花括号）
+
+        渐变 / 发光各看各的勾：只勾一样就只写那样，两样都不勾就只剩描边。
+        """
+        def _h(c):
+            return "&H%02X%02X%02X&" % (c.blue(), c.green(), c.red())
+
+        chu = ""
+        if self.you_jianbian.isChecked():
+            a = _h(self._se["a"])
+            b = _h(self._se["b"])
+            # \1vc(左上, 右上, 左下, 右下)：两个色摆在哪两个角，就是哪个方向
+            fx = self.fangxiang.currentText()
+            if fx == "左右":
+                chu += "\\1vc(%s,%s,%s,%s)" % (a, b, a, b)
+            elif fx == "左上→右下":
+                m = _h(self._zhong_se())
+                chu += "\\1vc(%s,%s,%s,%s)" % (a, m, m, b)
+            elif fx == "右上→左下":
+                m = _h(self._zhong_se())
+                chu += "\\1vc(%s,%s,%s,%s)" % (m, a, b, m)
+            else:
+                chu += "\\1vc(%s,%s,%s,%s)" % (a, a, b, b)
+        kuan = int(self.bi_kuan.value())
+        if kuan > 0:
+            chu += "\\bord%d\\3c%s" % (kuan, _h(self._se["bian"]))
+        if self.fa_guang.isChecked():
+            chu += "\\1fg(%d,%d,%d)" % (
+                int(self.fa_kuan.value()),
+                int(self.fa_mo.value()),
+                int(self.fa_nong.value()),
+            )
+        return chu
 
 
 class ShuohuaFenpeiDialog(QtWidgets.QDialog):
@@ -13831,6 +14286,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shijianzhou.yin_hang_bian.connect(self._shuaxin_huamian_zimu)
         self.shijianzhou.shuohua_fen_gui.connect(self._shoudao_shuohua_fen_gui)
         self.shijianzhou.hebing_gui.connect(self._shoudao_hebing_gui)
+        self.shijianzhou.jianbian_zi.connect(self._shoudao_jianbian_zi)
         self.shijianzhou.fangxiang_jian.connect(self._fangxiangjian_tiaobu)
         self.shijianzhou.j_qu_gai.connect(self._j_qu_gai_ms)
         self.shijianzhou.j_qu_tuo.connect(self._j_qu_yu_biao)
@@ -15552,6 +16008,134 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self.shezhi_mianban.zhuangtai_shezhi("已合并到 1 条轨道")
         else:
             self.shezhi_mianban.zhuangtai_shezhi("本来就在一条轨道上")
+
+    def _shoudao_jianbian_zi(self, xuan):
+        """给选中的字幕块设渐变发光：渐变 / 描边 / 外发光，三样各管各的
+
+        写的是 \\1vc(四角颜色) + \\bord/\\3c + 工作台自己的 \\1fg(宽,模糊,浓度)。
+        外发光在别的播放器里不认，导出 ASS 时会自动拆成两条标准行。
+        打开弹框时先把第一条选中字幕现在的设置带出来（改着方便）。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        xuan = [int(x) for x in (xuan or []) if 0 <= int(x) < len(zimu)]
+        if not xuan:
+            return
+        # 回显：拿第一条选中的字幕当样子
+        xian = _du_jianbian_wenzi(str(zimu[xuan[0]][2] or ""))
+        she_guo = ("si" in xian) or ("fg" in xian)
+        if she_guo:
+            # 这条以前设过：有 \1vc 就是开了渐变，只有 \1fg 就是特意关了渐变
+            you_jianbian = "si" in xian
+            fa_guang = "fg" in xian
+        else:
+            # 新字幕：按出厂默认，渐变和发光都开
+            you_jianbian, fa_guang = True, True
+        can = {"fa_guang": fa_guang}
+        if xian.get("si"):
+            si = xian["si"]
+            can["se_shang"] = si[0]
+            can["se_xia"] = si[2]
+            can["fangxiang"] = xian.get("fangxiang", "上下")
+        if "bord" in xian:
+            can["bi_kuan"] = xian["bord"]
+        if xian.get("bian"):
+            can["bi_se"] = xian["bian"]
+        if xian.get("fg"):
+            can["fa_kuan"] = max(1, min(40, int(xian["fg"][0])))
+            can["fa_mo"] = max(0, min(60, int(xian["fg"][1])))
+            can["fa_nong"] = max(0, min(255, int(xian["fg"][2])))
+        kuang = JianbianZiKuang(you_jianbian=you_jianbian, **can, parent=self)
+        if kuang.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        biao = kuang.biaoqian()
+        yao_fg = kuang.fa_guang.isChecked()
+        fk = int(kuang.fa_kuan.value())
+        fm = int(kuang.fa_mo.value())
+        fn = int(kuang.fa_nong.value())
+        # 锚点和附加字段先一次算齐：循环里文本一改、条一插，缓存就失效要重算，
+        # 多选几十条时光这两样就够卡了
+        maodian = {}
+        if yao_fg:
+            for xu in xuan:
+                maodian[xu] = self._zimu_maodian(xu, zimu)
+        try:
+            fu_quan = self._zimu_fujia(zimu)
+        except (TypeError, AttributeError):
+            fu_quan = []
+        jian = 0
+        # 从后往前处理：每条发光都要往列表里插一条，正着走后面的索引全错位
+        for xu in sorted(xuan, reverse=True):
+            zi = self.zimu_mianban.zimu_liebiao()
+            if not (0 <= xu < len(zi)):
+                continue
+            qi, zhi = int(zi[xu][0]), int(zi[xu][1])
+            fu_yuan = dict(fu_quan[xu] or {}) if xu < len(fu_quan) else {}
+            wen = str(zi[xu][2] or "")
+            # 上一次设过的 \1vc / \1fg 先摘掉，免得越叠越多（以刚选的为准）
+            wen = re.sub(r"\\1vc\([^)]*\)", "", wen)
+            wen = re.sub(r"\\1fg\([^)]*\)", "", wen)
+            if yao_fg:
+                # 本体的锚点先落到它自己的文字里：光晕那条整串抄过去，两条才标
+                # 同一个点。不写 \pos 的话，一条描边 5、一条描边 5+发光 22，字框
+                # 一胖一瘦，AEG 按样式 + 边距摆出来就"分家"了。
+                jd = maodian.get(xu)
+                if jd is not None:
+                    wen = _pos_xie_ru(wen, jd[0], jd[1])
+            ben = _jia_biaoqian(wen, biao)
+            # 这一步只改数据，界面和文件等整批改完再统一刷一次（多选才不卡）
+            self.zimu_mianban.gai_zimu_wenben(xu, ben)
+            self.shijianzhou.gai_zimu_wenben(xu, ben)
+            jian += 1
+            if not yao_fg:
+                continue
+            # 发光那条照 Aegisub 的写法真生成一条：粗白边 + 大模糊 + 字身全透明。
+            # 已经配好的（以前设过）就改它，没有才新建，不会越设越多。
+            guang = _faguang_wenben(ben, fk, fm, fn)
+            pei = self._zhao_faguang_peidui(xu)
+            if pei is not None:
+                self.zimu_mianban.gai_zimu_wenben(pei, guang)
+                self.shijianzhou.gai_zimu_wenben(pei, guang)
+                continue
+            # 发光那条插在本体**前面**：画面是按列表顺序画的，排在前面就先画，
+            # 本体后画压在上面 —— 跟 Aegisub 里光晕写在前、本体写在后一个道理。
+            xin = self.zimu_mianban.charu_zimu(xu, qi, zhi, guang)
+            self.shijianzhou.charu_zimu(xin, qi, zhi, guang)
+            if fu_yuan:
+                # 认领本体的样式 / 说话人 / 边距，字体和位置才一致
+                self._fu_wai[(qi, zhi, guang)] = dict(fu_yuan)
+            hang = self.shijianzhou.kong_hang_gei(xu + 1, tiaoguo=xin)
+            self.shijianzhou.shezhi_hang([(xin, hang)])
+        # 整批改完：界面列表刷一次、字幕条重画一次、SRT / ASS 写一次
+        self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao())
+        self._zimu_hang_ji = None
+        self._zimu_tiao_wen = None
+        self._shuaxin_zimu_tiao()
+        xie = self._chong_xie_zimu_wenjian("设置渐变发光", "wenben")
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"已给 {jian} 段字幕设置渐变发光" + ("，字幕文件已重写" if xie else "")
+        )
+
+    def _zhao_faguang_peidui(self, xu, zimu=None):
+        """找这条字幕已经配好的光晕条：同时刻 + 纯文字一样 + 带 \\1fg(hui) 记号
+
+        重设的时候靠它认回来，原地改，不再多插一条。
+        """
+        if zimu is None:
+            zimu = self.zimu_mianban.zimu_liebiao()
+        xu = int(xu)
+        if not (0 <= xu < len(zimu)):
+            return None
+        qi, zhi, wen = zimu[xu][0], zimu[xu][1], zimu[xu][2]
+        chun = _ass_chun_wen(wen)
+        for i, t in enumerate(zimu):
+            if i == xu:
+                continue
+            if int(t[0]) != int(qi) or int(t[1]) != int(zhi):
+                continue
+            w = str(t[2] or "")
+            if "\\1fg(hui)" in w and _ass_chun_wen(w) == chun:
+                return i
+        return None
 
     def _kuai_yanse_yise(self, fu, biao):
         """一条字幕该用什么底色：没说话人 / 样式查不到 -> None（用默认蓝）"""
