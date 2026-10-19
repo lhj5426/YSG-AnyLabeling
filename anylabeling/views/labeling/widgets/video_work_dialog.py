@@ -7127,6 +7127,7 @@ class ShijianZhou(QtWidgets.QWidget):
     yanse_quan = pyqtSignal()               # 空白处右键「批量提取字幕颜色」-> 走⑨全量那路
     shuohua_fenpei = pyqtSignal()           # 空白处右键「用颜色设置样式和说话人」-> 外面弹预览框
     shuohua_fen_gui = pyqtSignal()          # 空白处右键「按说话人分轨道」-> 外面重排行号
+    hebing_gui = pyqtSignal()               # 空白处右键「合并到一条轨道」-> 外面收回第 1 轨
     xinjian_xuanzhong_gai = pyqtSignal(bool)  # 空白处右键切「创建字幕块后选中字幕块」-> 外面存 ini
     j_qu_gai = pyqtSignal(int)              # 按住 J 拖动 -> 范围这头跟到鼠标那一毫秒
     j_qu_tuo = pyqtSignal()                 # 按住 J 又按了鼠标 -> 外面先停下播放
@@ -8404,6 +8405,27 @@ class ShijianZhou(QtWidgets.QWidget):
         self.update()
         return True
 
+    def hebing_hang(self):
+        """所有块都收回第 1 行，手动加出来的空轨一并收掉
+
+        只改摆放位置，字幕内容 / 时间 / 样式一个字不动。原来分在不同轨的块
+        并到一条轨上，时间上撞在一起的会叠着显示 —— 那是数据本来就重叠，
+        想分开就选中它按 Alt+↑/↓ 挪走。
+        """
+        n = len(self._zimu)
+        tao = self._zimu_hang()
+        gai = any(h != 0 for h in tao) or int(self._guidao_shu) > 0
+        if not gai:
+            return False
+        if n:
+            self._zimu_tao = [0] * n
+        self._guidao_shu = 0
+        self._hang_gun = 0          # 行数缩回一行，原来滚的位置没意义了
+        self._jing_ban += 1
+        self.shitu_bian.emit()
+        self.update()
+        return True
+
     def _kaiguan_hang_zai(self, x, y):
         """鼠标点没点在左边那一列轨道开关上 -> 第几行（-1 = 没点）"""
         if self._shichang <= 0:
@@ -8512,6 +8534,14 @@ class ShijianZhou(QtWidgets.QWidget):
                     gai = True
         if gai:
             self.update()
+            # 挪到屏幕外面就跟着滚过去 —— 不然按一下上去 / 下去，块看不见了等于没动
+            hang_men = [
+                self._zimu_tao[x] for x in xuan if 0 <= x < len(self._zimu_tao)
+            ]
+            if hang_men:
+                self.gundong_dao_hang(
+                    min(hang_men) if int(fangxiang) < 0 else max(hang_men)
+                )
 
     def _zimu_hang_kuang(self, tiao, hang, hangshu):
         """第 hang 行（一共 hangshu 行）在字幕带里占的那一条
@@ -9529,6 +9559,16 @@ class ShijianZhou(QtWidgets.QWidget):
         # 焦点在时间轴上时，左右方向键逐帧移动播放头。时间轴自己拿到焦点后，
         # 按键不会再冒泡到外层窗口，得在这儿接住再喊外面去调帧。
         jian = event.key()
+        # Alt + ↑/↓：选中的块整批往上 / 往下挪一条轨道（挪出屏幕会跟着滚）
+        if event.modifiers() == Qt.AltModifier:
+            if jian == Qt.Key_Up:
+                self._yi_zimu_hang(-1)
+                event.accept()
+                return
+            if jian == Qt.Key_Down:
+                self._yi_zimu_hang(1)
+                event.accept()
+                return
         # PgUp / PgDn：前后翻一屏（带字幕对齐，见 _fanyie）
         if jian == Qt.Key_PageUp:
             self._fanyie(-1)
@@ -9873,6 +9913,7 @@ class ShijianZhou(QtWidgets.QWidget):
         a_shang = a_xia = a_he = a_shan = a_yanse = a_yanse_quan = None
         a_shuohua_fenpei = None
         a_shuohua_fen_gui = None
+        a_hebing_gui = None
         a_xinjian_xuan = None
         a_yin_gui = a_jia_gui = a_xian_gui = None
         if xuan:
@@ -9910,6 +9951,9 @@ class ShijianZhou(QtWidgets.QWidget):
             # 每个说话人一条轨道：同一人说的全排到同一行，认轨 / 改样式都方便
             a_shuohua_fen_gui = cai.addAction("按说话人分轨道")
             a_shuohua_fen_gui.setEnabled(bool(self._zimu))
+            # 反过来：全收回第 1 轨（分完轨觉得空轨太多、想还原成一条）
+            a_hebing_gui = cai.addAction("合并到一条轨道")
+            a_hebing_gui.setEnabled(bool(self._zimu))
             cai.addSeparator()
             # 回车建空白块之后要不要顺手把它选中（勾上 = 建完直接能编辑；
             # 不勾 = 老样子，接着按回车能一条接一条往后建）。勾不勾记在 ini 里。
@@ -9962,6 +10006,8 @@ class ShijianZhou(QtWidgets.QWidget):
             self.shuohua_fenpei.emit()
         elif dian_xuan is a_shuohua_fen_gui:
             self.shuohua_fen_gui.emit()
+        elif dian_xuan is a_hebing_gui:
+            self.hebing_gui.emit()
         elif dian_xuan is a_xinjian_xuan:
             kai = bool(a_xinjian_xuan.isChecked())
             self.xinjian_xuanzhong = kai
@@ -13784,6 +13830,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shijianzhou.shitu_bian.connect(self._shuaxin_shitu_tiao)
         self.shijianzhou.yin_hang_bian.connect(self._shuaxin_huamian_zimu)
         self.shijianzhou.shuohua_fen_gui.connect(self._shoudao_shuohua_fen_gui)
+        self.shijianzhou.hebing_gui.connect(self._shoudao_hebing_gui)
         self.shijianzhou.fangxiang_jian.connect(self._fangxiangjian_tiaobu)
         self.shijianzhou.j_qu_gai.connect(self._j_qu_gai_ms)
         self.shijianzhou.j_qu_tuo.connect(self._j_qu_yu_biao)
@@ -15494,6 +15541,17 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shijianzhou.shezhi_hang(dui)
         shu = len(shun) + (1 if you_wu else 0)
         self.shezhi_mianban.zhuangtai_shezhi(f"已按说话人分成 {shu} 条轨道")
+
+    def _shoudao_hebing_gui(self):
+        """合并到一条轨道：所有块收回第 1 轨，空轨一并收掉
+
+        跟分轨是反操作：只改摆放位置，字幕内容 / 时间 / 样式不动，
+        列表里的说话人那一列照旧，所以在列表里还是能按人分开看。
+        """
+        if self.shijianzhou.hebing_hang():
+            self.shezhi_mianban.zhuangtai_shezhi("已合并到 1 条轨道")
+        else:
+            self.shezhi_mianban.zhuangtai_shezhi("本来就在一条轨道上")
 
     def _kuai_yanse_yise(self, fu, biao):
         """一条字幕该用什么底色：没说话人 / 样式查不到 -> None（用默认蓝）"""
@@ -18605,6 +18663,18 @@ class VideoWorkDialog(QtWidgets.QDialog):
                     self._j_qu_song()
                 return True
             return super().eventFilter(duixiang, shijian)
+        # Alt + ↑/↓：选中的字幕块整批往上 / 往下挪一条轨道。焦点在哪儿都算数
+        # （字幕列表 / 编辑框 / 时间轴），跟时间轴自己那份一起用 —— 应用级的
+        # 过滤器先收到，那边就轮不上了。没选中块就放行，别吃掉别的 Alt 组合。
+        if (
+            shijian.modifiers() == Qt.AltModifier
+            and shijian.key() in (Qt.Key_Up, Qt.Key_Down)
+        ):
+            if self.shijianzhou.xuan_zhong_liebiao():
+                self.shijianzhou._yi_zimu_hang(
+                    -1 if shijian.key() == Qt.Key_Up else 1
+                )
+                return True
         if shijian.modifiers() & (
             Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
         ):
