@@ -154,6 +154,7 @@ JIEMIAN_SHISHI_GUN = "jiemian/shishi_gun"            # 记住「时间轴实时�
 JIEMIAN_BOFANGTOU_XUANZHONG = "jiemian/bofangtou_xuanzhong"  # 记住「播放头选中」开关
 JIEMIAN_HEBING_YUZHI = "jiemian/shuohua_hebing"      # 记住⑨分说话人的「合并阈值」
 JIEMIAN_FENZU_GUIZE = "jiemian/shuohua_fenzu_guize"  # 记住⑨分说话人用哪条「分组规则」
+JIEMIAN_XINJIAN_XUANZHONG = "jiemian/xinjian_zimu_xuanzhong"  # 记住「建完字幕块顺手选中它」
 CHEXIAO_ZUIDA = 100               # 撤销栈最多留几版（照 AEG 的 Limits/Undo Levels）
 CHEXIAO_HEBING_MIAO = 1.5         # 同一类动作连着做，隔这么近就算一笔（长按挪块不刷爆栈）
 ZIMU_HOUZHUI = (".srt", ".ass", ".ssa")   # 认得的字幕文件后缀（拖进窗口就载入）
@@ -165,6 +166,11 @@ ZIMU_TIAO_GAO = 34                # 画面下方那条字幕对照条的高度
 ZIMU_TIAO_ZIHAO = 15              # 字幕对照条的字号
 XINJIAN_ZIMU_MS = 3000            # 新建字幕块多长（毫秒）：按回车建空白块、插入行都用它
 #                                  （AEG 那边 Default Duration 默认也是 3000）
+# 按住 J 拉范围时那条预览框的颜色：橘黄，跟已经存在的蓝色字幕块一眼分得开
+JIAN_QU_YANSE = "#F07427"
+# 关掉的轨道：块还画（能点能改），只是整块变灰，跟开着的蓝块一眼分得开
+GUAN_HANG_DI = "#6e6e73"
+GUAN_HANG_BIAN = "#3a3a3c"
 ZIDONG_BAOCUN_MIAO = 60           # 自动保存间隔（秒）：隔这么久、字幕又变过，就存一份带时间戳的进「自动保存」
 ZIDONG_BAOCUN_JIA = "自动保存"     # 自动保存文件夹名（跟字幕文件建在同一层）
 ZIDONG_BEIFEN_JIA = "自动备份"     # 自动备份文件夹名（跟字幕文件建在同一层）
@@ -6779,6 +6785,57 @@ def _chai_ass(wenben):
     }
 
 
+GUI_JIAN = "ysgtrack"     # [Script Info] 里记"每块摆在第几轨"的那一行（小写比对）
+
+
+def _du_ass_gui(tou):
+    """从 ASS 头部读出每块的轨道号：YsgTrack: 0,0,1,2,...（没有 = None）
+
+    一条字幕一个数字，顺序跟字幕条一致。只认纯数字，写坏了就当没写过，
+    免得整片字幕被摆到乱七八糟的行上。
+    """
+    for tiao in tou or []:
+        tiao = str(tiao).strip()
+        if tiao.lower().startswith(GUI_JIAN + ":"):
+            men = []
+            for x in tiao.split(":", 1)[1].split(","):
+                x = x.strip()
+                if not x.isdigit():
+                    return None
+                men.append(int(x))
+            return men
+    return None
+
+
+def _tou_xie_gui(tou, gui):
+    """把轨道号写进 [Script Info] 段（旧的先删掉）
+
+    写一条 `YsgTrack: 0,0,1,2` 就够 —— Aegisub / 播放器都不认这行，原样留着，
+    不影响别的软件打开。
+    """
+    tou = [
+        t for t in (tou or [])
+        if not str(t).strip().lower().startswith(GUI_JIAN + ":")
+    ]
+    jian = "YsgTrack: " + ",".join(str(int(h)) for h in gui)
+    ci = -1
+    for i, t in enumerate(tou):
+        if str(t).strip().lower() == "[script info]":
+            ci = i
+            break
+    if ci < 0:
+        return tou + [jian]
+    wei = ci
+    for j in range(ci + 1, len(tou)):
+        s = str(tou[j]).strip()
+        if s.startswith("[") and s.endswith("]"):
+            break
+        if s:
+            wei = j
+    tou.insert(wei + 1, jian)
+    return tou
+
+
 # 编辑位置段：Aegisub 管它叫 [Aegisub Project Garbage]，记「上次编辑到哪儿」
 # （源码 src/subtitle_format_ass.cpp 第 92 行起、src/ass_parser.cpp 第 59 行起）
 _JILU_DUAN = "[aegisub project garbage]"
@@ -6910,7 +6967,7 @@ def _tou_cha_jilu(tou, jilu):
     return chu[:cha] + [""] + duan + chu[hou:]
 
 
-def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None, jilu=None):
+def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None, jilu=None, gui=None):
     """按原 ASS 的结构写出去：骨架 / 样式表 / 每行的字段原样带过去
 
     只有时间、条数、文字会变：每条字幕优先认原来的那一行（先认文字、再认原来
@@ -6922,6 +6979,9 @@ def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None, jilu=None):
 
     jilu = 这次的编辑位置（选中第几行 + 播放头第几帧），照 Aegisub 写在
     [Script Info] 之后、[Events] 之前，下次打开能接回去。
+
+    gui = 每块摆在第几轨（一条一个数），写进 [Script Info] 的 YsgTrack 那行，
+    下次打开照它摆回去；不给 / 条数对不上就不写。
     """
     from anylabeling.views.labeling.utils.video import (
         ASS_TEMPLATE,
@@ -6991,6 +7051,8 @@ def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None, jilu=None):
 
     lei_zhi = str(hang_xin[0].get("_lei") or "Dialogue") if hang_xin else ""
     tou = jiegou.get("tou") or []
+    if gui is not None and len(gui) == len(zimu):
+        tou = _tou_xie_gui(tou, gui)     # 轨道摆放写进 [Script Info]
     if tou and jilu is not None:
         # 编辑位置段：旧的先清掉，新的插在 [Script Info] 之后（顺序照 AEG）
         tou = _tou_cha_jilu(tou, jilu)
@@ -7014,10 +7076,11 @@ def _xie_ass_baoliu(lu, jiegou, zimu, fu_liebiao=None, jilu=None):
             )
 
 
-def _xie_zimu_dao_wenjian(lu, zimu, ass_yuan=None, fu_liebiao=None, jilu=None):
+def _xie_zimu_dao_wenjian(lu, zimu, ass_yuan=None, fu_liebiao=None, jilu=None,
+                          gui=None):
     """按扩展名挑写法：.ass / .ssa 有原结构就按原结构写，否则用模板"""
     if ass_yuan and osp.splitext(lu)[1].lower() in (".ass", ".ssa"):
-        _xie_ass_baoliu(lu, ass_yuan, zimu, fu_liebiao, jilu)
+        _xie_ass_baoliu(lu, ass_yuan, zimu, fu_liebiao, jilu, gui)
     else:
         _xie_zimu_wenjian(lu, zimu)
 
@@ -7063,10 +7126,18 @@ class ShijianZhou(QtWidgets.QWidget):
     yanse_xuan = pyqtSignal(object)         # 右键「提取选中字幕块的颜色」-> 带选中下标走⑨单条那路
     yanse_quan = pyqtSignal()               # 空白处右键「批量提取字幕颜色」-> 走⑨全量那路
     shuohua_fenpei = pyqtSignal()           # 空白处右键「用颜色设置样式和说话人」-> 外面弹预览框
+    shuohua_fen_gui = pyqtSignal()          # 空白处右键「按说话人分轨道」-> 外面重排行号
+    xinjian_xuanzhong_gai = pyqtSignal(bool)  # 空白处右键切「创建字幕块后选中字幕块」-> 外面存 ini
+    j_qu_gai = pyqtSignal(int)              # 按住 J 拖动 -> 范围这头跟到鼠标那一毫秒
+    j_qu_tuo = pyqtSignal()                 # 按住 J 又按了鼠标 -> 外面先停下播放
+    yin_hang_bian = pyqtSignal()            # 开关了轨道（眼睛）-> 外面把画面叠加字幕重刷一遍
 
     # 右键菜单末尾「谁放在下方」那两项由主窗口填（菜单是模态的，只能回调进来）
     tian_weizhi = None          # 回调：往菜单里加那两项，返回 (时间轴项, 列表项)
     dian_weizhi = None          # 回调：菜单关掉后处理点中的那项
+    # 「创建字幕块后选中字幕块」开没开：主窗口按 ini 喂进来，菜单里只读它来打勾。
+    # 默认关 = 老样子（建完就建完，接着按回车能一条接一条往后建）。
+    xinjian_xuanzhong = False
 
     CHIDU_GAO = 28
     ZUO_PAD = 12
@@ -7075,7 +7146,8 @@ class ShijianZhou(QtWidgets.QWidget):
     ZIMU_BIAN_KUAN = 6              # 离块边缘这么近就算点在边上（能左右拖）
     ZIMU_FEN_GE_KUAN = 4            # 离字幕带下边缘这么近就算点在下边缘上（能上下拖单行高度）
     ZIMU_BIAN_KUAN_DU = 2           # 字幕块描边粗细（奇数/偶数块交替两种颜色）
-    ZIMU_HANG_ZUIDA = 8             # 字幕带最多摞几行（自己往上/往下挪，想摆哪行摆哪行）
+    ZIMU_HANG_ZUIDA = 64            # 字幕带最多摞几行（自己往上/往下挪，想摆哪行摆哪行）
+    GUIDAO_KAIGUAN_KUAN = 26        # 左边那条窄列：只放轨道序号（点序号开关这条轨）
     BO_SHOU_KUAN = 16               # 波形左上角调振幅的小把手多大（正方形边长）
     KUANG_DONG_PX = 4               # 空白处按住拖这么多像素才算框选（不到就算点了一下空白）
     XIFU_PX = 8                     # 拖块时离别的块边缘这么近（像素）就吸上去
@@ -7144,10 +7216,20 @@ class ShijianZhou(QtWidgets.QWidget):
         self._xuanfu_zimu = None        # 鼠标悬在哪块字幕上（描边 + 底下整条竖带）
         self._zimu_bian_yu = None       # 鼠标悬在哪个块的哪条边（换光标 / 画把手）
         self._zimu_gao_guding = _du_zimu_gao()   # 用户调过的每行字幕块高度；None = 用默认
+        # 竖向滚动滚到第几行（整数，只会停在整行上 —— 一格滚轮滚一行，不露半行）
+        self._hang_gun = 0
+        # 手动"加轨道"加出来的空轨数（不算块占的行）：行数至少这么多
+        self._guidao_shu = 0
+        # 被关掉的轨道（行号集合）：块不画、点不中，数据照旧留着
+        self._yin_hang = set()
         self._tuo_gao = None            # 正在拖字幕带下边缘调高度：{"an_y": y, "an_gao": 高度}
         self._fen_ge_liang = False      # 鼠标有没有停在字幕带下边缘上（只换光标，不画线）
         # 空白处按住拖出来的选框：{"x0","y0","x1","y1","dong"}；None = 没在框选
         self._kuang = None
+        # 按住 J 拉出来的建块范围（ms 起止）；None = 没按着 J。
+        # 只管"画一条预览框 + 拖动时不碰别的"，真建块在窗口那边（松开 J 才建）
+        self._jian_qu = None
+        self._j_tuo = False             # 按着 J 期间鼠标也按下去了（拖动中）
         # 切片点的预览（切片设置里勾了「预览切片点」才画）：开没开 + 靠它算切点
         self._qiepian_yulan = False
         self._qiepian_peizhi = {}
@@ -7537,6 +7619,21 @@ class ShijianZhou(QtWidgets.QWidget):
         self.update()
         self.kuang_xuan.emit(list(self._xuan_duo))
 
+    def gundong_dao_hang(self, hang):
+        """竖向把第 hang 行滚进"看得见的那几行"里（已经在视野里就不动）
+
+        滚到哪儿也是整行：目标在上方就对齐到最上一行，在下方就对到最下一行，
+        不会出现半行。
+        """
+        hang = int(hang)
+        ke = self._kejian_hang_shu()
+        fan = self._gun_fanwei()
+        shang = int(self._hang_gun)
+        if shang <= hang <= shang + ke - 1:
+            return
+        xin = hang if hang < shang else hang - ke + 1
+        self.shezhi_hang_gun(max(0, min(xin, fan)))
+
     def gundong_dao_zimu(self, xu):
         """把第 xu 段滚进视野（只动视图，不动播放头）
 
@@ -7547,6 +7644,10 @@ class ShijianZhou(QtWidgets.QWidget):
         """
         if not (0 <= int(xu) < len(self._zimu)):
             return
+        # 竖向：这条要是摆在被滚上去 / 滚下去看不见的那几行，先把轨道滚回来
+        hang = self._zimu_hang()
+        if int(xu) < len(hang):
+            self.gundong_dao_hang(hang[int(xu)])
         qi, zhi, _w = self._zimu[int(xu)]
         ke = self._keshi_ms()
         if ke > 0 and self._shi_ms <= int(qi) < self._shi_ms + ke:
@@ -7857,10 +7958,16 @@ class ShijianZhou(QtWidgets.QWidget):
 
     # ---- 坐标换算 ----
     def _guidao_qu(self):
+        """轨道区（刻度尺下面那一大片）
+
+        左边让出 GUIDAO_KAIGUAN_KUAN 那么窄一条，专门放"开关轨道"的眼睛 ——
+        波形、字幕带都从眼睛右边开始，鼠标坐标换算也跟着一起让。
+        """
+        zuo = self.ZUO_PAD + self.GUIDAO_KAIGUAN_KUAN
         return QtCore.QRect(
-            self.ZUO_PAD,
+            zuo,
             self.CHIDU_GAO + 6,
-            max(0, self.width() - self.ZUO_PAD * 2),
+            max(0, self.width() - zuo - self.ZUO_PAD),
             max(0, self.height() - self.CHIDU_GAO - 6 - self.XIA_PAD),
         )
 
@@ -7911,14 +8018,115 @@ class ShijianZhou(QtWidgets.QWidget):
         huabi.drawPixmap(0, 0, self._jing_tu())
         # 再画实时层：提取中「正在讲的那一段」、播放头、它正压着的那块、
         # 鼠标悬停的高亮、吸附线、鼠标处的时间线
+        # 字幕相关的这几层也裁在轨道区里（跟静层一个道理，别露到下面去）
+        huabi.save()
+        huabi.setClipRect(qu)
         self._hua_jinxing(huabi, qu)
         self._hua_kuai_zai(huabi, qu)
-        self._hua_bofangtou(huabi, qu)
         self._hua_xuanfu_zimu(huabi, qu)
+        huabi.restore()
+        self._hua_bofangtou(huabi, qu)
         self._hua_xifu(huabi, qu)
         self._hua_xuanfu(huabi)
         self._hua_xuan_kuang(huabi)
+        huabi.save()
+        huabi.setClipRect(qu)
+        self._hua_jian_qu(huabi, qu)
+        huabi.restore()
         huabi.end()
+
+    def shezhi_jian_qu(self, qi_ms=None, zhi_ms=None):
+        """按住 J 时那条建块预览范围（起止毫秒）；两个都给 None = 清掉
+
+        只管画：真建块在窗口那边松手时做（见 _j_qu_song）。
+        """
+        if qi_ms is None or zhi_ms is None:
+            if self._jian_qu is None:
+                return
+            self._jian_qu = None
+            self._j_tuo = False
+            self.update()
+            return
+        a, b = int(qi_ms), int(zhi_ms)
+        if b < a:
+            a, b = b, a
+        if self._jian_qu == (a, b):
+            return
+        self._jian_qu = (a, b)
+        self.update()
+
+    def _jian_qu_hang(self, qi, zhi):
+        """这条范围将来落在第几行（0 起）：哪一轨空着就挑哪一轨
+
+        跟窗口建块那条路（_kong_hang_wei）是一套规矩：1→2→… 顺次找"这一刻
+        没有块"的轨，全占着就回卷。预览只按一行高画 —— 以前按整条字幕带的
+        高度画，摞了几轨预览就撑几轨，看着像一次要建好几条。
+        """
+        hang = self._zimu_hang()
+        zhan = set()
+        chong = 0
+        for xu, (a, b, _w) in enumerate(self._zimu):
+            if b <= qi or a >= zhi:
+                continue
+            chong += 1
+            zhan.add(hang[xu] if xu < len(hang) else 0)
+        for h in range(self.ZIMU_HANG_ZUIDA):
+            if h in self._yin_hang:
+                continue            # 关掉的轨道不往里落
+            if h not in zhan:
+                return h
+        return chong % max(1, self.ZIMU_HANG_ZUIDA)
+
+    def _hua_jian_qu(self, huabi, qu):
+        """按住 J 拉范围时那条虚线框：只占将来落地的那一行，淡橘色 + 虚线边 + 秒数
+
+        跟框选那个框分开放：框选是"挑块"（主题蓝细边），这个是"要在这儿建
+        一块新的"——用橘黄 #F07427，还没落定的时候一眼就跟已经存在的蓝字幕块
+        区分开。
+        """
+        if self._jian_qu is None or self._shichang <= 0:
+            return
+        qi, zhi = self._jian_qu
+        x1 = self._ms_to_x(qi)
+        x2 = self._ms_to_x(zhi)
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if x2 - x1 < 3:
+            x2 = x1 + 3
+        tiao = self._zimu_qu(qu)
+        # 只画一行，高度就是"现在每行多高"（带高 / 现在几行）——不跟着新行号缩水。
+        # 挑中的那一行要是还没露出来（比如两轨都占着、要落第三行），就贴着带子
+        # 往下画，看着就是"这条会掉到下一轨"，大小跟已经在的蓝块一模一样。
+        hangshu = max(1, self._zimu_hang_shu())
+        mei_hang = tiao.height() / float(hangshu)
+        hang = self._jian_qu_hang(qi, zhi)
+        top = tiao.top() + int(round(hang * mei_hang))
+        gao = max(2, int(round(mei_hang)))
+        ju = QtCore.QRect(x1, top, max(1, x2 - x1), gao)
+        ju = ju.intersected(self.rect())
+        if ju.width() <= 0 or ju.height() <= 0:
+            return
+        se = QtGui.QColor(JIAN_QU_YANSE)
+        tian = QtGui.QColor(se)
+        tian.setAlpha(70)
+        huabi.save()
+        huabi.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        huabi.fillRect(ju, tian)
+        huabi.setPen(QtGui.QPen(se, 2, Qt.DashLine))
+        huabi.setBrush(Qt.NoBrush)
+        huabi.drawRect(ju)
+        # 框够宽才写秒数，窄了写字糊成一团
+        if ju.width() >= 56:
+            ziti = huabi.font()
+            ziti.setPointSize(8)
+            huabi.setFont(ziti)
+            huabi.setPen(QtGui.QColor(_ys()["wenzi"]))
+            huabi.drawText(
+                ju.adjusted(6, 0, -6, 0),
+                Qt.AlignVCenter | Qt.AlignLeft,
+                "%.2f 秒" % ((zhi - qi) / 1000.0),
+            )
+        huabi.restore()
 
     def _hua_xuan_kuang(self, huabi):
         """框选时那个框：淡蓝填一层 + 主题色细边（照 ARC，画在最上面）"""
@@ -8009,6 +8217,9 @@ class ShijianZhou(QtWidgets.QWidget):
             self._bo_tishi,
             self.man_liang_cheng(),
             self._zimu_gao(qu),
+            self._hang_gun,                 # 竖向滚到第几行
+            tuple(sorted(self._yin_hang)),  # 哪几条轨道被关掉了
+            self._guidao_shu,               # 手动加的空轨数
             self._xuan_zhong,
             tuple(self._xuan_duo),
             self._bo_shou_liang,
@@ -8049,8 +8260,16 @@ class ShijianZhou(QtWidgets.QWidget):
                 tishi = self._bo_tishi or "（没有音频波形）"
             huabi.drawText(bo, Qt.AlignCenter, tishi)
 
+        # 字幕带那几层一律裁在轨道区里：滚到最后一屏时底下会多出不到一行的
+        # 余量，不裁的话下一行的顶边会露到轨道区外面（看着就是"上一行的影子"）
+        huabi.save()
+        # 左边多让出眼睛那一列：裁剪从轨道区左沿开始的话，会把眼睛整个裁掉
+        huabi.setClipRect(qu.adjusted(-self.GUIDAO_KAIGUAN_KUAN, 0, 0, 0))
+        self._hua_guidao_kaiguan(huabi, qu)
         self._hua_zimu(huabi, qu)
+        self._hua_guidao_biaozhu(huabi, qu)   # 「← 此轨道已关闭」压在块上面
         self._hua_qiepian_dian(huabi, qu)   # 预览切片点（没勾就什么都不画）
+        huabi.restore()
         self._hua_chidu(huabi, qu)
         # 重叠标记放在刻度之后画：它的竖线要竖到刻度条里去，先画会被刻度条盖掉
         self._hua_chongdie(huabi, qu)
@@ -8068,6 +8287,18 @@ class ShijianZhou(QtWidgets.QWidget):
         """
         return max(ZIMU_GAO_ZUI_XIAO, min(ZIMU_GAO_ZUIDA, int(qu.height())))
 
+    def _mei_hang_gao(self, qu=None):
+        """一行字幕块多高（像素）：存的是每行高，不是整条带子的总高"""
+        qu = self._guidao_qu() if qu is None else qu
+        mei_hang = (
+            ZIMU_GAO_MOREN
+            if self._zimu_gao_guding is None
+            else self._zimu_gao_guding
+        )
+        return max(
+            ZIMU_GAO_ZUI_XIAO, min(int(mei_hang), self._zimu_gao_shangxian(qu))
+        )
+
     def _zimu_gao(self, qu):
         """字幕带占多高 = 每行高 × 行数
 
@@ -8075,19 +8306,122 @@ class ShijianZhou(QtWidgets.QWidget):
         整体跟着变高变矮，每一行的高度雷打不动 —— 块不会因为换行就长高。
         默认 ZIMU_GAO_MOREN；自己拖过就按调好的来（记在配置里，下次打开还在）。
         """
-        mei_hang = (
-            ZIMU_GAO_MOREN
-            if self._zimu_gao_guding is None
-            else self._zimu_gao_guding
-        )
-        mei_hang = max(
-            ZIMU_GAO_ZUI_XIAO, min(int(mei_hang), self._zimu_gao_shangxian(qu))
-        )
-        return mei_hang * max(1, self._zimu_hang_shu())
+        return self._mei_hang_gao(qu) * max(1, self._zimu_hang_shu())
 
     def _zimu_qu(self, qu):
-        """字幕块那条带子：轨道区最上面一条（波形上方）"""
-        return QtCore.QRect(qu.left(), qu.top(), qu.width(), self._zimu_gao(qu))
+        """字幕块那条带子：轨道区最上面一条（波形上方）
+
+        行数多到一屏放不下时，整条带子按 _hang_gun（滚到第几行）整体往上挪，
+        挪出去的部分被控件裁掉 —— 这样"第几行在哪"始终按行高算，滚到哪儿都准。
+        """
+        mei = self._mei_hang_gao(qu)
+        self._hang_gun = max(0, min(int(self._hang_gun), self._gun_fanwei()))
+        return QtCore.QRect(
+            qu.left(),
+            qu.top() - int(self._hang_gun) * mei,
+            qu.width(),
+            mei * max(1, self._zimu_hang_shu()),
+        )
+
+    # ---- 竖向滚动 / 轨道开关 ----
+    def _kejian_hang_shu(self):
+        """一屏能看见几行"""
+        qu = self._guidao_qu()
+        return max(1, qu.height() // max(1, self._mei_hang_gao(qu)))
+
+    def _gun_fanwei(self):
+        """竖向最多能滚几行（总行数 - 一屏能看见的行数）"""
+        return max(0, self._zimu_hang_shu() - self._kejian_hang_shu())
+
+    def gun_fanwei(self):
+        return int(self._gun_fanwei())
+
+    def kejian_hang_shu(self):
+        return int(self._kejian_hang_shu())
+
+    def hang_gun(self):
+        return int(self._hang_gun)
+
+    def gun_hang(self, bu):
+        """竖向滚轨道：一次滚整数行（不会停在半行上）"""
+        fan = self._gun_fanwei()
+        xin = max(0, min(int(self._hang_gun) + int(bu), fan))
+        if xin == int(self._hang_gun):
+            return False
+        self._hang_gun = xin
+        self._jing_huancun = None
+        self.shitu_bian.emit()
+        self.update()
+        return True
+
+    def shezhi_hang_gun(self, hang):
+        """滚到第几行（竖向滚动条拉过来的）"""
+        return self.gun_hang(int(hang) - int(self._hang_gun))
+
+    def hang_yin_le(self, hang):
+        return int(hang) in self._yin_hang
+
+    def yin_hang_liebiao(self):
+        return sorted(int(h) for h in self._yin_hang)
+
+    def zimu_zai_yin_hang(self, xu):
+        """第 xu 条字幕是不是落在已关闭的轨道上（画面叠加据此不画它）"""
+        if xu < 0 or xu >= len(self._zimu_tao):
+            return False
+        return int(self._zimu_tao[xu]) in self._yin_hang
+
+    def qiehuan_yin_hang(self, hang):
+        """开关一条轨道：开着 -> 关掉（块变灰、还看得见也点得动）；关着 -> 打开"""
+        hang = int(hang)
+        if hang in self._yin_hang:
+            self._yin_hang.discard(hang)
+        else:
+            self._yin_hang.add(hang)
+        # 关掉的轨要是正滚在视野里，别的轨不动 —— 位置不变，只是这行的块变灰
+        self._jing_ban += 1
+        self.shitu_bian.emit()
+        self.yin_hang_bian.emit()     # 画面里那条也一起撤掉 / 放回来
+        self.update()
+
+    def quan_bu_xian_shi(self):
+        """把所有关掉的轨道重新打开"""
+        if not self._yin_hang:
+            return
+        self._yin_hang.clear()
+        self._jing_ban += 1
+        self.shitu_bian.emit()
+        self.yin_hang_bian.emit()
+        self.update()
+
+    def jia_guidao(self, shu=1):
+        """加空轨道（轨道数 = max(块占的行数, 手动加的轨道数)）"""
+        xin = min(int(self._zimu_hang_shu()) + int(shu), self.ZIMU_HANG_ZUIDA)
+        if xin <= int(self._zimu_hang_shu()):
+            return False
+        self._guidao_shu = xin
+        self._jing_ban += 1
+        self.shitu_bian.emit()
+        self.update()
+        return True
+
+    def _kaiguan_hang_zai(self, x, y):
+        """鼠标点没点在左边那一列轨道开关上 -> 第几行（-1 = 没点）"""
+        if self._shichang <= 0:
+            return -1
+        if not (self.ZUO_PAD <= x <= self.ZUO_PAD + self.GUIDAO_KAIGUAN_KUAN):
+            return -1
+        qu = self._guidao_qu()
+        tiao = self._zimu_qu(qu)
+        if not (tiao.top() <= y <= tiao.bottom()):
+            return -1
+        hangshu = max(1, self._zimu_hang_shu())
+        mei = self._zimu_gao(qu) / float(hangshu)
+        if mei <= 0:
+            return -1
+        hang = int((y - tiao.top()) // mei)
+        if 0 <= hang < hangshu:
+            return hang
+        return -1
 
     def _zimu_hang(self):
         """每块字幕摆在第几行（0 起），跟 _zimu 一一对应
@@ -8103,9 +8437,14 @@ class ShijianZhou(QtWidgets.QWidget):
         return [max(0, min(int(x), self.ZIMU_HANG_ZUIDA - 1)) for x in tao]
 
     def _zimu_hang_shu(self):
-        """字幕带现在有几行（= 最下面那一块的行号 + 1，至少一行）"""
+        """字幕带现在有几行（= 最下面那一块的行号 + 1，至少一行）
+
+        手动"加轨道"加出来的空轨（_guidao_shu）也算 —— 空轨是能摆块的行，
+        不跟着显示出来就没接法往上摆。
+        """
         tao = self._zimu_hang()
-        return max(1, max(tao) + 1) if tao else 1
+        zui = max(tao) + 1 if tao else 1
+        return max(1, zui, int(getattr(self, "_guidao_shu", 0) or 0))
 
     def _gai_zimu_hang(self, xu_liebiao, xin_hang):
         """把这几块挪到第 xin_hang 行（一次挪一整批，多选时一起动）"""
@@ -8296,6 +8635,55 @@ class ShijianZhou(QtWidgets.QWidget):
         )
         huabi.setBrush(Qt.NoBrush)
 
+    def _hua_guidao_kaiguan(self, huabi, qu):
+        """左边那条窄列：一条轨道一个序号，点序号就关掉 / 打开这条轨道
+
+        关掉的轨道字幕块变灰、画面里也不显示（数据照旧留着，导出照旧写）。
+        序号画成粗体：开着 = 主题蓝，关掉 = 灰 + 删除线，一眼看出状态。
+        行数是滚到第几行开始往下画，只画看得见的那几行。
+        """
+        if self._shichang <= 0:
+            return
+        c = _ys()
+        tiao = self._zimu_qu(qu)
+        hangshu = max(1, self._zimu_hang_shu())
+        gao = self._zimu_gao(qu)
+        if gao <= 0 or tiao.width() <= 0:
+            return
+        mei = gao / float(hangshu)
+        if mei < 6:
+            return
+        kai_se = QtGui.QColor(c["zhuse"])
+        guan_se = QtGui.QColor(c["wenzi_ci"])
+        huabi.save()
+        huabi.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        shang = int(self._hang_gun)
+        xia = min(hangshu, shang + self._kejian_hang_shu() + 1)
+        ziti = huabi.font()
+        ziti.setBold(True)
+        for h in range(shang, xia):
+            top = tiao.top() + int(round(h * mei))
+            gao_hang = max(2, int(round(mei)) - 1)
+            ju = QtCore.QRect(
+                self.ZUO_PAD, top, self.GUIDAO_KAIGUAN_KUAN - 4, gao_hang
+            )
+            if ju.bottom() < qu.top() or ju.top() > qu.bottom():
+                continue
+            yin = h in self._yin_hang
+            if mei >= 9:
+                ziti.setPointSize(8 if mei >= 16 else 7 if mei >= 11 else 6)
+                ziti.setStrikeOut(bool(yin))
+                huabi.setFont(ziti)
+                huabi.setPen(guan_se if yin else kai_se)
+                huabi.drawText(ju, Qt.AlignCenter, "%02d" % (h + 1))
+            else:
+                # 行矮到字都挤不下：画一道横线，至少知道这行在
+                huabi.fillRect(
+                    QtCore.QRect(ju.left(), ju.center().y(), ju.width(), 2),
+                    guan_se,
+                )
+        huabi.restore()
+
     def _hua_zimu(self, huabi, qu):
         if not self._zimu or self._shichang <= 0 or qu.width() <= 0:
             return
@@ -8308,10 +8696,15 @@ class ShijianZhou(QtWidgets.QWidget):
         # 喂一份颜色进来（_kuai_yanse），没喂到的照旧用这个默认蓝。
         moren = QtGui.QColor(YANSE_ZIMU)
         moren.setAlpha(ZIMU_TOUMING_DU)
+        # 关掉的轨道：块还在、还能点能改，只是整块画成灰的 —— 一眼看出这轨关了
+        guan_di = QtGui.QColor(GUAN_HANG_DI)
+        guan_di.setAlpha(ZIMU_TOUMING_DU)
+        guan_bian = QtGui.QColor(GUAN_HANG_BIAN)
         ziti = huabi.font()
         ziti.setPointSize(8)
         huabi.setFont(ziti)
         for xu, (qi, zhi, wenben) in enumerate(self._zimu):
+            yin = hang[xu] in self._yin_hang
             hang_qu = self._zimu_hang_kuang(tiao, hang[xu], hangshu)
             x1 = self._ms_to_x(qi)
             x2 = self._ms_to_x(zhi)
@@ -8332,6 +8725,8 @@ class ShijianZhou(QtWidgets.QWidget):
             yanse = moren
             if xu < len(self._kuai_yanse) and self._kuai_yanse[xu] is not None:
                 yanse = self._kuai_yanse[xu]
+            if yin:
+                yanse = guan_di        # 关掉的轨道：不管原来是蓝是白，一律灰底
             xuan = xu in self._xuan_duo
             if xuan:
                 # 选中：只在块内部描一圈绿框，底色和文字都保持原样（跟别人
@@ -8347,6 +8742,8 @@ class ShijianZhou(QtWidgets.QWidget):
                 bian = QtGui.QColor(
                     YANSE_ZIMU_BIAN_A if xu % 2 == 0 else YANSE_ZIMU_BIAN_B
                 )
+                if yin:
+                    bian = guan_bian
                 kuan_bi = self.ZIMU_BIAN_KUAN_DU
             # 底色直接铺在时间轴背景上（半透明），再沿块的四条内边刷一圈描边色。
             # 描边全刷在自己块里，不糊到隔壁块上——两块紧挨着时交界就是
@@ -8468,6 +8865,47 @@ class ShijianZhou(QtWidgets.QWidget):
             )
             huabi.setFont(jiu_ziti)
 
+    def _hua_guidao_biaozhu(self, huabi, qu):
+        """关掉的轨道行：在块上面写一句「← 此轨道已关闭」（跟 ARC 一样）
+
+        块本身还在（画成灰的，能点能改），这句只是把"这轨是关的"说出来 ——
+        免得轨道空着的时候看不出来到底是关了还是本来就没内容。
+        """
+        if self._shichang <= 0 or not self._yin_hang:
+            return
+        tiao = self._zimu_qu(qu)
+        gao = tiao.height()
+        hangshu = max(1, self._zimu_hang_shu())
+        if gao <= 0 or tiao.width() <= 0:
+            return
+        mei = gao / float(hangshu)
+        if mei < 8:
+            return
+        c = _ys()
+        se = QtGui.QColor(c["juzi"])
+        ziti = huabi.font()
+        ziti.setPointSize(9)
+        huabi.save()
+        huabi.setFont(ziti)
+        shang = int(self._hang_gun)
+        xia = min(hangshu, shang + self._kejian_hang_shu() + 1)
+        for h in range(shang, xia):
+            if h not in self._yin_hang:
+                continue
+            top = tiao.top() + int(round(h * mei))
+            ju = QtCore.QRect(
+                qu.left() + 8, top, max(1, qu.width() - 16), max(1, int(round(mei)))
+            )
+            if ju.bottom() < qu.top() or ju.top() > qu.bottom():
+                continue
+            # 先描一圈深色影子再画字：压在灰块 / 蓝块上也看得清
+            huabi.setPen(QtGui.QColor(0, 0, 0, 180))
+            huabi.drawText(ju.adjusted(1, 1, 0, 0), Qt.AlignVCenter | Qt.AlignLeft,
+                           "← 此轨道已关闭")
+            huabi.setPen(se)
+            huabi.drawText(ju, Qt.AlignVCenter | Qt.AlignLeft, "← 此轨道已关闭")
+        huabi.restore()
+
     def _hua_qiepian_dian(self, huabi, qu):
         """预览切片点：在每块字幕内部画一根紫线，标出真正会截图的那一刻
 
@@ -8562,9 +9000,12 @@ class ShijianZhou(QtWidgets.QWidget):
                 continue
             hang_qu = self._zimu_hang_kuang(tiao, h, hangshu)
             # 在块上面再压一层暗色 —— 重叠的那一截看着就是深了一截
-            huabi.fillRect(
-                QtCore.QRect(x1, hang_qu.top(), x2 - x1, hang_qu.height()), shen
-            )
+            # 裁在轨道区里：滚到最后一屏时别把暗色铺到轨道区外面去
+            kuai = QtCore.QRect(
+                x1, hang_qu.top(), x2 - x1, hang_qu.height()
+            ).intersected(qu)
+            if kuai.width() > 0 and kuai.height() > 0:
+                huabi.fillRect(kuai, shen)
         # L 形标记：横线贴着字幕带顶边横跨整个重叠区间，竖线从横线的左端往上
         # 竖进时间轴的刻度条里（之前是往下垂进字幕块，正好画反了）
         huabi.save()
@@ -9130,8 +9571,23 @@ class ShijianZhou(QtWidgets.QWidget):
     def mousePressEvent(self, event):
         # 点一下就把键盘焦点拿过来：后面的空格 / 方向键 / 回车才接得住
         self.setFocus(Qt.MouseFocusReason)
+        if self._jian_qu is not None and event.button() == Qt.LeftButton:
+            # 按着 J 的这段时间：鼠标不干别的，只把范围那头拉过来（照 ARC）。
+            # 点在块上、刻度尺上都不算数 —— 这时候是在"画范围"，不是选块/挪播放头。
+            self._j_tuo = True
+            self.setCursor(Qt.CrossCursor)
+            self.j_qu_tuo.emit()        # 播放中就停下：这头改由鼠标说了算
+            self.j_qu_gai.emit(self._x_to_ms(event.pos().x(), xifu=False))
+            event.accept()
+            return
         if event.button() == Qt.LeftButton and self._shichang > 0:
             x, y = event.pos().x(), event.pos().y()
+            # 点在左边那一列轨道开关上：开关这条轨道，别的什么都不做
+            kaiguan = self._kaiguan_hang_zai(x, y)
+            if kaiguan >= 0:
+                self.qiehuan_yin_hang(kaiguan)
+                event.accept()
+                return
             if self._bo_shou_qu().contains(x, y):
                 # 按在波形左上角的小把手上：上下拖 = 调波形振幅缩放
                 self._tuo_bo = {"an_y": y, "an_fang": self._bo_fangda}
@@ -9211,6 +9667,13 @@ class ShijianZhou(QtWidgets.QWidget):
 
     def mouseMoveEvent(self, event):
         self._xuanfu_x = event.pos().x()
+        if self._jian_qu is not None:
+            # 按着 J：光标一律十字；按下去了就把范围那头拉到鼠标这儿
+            self.setCursor(Qt.CrossCursor)
+            if self._j_tuo:
+                self.j_qu_gai.emit(self._x_to_ms(event.pos().x(), xifu=False))
+            super().mouseMoveEvent(event)
+            return
         if self._tuo_bo is not None:
             self._bo_fangda_dao(event.pos().y())
         elif self._tuo_gao is not None:
@@ -9264,6 +9727,11 @@ class ShijianZhou(QtWidgets.QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._j_tuo:
+            # 松鼠标只是"这头拉完了"，块等松开 J 才建（手不用离开 J，还能接着拖）
+            self._j_tuo = False
+            event.accept()
+            return
         if event.button() == Qt.LeftButton:
             if self._tuo_bo is not None:
                 # 松手：振幅缩放就这样了（拖动过程里已经实时改过），记下来下次打开还是这么大
@@ -9404,6 +9872,9 @@ class ShijianZhou(QtWidgets.QWidget):
         cai = QtWidgets.QMenu(self)
         a_shang = a_xia = a_he = a_shan = a_yanse = a_yanse_quan = None
         a_shuohua_fenpei = None
+        a_shuohua_fen_gui = None
+        a_xinjian_xuan = None
+        a_yin_gui = a_jia_gui = a_xian_gui = None
         if xuan:
             hang = self._zimu_hang()
             biao = cai.addAction(f"操作 {len(xuan)} 段字幕")
@@ -9415,6 +9886,7 @@ class ShijianZhou(QtWidgets.QWidget):
             a_xia.setEnabled(
                 all(hang[x] < self.ZIMU_HANG_ZUIDA - 1 for x in xuan)
             )
+            a_yin_gui = cai.addAction("关闭这条轨道（字幕块变灰）")
             cai.addSeparator()
             a_he = cai.addAction("合并字幕块（Ctrl+M）")
             a_he.setEnabled(len(xuan) >= 2)
@@ -9435,6 +9907,23 @@ class ShijianZhou(QtWidgets.QWidget):
             a_yanse_quan = cai.addAction("批量提取字幕颜色")
             a_shuohua_fenpei = cai.addAction("用颜色设置样式和说话人")
             a_shuohua_fenpei.setEnabled(bool(self._zimu))
+            # 每个说话人一条轨道：同一人说的全排到同一行，认轨 / 改样式都方便
+            a_shuohua_fen_gui = cai.addAction("按说话人分轨道")
+            a_shuohua_fen_gui.setEnabled(bool(self._zimu))
+            cai.addSeparator()
+            # 回车建空白块之后要不要顺手把它选中（勾上 = 建完直接能编辑；
+            # 不勾 = 老样子，接着按回车能一条接一条往后建）。勾不勾记在 ini 里。
+            a_xinjian_xuan = cai.addAction("创建字幕块后选中字幕块")
+            a_xinjian_xuan.setCheckable(True)
+            a_xinjian_xuan.setChecked(bool(self.xinjian_xuanzhong))
+            cai.addSeparator()
+            # 轨道：加一条空轨 / 把关掉的那些重新打开（开关本身在左边眼睛那儿）
+            a_jia_gui = cai.addAction("增加一条轨道")
+            a_jia_gui.setEnabled(self._zimu_hang_shu() < self.ZIMU_HANG_ZUIDA)
+            a_xian_gui = cai.addAction(
+                f"重新打开被关掉的 {len(self._yin_hang)} 条轨道"
+            )
+            a_xian_gui.setEnabled(bool(self._yin_hang))
             cai.addSeparator()
 
         # 切片两项：跟时间轴上有没有块无关都能进设置；没块时不给切
@@ -9458,12 +9947,25 @@ class ShijianZhou(QtWidgets.QWidget):
             self.hebing_zimu.emit(xuan)
         elif dian_xuan is a_shan:
             self.shanchu_zimu.emit(xuan)
+        elif dian_xuan is a_yin_gui:
+            for h in sorted({int(hang[x]) for x in xuan}):
+                self.qiehuan_yin_hang(h)
+        elif dian_xuan is a_jia_gui:
+            self.jia_guidao(1)
+        elif dian_xuan is a_xian_gui:
+            self.quan_bu_xian_shi()
         elif dian_xuan is a_yanse:
             self.yanse_xuan.emit(xuan)
         elif dian_xuan is a_yanse_quan:
             self.yanse_quan.emit()
         elif dian_xuan is a_shuohua_fenpei:
             self.shuohua_fenpei.emit()
+        elif dian_xuan is a_shuohua_fen_gui:
+            self.shuohua_fen_gui.emit()
+        elif dian_xuan is a_xinjian_xuan:
+            kai = bool(a_xinjian_xuan.isChecked())
+            self.xinjian_xuanzhong = kai
+            self.xinjian_xuanzhong_gai.emit(kai)
         elif dian_xuan is a_qie:
             self.qiepian.emit()
         elif dian_xuan is a_shezhi:
@@ -9491,14 +9993,25 @@ class ShijianZhou(QtWidgets.QWidget):
         往下滚 = 往右看（往后走），往上滚 = 往左看（往前走）。
         一格滚轮挪视野的 1/10 左右，按住滚轮连续滚就是快速拖。
         没放大时（整条视频都在视野里）本来就没得挪，什么都不做。
+
+        按住 Alt / Shift 再滚 = 上下滚轨道，一次滚一整行（不会停在半行上）。
         """
-        if self._shichang <= 0 or self._shi_shangxian() <= 0:
+        if self._shichang <= 0:
             event.accept()
             return
         jiao = event.angleDelta().y()
         if jiao == 0:
             jiao = event.angleDelta().x()
         if jiao == 0:
+            event.accept()
+            return
+        if event.modifiers() & (Qt.AltModifier | Qt.ShiftModifier):
+            # 上下滚轨道：一格滚轮 = 一行，只落在整行上
+            if self._gun_fanwei() > 0:
+                self.gun_hang(1 if jiao < 0 else -1)
+            event.accept()
+            return
+        if self._shi_shangxian() <= 0:
             event.accept()
             return
         # 按滚动量成比例地挪（鼠标一格是 120；触摸板一次给一点点，
@@ -9511,6 +10024,15 @@ class ShijianZhou(QtWidgets.QWidget):
         self.shitu_bian.emit()
         self.update()
         event.accept()
+
+    def resizeEvent(self, event):
+        """尺寸变了：一屏能看见几行跟着变，滚过头的位置拉回范围内"""
+        super().resizeEvent(event)
+        jiu = self._hang_gun
+        self._hang_gun = max(0, min(int(self._hang_gun), self._gun_fanwei()))
+        self._jing_huancun = None
+        if self._hang_gun != jiu:
+            self.shitu_bian.emit()
 
 
 # ---------------------------------------------------------------------
@@ -11186,6 +11708,12 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.tuo_dingshi.setInterval(TUO_SEEK_JIAN_GE_MS)
         self.tuo_dingshi.timeout.connect(self._fa_tuo_dingwei)
 
+        # 按住 J 边播边拉范围：播放头一直在往前跑，范围这头得跟着它长
+        # （见 _j_qu_genbo）。不播的时候定时器不转，全靠鼠标 / 方向键。
+        self._j_qu_dingshi = QtCore.QTimer(self)
+        self._j_qu_dingshi.setInterval(33)
+        self._j_qu_dingshi.timeout.connect(self._j_qu_genbo)
+
         # 声音也归 mpv：这里留个代理，外面还是照老样子调 setVolume / play /
         # pause / stop / setPlaybackRate，实际都转到 mpv 上
         self.yinpin = None
@@ -11270,6 +11798,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 警告，两边还可能同时响应。打开本窗口期间把它们临时降成"窗口级"，
         # 主窗口不激活就不响应；关窗口再原样还回去。
         self._beiping_kuangjie = []
+        # 按住 J 拉范围建块：{"qi": 起点ms, "zhi": 现在这头ms}；None = 没按着
+        self._j_qu = None
         self._biping_zhujiemian_kuangjie()
 
         # 再补一道保险：空格快捷键。
@@ -13238,6 +13768,12 @@ class VideoWorkDialog(QtWidgets.QDialog):
         bu.setSpacing(0)
 
         self.shijianzhou = ShijianZhou()
+        # 「创建字幕块后选中字幕块」：上次勾没勾（头一回 = 不勾，老样子），
+        # 勾了右键菜单里再改会即时写回 ini
+        self.shijianzhou.xinjian_xuanzhong = self._du_kaiguan(
+            JIEMIAN_XINJIAN_XUANZHONG, False
+        )
+        self.shijianzhou.xinjian_xuanzhong_gai.connect(self._gai_xinjian_xuanzhong)
         self.shijianzhou.tiaozheng.connect(self._shoudao_tiaozheng)
         self.shijianzhou.tuo_kaishi.connect(self._tuo_bofangtou_kaishi)
         self.shijianzhou.tuo_jieshu.connect(self._tuo_bofangtou_wancheng)
@@ -13246,7 +13782,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shijianzhou.shanchu_zimu.connect(self._shoudao_zimu_shanchu)
         self.shijianzhou.hebing_zimu.connect(self._shoudao_zimu_hebing)
         self.shijianzhou.shitu_bian.connect(self._shuaxin_shitu_tiao)
+        self.shijianzhou.yin_hang_bian.connect(self._shuaxin_huamian_zimu)
+        self.shijianzhou.shuohua_fen_gui.connect(self._shoudao_shuohua_fen_gui)
         self.shijianzhou.fangxiang_jian.connect(self._fangxiangjian_tiaobu)
+        self.shijianzhou.j_qu_gai.connect(self._j_qu_gai_ms)
+        self.shijianzhou.j_qu_tuo.connect(self._j_qu_yu_biao)
         self.shijianzhou.zimu_nuo.connect(self._shoudao_zimu_nuo)
         self.shijianzhou.xiayitiao.connect(self._shoudao_xiayitiao)
         self.shijianzhou.fuzhi_kuai.connect(self._shoudao_kuai_fuzhi)
@@ -13276,7 +13816,23 @@ class VideoWorkDialog(QtWidgets.QDialog):
         )
         # 时间轴能拿键盘焦点：点它之后空格 / 方向键 / 回车才落到这儿
         self.shijianzhou.setFocusPolicy(Qt.StrongFocus)
-        bu.addWidget(self.shijianzhou, 1)
+        # 时间轴 + 右侧的竖向滚动条（轨道多了往下滚）
+        zhou_hang = QtWidgets.QWidget()
+        zhou_bu = QtWidgets.QHBoxLayout(zhou_hang)
+        zhou_bu.setContentsMargins(0, 0, 0, 0)
+        zhou_bu.setSpacing(0)
+        zhou_bu.addWidget(self.shijianzhou, 1)
+        self.shijianzhou_hang_tiao = QtWidgets.QScrollBar(Qt.Vertical)
+        self.shijianzhou_hang_tiao.setObjectName("YsgShijianZhouTiao")
+        self.shijianzhou_hang_tiao.setFixedWidth(10)
+        # 值 = 第几行：一格一步就是一行，只停在整行上
+        self.shijianzhou_hang_tiao.setRange(0, 0)
+        self.shijianzhou_hang_tiao.setSingleStep(1)
+        self.shijianzhou_hang_tiao.setPageStep(1)
+        self.shijianzhou_hang_tiao.setVisible(False)
+        self.shijianzhou_hang_tiao.valueChanged.connect(self._gundong_guidao)
+        zhou_bu.addWidget(self.shijianzhou_hang_tiao, 0)
+        bu.addWidget(zhou_hang, 1)
 
         self.shijianzhou_tiao = QtWidgets.QScrollBar(Qt.Horizontal)
         self.shijianzhou_tiao.setObjectName("YsgShijianZhouTiao")
@@ -13593,6 +14149,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
         except Exception as cuowu:  # noqa
             logger.error(f"视频工作台：记录开关失败 {cuowu}")
 
+    def _gai_xinjian_xuanzhong(self, kai):
+        """时间轴空白处右键切了「创建字幕块后选中字幕块」-> 记进 ini
+
+        值已经由 ShijianZhou 自己存着了（菜单里打勾用），这儿只管落盘。
+        """
+        self._cun_kaiguan(JIEMIAN_XINJIAN_XUANZHONG, bool(kai))
+
     def _qiehuan_zimu_tiao(self, kai):
         """显示 / 隐藏画面下方那条独立字幕；关了就收掉那块地方，视频直接贴着底栏"""
         self.zimu_tiao.setVisible(bool(kai))
@@ -13794,6 +14357,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
         zhen = _ms_zhen(mubiao, self.fps)
         zhen = max(0, min(max(0, self.zong_zhen - 1), zhen))
         self._zou_dao_ms = float(self._tiaozheng_zhen(zhen))
+        if self._j_qu is not None:
+            # 按着 J 的时候方向键是"把范围这头拉过来"（照 ARC）：播放头照旧跟着走，
+            # 范围另一头跟着播放头长 / 缩，松开 J 就按这个范围建块。
+            self._j_qu_gai_ms(self._tou_ms(zhen))
 
     def _bofang_zhen(self):
         """播放头现在停在第几帧（照 AEG：帧号才是准的，毫秒只是显示形式）
@@ -14106,9 +14673,31 @@ class VideoWorkDialog(QtWidgets.QDialog):
         )
         self.shijianzhou_tiao.blockSignals(False)
 
+        # 轨道几条、一屏能放几条、滚到第几行 —— 竖向滚动条跟着一起刷
+        self._shuaxin_hang_tiao()
+
     def _shijianzhou_pingyi(self, zhi):
         """拖底下滚动条 -> 时间轴左右平移"""
         self.shijianzhou.shezhi_shitu_bili(zhi / 1000.0)
+
+    def _gundong_guidao(self, zhi):
+        """拖右边竖滚动条 -> 时间轴上下滚轨道（值就是第几行）"""
+        self.shijianzhou.shezhi_hang_gun(zhi)
+        self._shuaxin_hang_tiao()
+
+    def _shuaxin_hang_tiao(self):
+        """刷新右边那条竖向滚动条：只在轨道一屏放不下时才露出来"""
+        tiao = getattr(self, "shijianzhou_hang_tiao", None)
+        if tiao is None:
+            return
+        fan = int(self.shijianzhou.gun_fanwei())
+        tiao.blockSignals(True)
+        tiao.setRange(0, max(0, fan))
+        tiao.setPageStep(max(1, int(self.shijianzhou.kejian_hang_shu())))
+        tiao.setValue(min(int(self.shijianzhou.hang_gun()), max(0, fan)))
+        tiao.setEnabled(fan > 0)
+        tiao.blockSignals(False)
+        tiao.setVisible(fan > 0)
 
     # --------------------------------------------------------------
     # 帧回调
@@ -14504,6 +15093,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
             jieguo.append(dai.pop(0) if dai else ("Default", "", "", {}))
         return jieguo
 
+    def _zimu_gui_liebiao(self, shu=None):
+        """现在每块摆在第几轨（存 ASS 时写进 YsgTrack，下次打开照它摆）"""
+        if shu is None:
+            shu = self.zimu_mianban.zimu_shu()
+        shu = int(shu or 0)
+        return [int(self.shijianzhou.zimu_hang(i)) for i in range(shu)]
+
     def _zimu_fujia(self, zimu):
         """字幕编辑页列表的「样式 / 说话人」两列 + 编辑区上方那排要的字段
 
@@ -14788,6 +15384,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         for i, (qi, zhi, wenben) in enumerate(zimu):
             if not (int(qi) <= ms < max(int(qi) + 1, int(zhi))):
                 continue
+            if self.shijianzhou.zimu_zai_yin_hang(i):
+                continue                    # 这条在关掉的轨道上：画面里也不显示
             fu = fu_men[i] if i < len(fu_men) else {}
             if fu.get("zhushi"):
                 continue                    # 注释行不画在画面上
@@ -14862,6 +15460,40 @@ class VideoWorkDialog(QtWidgets.QDialog):
             fu = fu_men[i] if i < len(fu_men) else {}
             men.append(self._kuai_yanse_yise(fu, biao))
         self.shijianzhou.shezhi_kuai_yanse(men)
+
+    def _shoudao_shuohua_fen_gui(self):
+        """按说话人分轨道：一个说话人一条轨道
+
+        顺序按第一次出现的先后；没填说话人的块统一放最后一条（"未分配"），
+        不去打乱有人的那些。只挪时间轴上的摆放位置，字幕内容 / 时间 / 样式
+        一个字都不改，也不写进 srt。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        if not zimu:
+            return
+        fu_men = self._zimu_fujia(zimu)
+        shun = []       # 说话人，按第一次出现排
+        fen = {}        # 说话人 -> 行号
+        you_wu = False
+        for i in range(len(zimu)):
+            fu = fu_men[i] if i < len(fu_men) else {}
+            ming = str((fu or {}).get("shuo") or "").strip()
+            if not ming:
+                you_wu = True
+                continue
+            if ming not in fen:
+                fen[ming] = len(shun)
+                shun.append(ming)
+        if you_wu:
+            fen[""] = len(shun)
+        dui = []
+        for i in range(len(zimu)):
+            fu = fu_men[i] if i < len(fu_men) else {}
+            ming = str((fu or {}).get("shuo") or "").strip()
+            dui.append((i, fen.get(ming, 0)))
+        self.shijianzhou.shezhi_hang(dui)
+        shu = len(shun) + (1 if you_wu else 0)
+        self.shezhi_mianban.zhuangtai_shezhi(f"已按说话人分成 {shu} 条轨道")
 
     def _kuai_yanse_yise(self, fu, biao):
         """一条字幕该用什么底色：没说话人 / 样式查不到 -> None（用默认蓝）"""
@@ -16923,7 +17555,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
             os.makedirs(osp.dirname(shuo), exist_ok=True)
             _xie_zimu_dao_wenjian(
                 shuo, zimu, self._ass_yuan, self._zimu_fujia(zimu),
-                self._ass_jilu_dangqian(),
+                self._ass_jilu_dangqian(), self._zimu_gui_liebiao(len(zimu)),
             )
         except OSError as cuowu:
             logger.error(f"视频工作台：自动保存失败 {cuowu}")
@@ -16972,7 +17604,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         try:
             _xie_zimu_dao_wenjian(
                 ass_lu, zimu, self._ass_yuan, self._zimu_fujia(zimu),
-                self._ass_jilu_dangqian(),
+                self._ass_jilu_dangqian(), self._zimu_gui_liebiao(len(zimu)),
             )
             xie.append(ass_lu)
         except Exception as cuowu:  # noqa
@@ -17271,6 +17903,12 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.zimu_mianban.shezhi_shichang(self.shichang_ms)
         self.zimu_mianban.shezhi_xuan_zhong(-1)
         self.shijianzhou.shezhi_zimu(zimu)
+        # 这份文件里记过每块摆在第几轨就照它摆回去；没记过 / 条数对不上 = 全落第一轨
+        gui = _du_ass_gui((self._ass_yuan or {}).get("tou") or [])
+        if gui is not None and len(gui) == len(zimu):
+            self.shijianzhou.shezhi_hang(list(enumerate(gui)))
+        else:
+            self.shijianzhou.shezhi_hang([(i, 0) for i in range(len(zimu))])
         self.shijianzhou.shezhi_xuan_zhong(-1)
         self._shezhi_bianji_zimu(zimu, -1)
         self.shijianzhou.gundong_dao_ms(0, 0)
@@ -17547,7 +18185,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         try:
             _xie_zimu_dao_wenjian(
                 lu, zimu, self._ass_yuan, self._zimu_fujia(zimu),
-                self._ass_jilu_dangqian(),
+                self._ass_jilu_dangqian(), self._zimu_gui_liebiao(len(zimu)),
             )
         except OSError as cuowu:
             QtWidgets.QMessageBox.critical(
@@ -17679,10 +18317,126 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.yinliang_tiao.setEnabled(you)
         self.beisu_kuang.setEnabled(you)
 
-    def _xinjian_zimu_kongbai(self):
-        """没选中字幕块时按回车：以播放头为起点，建一条 XINJIAN_ZIMU_MS 的空白字幕块
+    def _zai_dazi_kuang(self, duixiang):
+        """这一下按键是不是发生在"能打字的地方"（字幕编辑框 / 查找框 / 数值框）
 
-        新块不选中 —— 接着按回车就是接着往后建，不用先取消选择。
+        J 是全局建块键，但字幕编辑框里 j 就是个字母 —— 在那儿不许抢。
+        """
+        if not isinstance(duixiang, QtWidgets.QWidget):
+            return False
+        return isinstance(
+            duixiang,
+            (
+                QtWidgets.QLineEdit,
+                QtWidgets.QPlainTextEdit,
+                QtWidgets.QTextEdit,
+                QtWidgets.QAbstractSpinBox,
+            ),
+        )
+
+    def _j_qu_kai(self):
+        """按住 J：先把播放头这一帧记成范围起点（照 ArcTime）
+
+        之后拖鼠标 / 按方向键 / 让视频接着播，都是在拉这头，松开 J 才真建块
+        （见 _j_qu_song）。播放中按 J 不打断播放 —— 范围这头由定时器跟着
+        播放头长（见 _j_qu_genbo），播到哪儿松手就建到哪儿。
+        """
+        if self.duqu is None or self.shichang_ms <= 0 or self.fps <= 0:
+            return
+        if self._j_qu is not None:
+            # 上一把的"松开 J"没收到（比如切了窗口）：清掉重来，别拿半个旧范围建块
+            self._j_qu = None
+            self.shijianzhou.shezhi_jian_qu(None, None)
+        qi = self._tou_ms(self._bofang_zhen())
+        self._j_qu = {"qi": int(qi), "zhi": int(qi)}
+        self.shijianzhou.shezhi_jian_qu(qi, qi)
+        if self.zhengzai_bofang:
+            self._j_qu_dingshi.start()
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "按住 J：跟着播放头走，松开 J 建字幕块"
+            )
+        else:
+            self._j_qu_dingshi.stop()
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "按住 J：拖鼠标 / 按方向键拉范围，松开 J 建字幕块"
+            )
+
+    def _j_qu_genbo(self):
+        """播放中按着 J：范围这头跟着播放头往前长（33ms 看一眼）
+
+        只在真播着的时候动：中途按了方向键 / 拖了鼠标会暂停播放，
+        这时候范围那头该由鼠标 / 方向键说了算，别被这里拽回去。
+        """
+        if self._j_qu is None:
+            self._j_qu_dingshi.stop()
+            return
+        if not self.zhengzai_bofang:
+            return
+        self._j_qu_gai_ms(self._tou_ms(self._bofang_zhen()))
+
+    def _j_qu_yu_biao(self):
+        """按着 J 又去时间轴上拖鼠标：播放先停下，这头改由鼠标说了算"""
+        self._j_qu_dingshi.stop()
+        if self.zhengzai_bofang:
+            self._zanting()
+
+    def _j_qu_gai_ms(self, ms):
+        """时间轴上鼠标拖到哪 -> 范围这头跟到哪（起点不动）"""
+        if self._j_qu is None:
+            return
+        self._j_qu["zhi"] = int(ms)
+        self.shijianzhou.shezhi_jian_qu(self._j_qu["qi"], self._j_qu["zhi"])
+
+    def _j_qu_song(self):
+        """松开 J：把拉出来的范围建成一条字幕块
+
+        只按了一下 J、没拉开（一头是同一个位置）就啥也不做 —— 想建一条
+        固定长度的空白块还是回车那套，别在这儿硬塞一条 0 帧的。
+        """
+        qu = self._j_qu
+        self._j_qu = None
+        self._j_qu_dingshi.stop()
+        self.shijianzhou.shezhi_jian_qu(None, None)
+        if not qu:
+            return
+        qi, zhi = int(qu["qi"]), int(qu["zhi"])
+        if zhi < qi:
+            qi, zhi = zhi, qi
+        if zhi - qi < 1:
+            return
+        self._xinjian_zimu_qujian(qi, zhi)
+
+    def _xinjian_zimu_qujian(self, qi_ms, zhi_ms):
+        """按给定的一段范围建一条空白字幕块（J 键拉出来的那个范围）
+
+        块头 / 块尾都按帧的"中点"重新算一遍（见 _zhen_kuang）：拖鼠标拿到的
+        毫秒是随便落在帧中间的，不重新算，块尾就会离下一帧差半帧。
+        落在第几轨、要不要顺手选中，跟回车建块是同一套（见 _xinjian_zimu_kongbai）。
+        """
+        if self.shichang_ms <= 0 or self.fps <= 0:
+            return False
+        qi_zhen = ms_tou_zhen(int(qi_ms), self.fps, wei=False)
+        zhi_zhen = ms_tou_zhen(int(zhi_ms), self.fps, wei=True)
+        qi = self._tou_ms(qi_zhen)
+        zhi = self._wei_ms(zhi_zhen)
+        zhi = min(zhi, int(self.shichang_ms))
+        if zhi <= qi:
+            return False
+        # 行号必须先算：_jia_zimu_kuai 会把自己插进去，插完再算就把自己数成占轨
+        hang, _die = self._kong_hang_wei(qi, zhi)
+        wei = self._jia_zimu_kuai(qi, zhi, "")
+        self.shijianzhou.shezhi_hang([(wei, hang)])
+        self._chong_xie_zimu_wenjian("按住 J 拉出一条字幕块", "xinjian")
+        if getattr(self.shijianzhou, "xinjian_xuanzhong", False):
+            self._shoudao_xuan_zhong_zimu(wei)
+        return True
+
+    def _xinjian_zimu_kongbai(self):
+        """回车：以播放头为起点，建一条 XINJIAN_ZIMU_MS 的空白字幕块（选中着块也照建）
+
+        新块建完选不选中看时间轴右键那个开关「创建字幕块后选中字幕块」：
+        没勾（默认）就不选中 —— 接着按回车就是接着往后建，不用先取消选择；
+        勾了就顺手选中它，三处（时间轴 / 字幕列表 / 编辑区）一起高亮，可以直接打字。
         落在第几轨按"那一刻哪一轨空着"挑（见 _kong_hang_wei）：以前一律落第 1 轨，
         第 1 轨那个位置已经有块了就叠在它上面，看着就是"糊成一坨"。
         """
@@ -17709,6 +18463,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # _ji_chexiao 一样是 "xinjian"，同一类动作会并成一笔，撤销不会多出一步。
         # 不说话：块直接出现在时间轴上，看得见，不用再提示一句
         self._chong_xie_zimu_wenjian("新建一条空白字幕块", "xinjian")
+        # 开关勾着才顺手选中（右键菜单里那个「创建字幕块后选中字幕块」）。
+        # 摆在三处都建好、文件也写完之后 —— 选中会刷工具条和列表，早做会被覆盖。
+        if getattr(self.shijianzhou, "xinjian_xuanzhong", False):
+            self._shoudao_xuan_zhong_zimu(wei)
         return True
 
     def _kong_hang_wei(self, qi_ms, zhi_ms):
@@ -17733,7 +18491,14 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 zhan.add(int(self.shijianzhou.zimu_hang(i)))
             except Exception:            # noqa
                 zhan.add(0)
+        yin = set()
+        try:
+            yin = set(self.shijianzhou.yin_hang_liebiao())
+        except Exception:            # noqa
+            yin = set()
         for hang in range(zui_da):
+            if hang in yin:
+                continue            # 关掉的轨道不往里落
             if hang not in zhan:
                 return hang, False
         # 八条都占着：回卷（第 9 个 -> 第 1 轨，第 10 个 -> 第 2 轨…）
@@ -17809,17 +18574,21 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._beiping_kuangjie = []
 
     def eventFilter(self, duixiang, shijian):
-        """视频工作台的全局按键：Tab / ` / ~ / Ctrl+Z / Ctrl+Y
+        """视频工作台的全局按键：Tab / ` / ~ / Ctrl+Z / Ctrl+Y / J
 
         这几个键在视频工作台里哪儿按都好使（焦点在字幕编辑框里照样），而且
-        Tab、波浪号不许落进输入框变成缩进 / 字符。
+        Tab、波浪号不许落进输入框变成缩进 / 字符。J 是"按住拉范围建块"，
+        松开那一半也得接住（KeyRelease），所以这里两种事件都过一遍。
 
         不走 QShortcut 的原因：焦点在 QPlainTextEdit（字幕编辑框）里时，它会
         把 Tab、波浪号当成自己要输入的字符，还会抢先声明"这键归我"，快捷键
         就轮不上了；Ctrl+Z 更霸道，框里有没有字可撤都归它。在应用级把按键拦
         下来最稳：是这几个键就直接办功能，事件吃掉、不再往下送。
         """
-        if shijian.type() != QtCore.QEvent.KeyPress or not self.isVisible():
+        if (
+            shijian.type() not in (QtCore.QEvent.KeyPress, QtCore.QEvent.KeyRelease)
+            or not self.isVisible()
+        ):
             return super().eventFilter(duixiang, shijian)
         # 只拦本窗口里的按键：别去抢主界面或别处的 Tab / 波浪号。
         # 查找 / 替换 / 选择那几个小窗口是独立的顶层窗口（它们自己要用 Tab
@@ -17828,6 +18597,14 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if isinstance(duixiang, QtWidgets.QWidget):
             if duixiang is not self and duixiang.window() is not self:
                 return super().eventFilter(duixiang, shijian)
+        # 松开 J = 把刚才拉的范围建成一条字幕块（按下时记的起点 -> 现在这头）。
+        # 只认"松开"这一下，长按时的自动重复不管；范围没拉开就啥也不做。
+        if shijian.type() == QtCore.QEvent.KeyRelease:
+            if shijian.key() == Qt.Key_J and self._j_qu is not None:
+                if not shijian.isAutoRepeat():
+                    self._j_qu_song()
+                return True
+            return super().eventFilter(duixiang, shijian)
         if shijian.modifiers() & (
             Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
         ):
@@ -17844,6 +18621,17 @@ class VideoWorkDialog(QtWidgets.QDialog):
                     return True
             return super().eventFilter(duixiang, shijian)
         jian = shijian.key()
+        # 按住 J + 拖鼠标（或按方向键）= 从播放头拉出一个范围，松开 J 就建成一条
+        # 字幕块（照 ArcTime 那套）。焦点在能打字的地方时不抢：字幕编辑框里
+        # j 就是个字母，得让人正常打；也不能带修饰键（Shift+J 是打字）。
+        if (
+            jian == Qt.Key_J
+            and not shijian.modifiers()
+            and not self._zai_dazi_kuang(duixiang)
+        ):
+            if not shijian.isAutoRepeat():
+                self._j_qu_kai()
+            return True
         if jian == Qt.Key_Tab:
             self._tab_an_xia()
             return True
@@ -18315,6 +19103,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 画面还拆在独立窗口里就先收回来（不然那块控件的 GL 上下文跟着窗口一起
         # 没了，下面松渲染上下文 / 关内核那两步会踩空）
         self._zhengzai_guan = True
+        # 关窗口时要是还按着 J（拉着范围）：做个了断，别把半截范围留到下次
+        if self._j_qu is not None:
+            self._j_qu = None
+            self._j_qu_dingshi.stop()
+            self.shijianzhou.shezhi_jian_qu(None, None)
         # 切片还在跑就让它收手，等它把手上这张存完再走（别硬杀线程）
         if self._qiepian_xiancheng is not None:
             self._qiepian_xiancheng.ting()
@@ -18358,10 +19151,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
     def keyPressEvent(self, event):
         jian = event.key()
         if jian in (Qt.Key_Return, Qt.Key_Enter):
-            # 没选中字幕块时，回车 = 在播放头位置建一条空白字幕块
-            if not self.shijianzhou.xuan_zhong_liebiao():
-                if self._xinjian_zimu_kongbai():
-                    return
+            # 回车 = 在播放头位置建一条空白字幕块，选没选中块都一样。
+            # 以前是"只有没选中字幕块时才建"，选中着按回车屁事没有，很别扭；
+            # 现在不管选没选中都建（建完选不选中看时间轴右键那个开关）。
+            if self._xinjian_zimu_kongbai():
+                return
         if jian == Qt.Key_Space:
             self._qiehuan_bofang()
             return
