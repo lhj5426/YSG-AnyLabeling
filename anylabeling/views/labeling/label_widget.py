@@ -6296,8 +6296,10 @@ class LabelingWidget(QtWidgets.QWidget):
 
     def open_expand_margins_dialog(self):
         """Toggle the expand margins dialog."""
-        # Use all possible labels from config
-        labels = self._config.get("labels", [])
+        # 合并配置里的标签和当前标签栏里的标签。
+        # 掩膜生成等操作产出的标签（如 mask）只会进标签栏，不会写进 _config["labels"]，
+        # 只读配置的话新标签不会出现在表格里。
+        labels = self._get_all_labels()
 
         if not labels:
             self.error_message(
@@ -13815,6 +13817,64 @@ class LabelingWidget(QtWidgets.QWidget):
         self.canvas.update()
         self.update_navigator_shapes()
 
+    def _remove_shapes_bulk(self, shapes_to_delete):
+        """批量移除本页的 shape。
+
+        逐条删除的代价：list.remove() 每次 O(n) 线性查找；更关键的是每删一行都会
+        经 StandardItemModel.itemDropped 调一次 label_order_changed()，等于全量
+        重建画布 + 全列表重设文本，开着自动保存时还要每删一条写一次盘。
+        几百个标签时界面必然假死。
+
+        这里改成：画布数据一次成型、列表一次定位、一次删完，最后只做一次收尾。
+        """
+        if not shapes_to_delete:
+            return 0
+
+        doomed = {id(shape) for shape in shapes_to_delete}
+
+        # 画布数据一次性过滤
+        self.canvas.shapes = [
+            shape for shape in self.canvas.shapes if id(shape) not in doomed
+        ]
+
+        # 列表里要删的行一次性定位（原写法每个 shape 都全列表扫一遍）
+        model = self.label_list.model()
+        rows_to_remove = []
+        for row in range(model.rowCount()):
+            item = model.item(row, 0)
+            if item is not None and id(item.shape()) in doomed:
+                rows_to_remove.append(row)
+
+        previous_suppress = getattr(model, "_suppress_dropped", False)
+        self.label_list.setUpdatesEnabled(False)
+        model._suppress_dropped = True
+        try:
+            # 从后往前删，避免行号漂移
+            for row in reversed(rows_to_remove):
+                model.removeRows(row, 1)
+        finally:
+            model._suppress_dropped = previous_suppress
+            self.label_list.setUpdatesEnabled(True)
+
+        return len(shapes_to_delete)
+
+    def _create_bulk_progress(self, title, total):
+        """为跨图片的批量操作建一个可取消的进度条。"""
+        progress = QtWidgets.QProgressDialog(
+            title,
+            self.tr("取消"),
+            0,
+            max(total, 1),
+            self,
+        )
+        progress.setWindowTitle(self.tr("请稍候"))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        return progress
+
     def delete_current_page_shapes_by_label(self, label):
         """删除本页所有该标签的矩形"""
         # 找到所有该标签的shape
@@ -13840,18 +13900,14 @@ class LabelingWidget(QtWidgets.QWidget):
         if reply != QtWidgets.QMessageBox.Yes:
             return
 
-        # 删除shapes
-        for shape in shapes_to_delete:
-            self.canvas.shapes.remove(shape)
-            item = self.label_list.find_item_by_shape(shape)
-            if item:
-                self.label_list.remove_item(item)
+        # 删除shapes（批量，避免逐个删除导致界面假死）
+        self._remove_shapes_bulk(shapes_to_delete)
 
         self.canvas.store_shapes()
-        self.canvas.update()
         self.set_dirty()
+        self.canvas.update()
 
-        # 更新标签计数
+        # 更新标签计数（全列表重排只做这一次）
         self._update_all_item_orders()
         self.update_combo_box()
         self.update_gid_box()
@@ -13888,36 +13944,52 @@ class LabelingWidget(QtWidgets.QWidget):
 
         processed_files = 0
         deleted_shapes_total = 0
+        total_images = len(self.image_list)
 
-        # 遍历所有图片
-        for image_path in self.image_list:
-            label_file_path = osp.splitext(image_path)[0] + ".json"
-            if self.output_dir:
-                label_file_path = osp.join(self.output_dir, osp.basename(label_file_path))
+        # 这个操作要遍历并改写全部标注文件，不给进度条会表现为界面假死
+        progress = self._create_bulk_progress(
+            self.tr(f"正在删除标签 '{label}' ..."), total_images
+        )
+        cancelled = False
+        try:
+            # 遍历所有图片
+            for index, image_path in enumerate(self.image_list, 1):
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
 
-            if not osp.exists(label_file_path):
-                continue
+                label_file_path = osp.splitext(image_path)[0] + ".json"
+                if self.output_dir:
+                    label_file_path = osp.join(self.output_dir, osp.basename(label_file_path))
 
-            # 读取标注文件
-            try:
-                with open(label_file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                if osp.exists(label_file_path):
+                    # 读取标注文件
+                    try:
+                        with open(label_file_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
 
-                # 过滤掉该标签的shapes
-                original_count = len(data.get('shapes', []))
-                data['shapes'] = [s for s in data.get('shapes', []) if s.get('label') != label]
-                deleted_count = original_count - len(data['shapes'])
+                        # 过滤掉该标签的shapes
+                        original_count = len(data.get('shapes', []))
+                        data['shapes'] = [s for s in data.get('shapes', []) if s.get('label') != label]
+                        deleted_count = original_count - len(data['shapes'])
 
-                if deleted_count > 0:
-                    # 保存文件
-                    with open(label_file_path, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                        if deleted_count > 0:
+                            # 保存文件
+                            with open(label_file_path, 'w', encoding='utf-8') as f:
+                                json.dump(data, f, ensure_ascii=False, indent=2)
 
-                    processed_files += 1
-                    deleted_shapes_total += deleted_count
+                            processed_files += 1
+                            deleted_shapes_total += deleted_count
 
-            except Exception as e:
-                logger.error(f"处理文件 {label_file_path} 时出错: {e}")
+                    except Exception as e:
+                        logger.error(f"处理文件 {label_file_path} 时出错: {e}")
+
+                # 分批刷新界面，让窗口保持响应
+                if index % 10 == 0 or index == total_images:
+                    progress.setValue(index)
+                    QtWidgets.QApplication.processEvents()
+        finally:
+            progress.close()
 
         # 从标签栏删除该标签
         self.unique_label_list.remove_items_by_label(label)
@@ -13925,6 +13997,18 @@ class LabelingWidget(QtWidgets.QWidget):
         # 刷新当前图片
         if self.filename:
             self.load_file(self.filename)
+
+        if cancelled:
+            QtWidgets.QMessageBox.information(
+                self,
+                self.tr("已取消"),
+                self.tr(
+                    f"操作已中断。\n"
+                    f"中断前已从 {processed_files} 张图片上\n"
+                    f"删除了 {deleted_shapes_total} 个 '{label}' 标签"
+                )
+            )
+            return
 
         # 显示结果
         QtWidgets.QMessageBox.information(
@@ -14126,18 +14210,14 @@ class LabelingWidget(QtWidgets.QWidget):
         if reply != QtWidgets.QMessageBox.Yes:
             return
 
-        # 删除shapes
-        for shape in shapes_to_delete:
-            self.canvas.shapes.remove(shape)
-            item = self.label_list.find_item_by_shape(shape)
-            if item:
-                self.label_list.remove_item(item)
+        # 删除shapes（批量，避免逐个删除导致界面假死）
+        self._remove_shapes_bulk(shapes_to_delete)
 
         self.canvas.store_shapes()
-        self.canvas.update()
         self.set_dirty()
+        self.canvas.update()
 
-        # 更新标签计数
+        # 更新标签计数（全列表重排只做这一次）
         self._update_all_item_orders()
         self.update_combo_box()
         self.update_gid_box()
@@ -14182,43 +14262,59 @@ class LabelingWidget(QtWidgets.QWidget):
         processed_files = 0
         deleted_shapes_total = 0
         label_deleted_counts = {label: 0 for label in labels}
+        total_images = len(self.image_list)
 
-        # 遍历所有图片
-        for image_path in self.image_list:
-            label_file_path = osp.splitext(image_path)[0] + ".json"
-            if self.output_dir:
-                label_file_path = osp.join(self.output_dir, osp.basename(label_file_path))
+        # 这个操作要遍历并改写全部标注文件，不给进度条会表现为界面假死
+        progress = self._create_bulk_progress(
+            self.tr(f"正在删除 {len(labels)} 个标签 ..."), total_images
+        )
+        cancelled = False
+        try:
+            # 遍历所有图片
+            for index, image_path in enumerate(self.image_list, 1):
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
 
-            if not osp.exists(label_file_path):
-                continue
+                label_file_path = osp.splitext(image_path)[0] + ".json"
+                if self.output_dir:
+                    label_file_path = osp.join(self.output_dir, osp.basename(label_file_path))
 
-            # 读取标注文件
-            try:
-                with open(label_file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                if osp.exists(label_file_path):
+                    # 读取标注文件
+                    try:
+                        with open(label_file_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
 
-                # 过滤掉选中标签的shapes，并统计每个标签的删除数量
-                original_count = len(data.get('shapes', []))
-                new_shapes = []
-                for s in data.get('shapes', []):
-                    if s.get('label') in labels:
-                        label_deleted_counts[s.get('label')] += 1
-                    else:
-                        new_shapes.append(s)
+                        # 过滤掉选中标签的shapes，并统计每个标签的删除数量
+                        original_count = len(data.get('shapes', []))
+                        new_shapes = []
+                        for s in data.get('shapes', []):
+                            if s.get('label') in labels:
+                                label_deleted_counts[s.get('label')] += 1
+                            else:
+                                new_shapes.append(s)
 
-                data['shapes'] = new_shapes
-                deleted_count = original_count - len(data['shapes'])
+                        data['shapes'] = new_shapes
+                        deleted_count = original_count - len(data['shapes'])
 
-                if deleted_count > 0:
-                    # 保存文件
-                    with open(label_file_path, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                        if deleted_count > 0:
+                            # 保存文件
+                            with open(label_file_path, 'w', encoding='utf-8') as f:
+                                json.dump(data, f, ensure_ascii=False, indent=2)
 
-                    processed_files += 1
-                    deleted_shapes_total += deleted_count
+                            processed_files += 1
+                            deleted_shapes_total += deleted_count
 
-            except Exception as e:
-                logger.error(f"处理文件 {label_file_path} 时出错: {e}")
+                    except Exception as e:
+                        logger.error(f"处理文件 {label_file_path} 时出错: {e}")
+
+                # 分批刷新界面，让窗口保持响应
+                if index % 10 == 0 or index == total_images:
+                    progress.setValue(index)
+                    QtWidgets.QApplication.processEvents()
+        finally:
+            progress.close()
 
         # 从标签栏删除这些标签
         for label in labels:
@@ -14230,6 +14326,19 @@ class LabelingWidget(QtWidgets.QWidget):
 
         # 构建结果消息
         labels_info = "\n".join([f"  • {label}: {count}个" for label, count in label_deleted_counts.items() if count > 0])
+
+        if cancelled:
+            QtWidgets.QMessageBox.information(
+                self,
+                self.tr("已取消"),
+                self.tr(
+                    f"操作已中断。\n"
+                    f"中断前已从 {processed_files} 张图片上删除了以下标签：\n\n"
+                    f"{labels_info}\n\n"
+                    f"共删除 {deleted_shapes_total} 个矩形"
+                )
+            )
+            return
 
         # 显示结果
         QtWidgets.QMessageBox.information(
@@ -18582,7 +18691,7 @@ class LabelingWidget(QtWidgets.QWidget):
 
         # After repopulating the file list, refresh the expand margins dialog if it's open.
         if self.expand_margins_dialog and self.expand_margins_dialog.isVisible():
-            all_labels = self._config.get("labels", [])
+            all_labels = self._get_all_labels()
             total_files = self.file_list_widget.count()
             # At this point, no item is selected yet, so the current page is temporarily set to 1.
             # The subsequent call to load_file -> file_selection_changed will update it precisely.
@@ -20403,6 +20512,11 @@ class LabelingWidget(QtWidgets.QWidget):
         if (hasattr(self, 'expand_margins_dialog') and
             self.expand_margins_dialog is not None and
             self.expand_margins_dialog.isVisible()):
+            # 标签集合变了（例如刚用掩膜工具生成了 mask 标签）就重建表格。
+            # 不重建的话表格里不会出现新标签，得把图片翻页来回才刷出来。
+            all_labels = self._get_all_labels()
+            if all_labels != self.expand_margins_dialog.label_order:
+                self.expand_margins_dialog.update_labels(all_labels)
             self.expand_margins_dialog.refresh_colors()
             # 更新当前页码（让"从"和"跳转到"跟随当前页）
             if self.file_list_widget:

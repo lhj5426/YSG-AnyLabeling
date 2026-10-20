@@ -177,10 +177,17 @@ class LabelListWidgetItem(QtGui.QStandardItem):
 class StandardItemModel(QtGui.QStandardItemModel):
     itemDropped = QtCore.pyqtSignal()
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 批量删除期间置 True：否则每删一行都会触发一次全量重排，
+        # 几百个标签时界面直接假死。
+        self._suppress_dropped = False
+
     # QT Overload
     def removeRows(self, *args, **kwargs):
         ret = super().removeRows(*args, **kwargs)
-        self.itemDropped.emit()
+        if not self._suppress_dropped:
+            self.itemDropped.emit()
         return ret
 
 
