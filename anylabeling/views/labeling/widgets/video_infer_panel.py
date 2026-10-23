@@ -6194,6 +6194,8 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         biao.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         biao.shezhi_liekuan_jizhun(self.LIE_KUAN, self.LIE_WENBEN)
         biao.itemSelectionChanged.connect(self._xuan_zhong_bian)
+        # 双击某一行：不管「画面跟随」开没开，画面都跳到这一条的开头（照 AEG）
+        biao.cellDoubleClicked.connect(self._shuangji_hang)
         biao.xiayitiao.connect(self._xia_yi_tiao)   # 列表里按回车 = 换下一条
         # Alt+↑ / Alt+↓ = 整批挪行，具体怎么挪是外面的事（照 AEG 的 Move line up/down）
         biao.yao_yidong.connect(self.yao_yidong)
@@ -6607,6 +6609,23 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
     def shezhi_zidong_tiao(self, kai):
         """「选中字幕时画面跟着跳」开关（照 AEG）：关了 = 点列表只选中，画面不动"""
         self.zidong_tiao = bool(kai)
+
+    def _shuangji_hang(self, hang, _lie=0):
+        """双击列表里某一行：只有「画面跟随」关着的时候才跳画面
+
+        分工是这样：
+        - 开了「画面跟随」：单击就跳，双击这时候不该多干一份事；
+        - 关了「画面跟随」：单击只选中、画面不动，想去看这一条就双击。
+
+        选中那一步单击时已经做完了（行都亮着了），这儿只发跳转。所以不去
+        碰 shezhi_xuan_zhong：多此一举，还会跟单击那条路抢着发两遍。
+        """
+        if self.zidong_tiao:
+            return          # 单击已经跳过了，双击不再重复
+        hang = int(hang)
+        if not (0 <= hang < len(self._zimu)):
+            return
+        self.zimu_qi_tiao.emit(int(self._zimu[hang][0]))
 
     def _xia_yi_tiao(self):
         """回车：选列表的下一行 —— 时间轴块、播放头一起跟过去

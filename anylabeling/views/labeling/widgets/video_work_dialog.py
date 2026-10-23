@@ -4133,6 +4133,18 @@ SHUOHUA_PANGBAI_MING = "F1" + SHUOHUA_PANGBAI   # 旁白那行的说话人名 = 
 SHUOHUA_ZHANKAI_HANG = 5             # 预览框展开的行号格子最多露 5 行，再多自己滚
 SHUOHUA_GE_ZI_GAO = 22               # 行号格子多高（宽 48 是在摆的时候定的）
 
+# ⑨预览框那张表：最左边两列是拖动排序用的（手柄 / 上下箭头），后面才是内容。
+# 列号写死容易改漏，统一在这儿定义，用到的地方都引名字。
+TUBIAO_TUO_KUAN = 20                 # 拖动手柄那列多宽
+TUBIAO_JIAN_KUAN = 22                # 上下箭头那列多宽
+TUBIAO_LIE_TUO = 0                   # 拖动手柄
+TUBIAO_LIE_JIAN = 1                  # 上移 / 下移箭头
+TUBIAO_LIE_XU = 2                    # 序号
+TUBIAO_LIE_SE = 3                    # 颜色
+TUBIAO_LIE_SHU = 4                   # 条数
+TUBIAO_LIE_MING = 5                  # 说话人
+TUBIAO_LIE_YANG = 6                  # 样式
+
 # ⑨分说话人的两条「分组规则」（下拉选单里选，存在 ini 里；两条都用「合并阈值」）
 SHUOHUA_GUIZE_PANGBAI = "pangbai"    # 按旁白：整行没括号的全算一组「旁白」，只有对话按颜色分
 SHUOHUA_GUIZE_YANSE = "yanse"        # 按颜色：旁白也按颜色拆（旁白1、旁白2…），对话照旧
@@ -7350,6 +7362,7 @@ class ShijianZhou(QtWidgets.QWidget):
     fuzhi_kuai = pyqtSignal()               # 时间轴上 Ctrl+C -> 复制选中的块（外面写剪贴板）
     zhantie_kuai = pyqtSignal()             # 时间轴上 Ctrl+V -> 复制一份落在原块的下面一行
     kuang_xuan = pyqtSignal(object)         # 空白处拖框选了一批块 -> 第几条的列表（外面同步列表多选）
+    shuangji_zimu = pyqtSignal(int)         # 双击某块字幕 -> 第几条（外面切到「字幕编辑」并开打）
     qiepian = pyqtSignal()                  # 右键菜单「以时间轴切片」-> 外面按现在的块 + 框选区域截图
     qiepian_shezhi = pyqtSignal()           # 右键菜单「切片设置」-> 外面弹设置框
     yanse_xuan = pyqtSignal(object)         # 右键「提取选中字幕块的颜色」-> 带选中下标走⑨单条那路
@@ -9964,6 +9977,20 @@ class ShijianZhou(QtWidgets.QWidget):
                 self.update()
                 event.accept()
                 return
+            # 双击字幕块：外面切到「字幕编辑」页、把光标放进编辑框，直接开打。
+            # 双击的头一下已经先按过一次左键（可能把"拖块"点起来了），这里收掉 ——
+            # 双击只是去编辑，不许顺手把块挪了。
+            if self._shichang > 0 and self._jian_qu is None:
+                xu, _buwei = self._zimu_zai_dian(event.pos().x(), event.pos().y())
+                if xu >= 0:
+                    self._tuo_zimu = None
+                    self._kuang = None
+                    self._tuodong = False
+                    self._xuan_ze_dan(xu)
+                    self.xuan_zhong.emit(int(xu))
+                    self.shuangji_zimu.emit(int(xu))
+                    event.accept()
+                    return
         super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -10925,6 +10952,47 @@ class JianbianZiKuang(QtWidgets.QDialog):
         return chu
 
 
+class _TuoShouBing(QtWidgets.QLabel):
+    """⑨预览框表格最左边那个小点：按住它上下拖，整行跟着换位置
+
+    不走 Qt 自带的拖放 —— 这表每一格都是控件（色块按钮 / 条数按钮 / 输入框 /
+    下拉框），Qt 拖放搬不动这些控件，拖完行会错位（第 3 行显示第 5 行的名字）。
+    这里只认「按住 - 移动 - 松开」，由框子在松手那一下整表重建，控件和数据
+    一定是对得上的。
+    """
+
+    def __init__(self, kuang, zu):
+        super().__init__("\u283f")
+        self._kuang = kuang
+        self.zu = zu
+        self._an_zhu = False
+        self.setCursor(Qt.OpenHandCursor)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet(
+            "color:#A0A0A0;font-size:15px;background:transparent;"
+        )
+        self.setToolTip("按住这里上下拖，调这一组的顺序")
+
+    def mousePressEvent(self, shijian):
+        if shijian.button() != Qt.LeftButton:
+            return
+        self._an_zhu = True
+        self.setCursor(Qt.ClosedHandCursor)
+        self._kuang._tuo_kaishi(self.zu)
+
+    def mouseMoveEvent(self, shijian):
+        if self._an_zhu:
+            self._kuang._tuo_yidong(shijian.globalPos())
+            shijian.accept()
+
+    def mouseReleaseEvent(self, shijian):
+        if not self._an_zhu:
+            return
+        self._an_zhu = False
+        self.setCursor(Qt.OpenHandCursor)
+        self._kuang._tuo_jieshu(shijian.globalPos())
+
+
 class ShuohuaFenpeiDialog(QtWidgets.QDialog):
     """⑨「用颜色设置样式和说话人」的预览框（非阻塞：show 不是 exec）
 
@@ -10983,9 +11051,9 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         zong.setContentsMargins(14, 12, 14, 12)
         zong.setSpacing(8)
 
-        self.biao = QtWidgets.QTableWidget(0, 5)
+        self.biao = QtWidgets.QTableWidget(0, 7)
         self.biao.setHorizontalHeaderLabels(
-            ("序号", "颜色", "条数", "说话人", "样式")
+            ("", "", "序号", "颜色", "条数", "说话人", "样式")
         )
         self.biao.verticalHeader().setVisible(False)
         self.biao.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -10996,15 +11064,25 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         self.biao.setContextMenuPolicy(Qt.CustomContextMenu)
         self.biao.customContextMenuRequested.connect(self._you_jian_cai_dan)
         tou = self.biao.horizontalHeader()
-        tou.setSectionResizeMode(0, QtWidgets.QHeaderView.Fixed)
-        tou.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
-        tou.setSectionResizeMode(2, QtWidgets.QHeaderView.Fixed)
-        tou.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
-        tou.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
-        self.biao.setColumnWidth(0, 46)
-        self.biao.setColumnWidth(1, 130)
-        self.biao.setColumnWidth(2, 70)
+        # 0 拖动  1 排序箭头  2 序号  3 颜色  4 条数  5 说话人  6 样式
+        for _lie in (0, 1, 2, 3, 4):
+            tou.setSectionResizeMode(_lie, QtWidgets.QHeaderView.Fixed)
+        tou.setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)
+        tou.setSectionResizeMode(6, QtWidgets.QHeaderView.Stretch)
+        self.biao.setColumnWidth(0, TUBIAO_TUO_KUAN)
+        self.biao.setColumnWidth(1, TUBIAO_JIAN_KUAN)
+        self.biao.setColumnWidth(2, 34)
+        self.biao.setColumnWidth(3, 130)
+        self.biao.setColumnWidth(4, 70)
         zong.addWidget(self.biao, 1)
+
+        # 拖动排序那条落点横线（挂在表格里面那块，拖的时候才露出来）
+        self._tuo_xian = QtWidgets.QFrame(self.biao.viewport())
+        self._tuo_xian.setStyleSheet("background:#2F7DD1;border:none;")
+        self._tuo_xian.setFixedHeight(2)
+        self._tuo_xian.hide()
+        self._tuo_zu = None            # 正在拖的组下标
+        self._tuo_mubiao = None        # 松手会插到第几个位置
 
         # 分组规则：按旁白 / 按颜色 两条，选了就照这条重新分组（存 ini 里）
         gui = QtWidgets.QHBoxLayout()
@@ -11183,19 +11261,23 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
             r = self.biao.rowCount()
             self.biao.insertRow(r)
             self._biao_hang[i] = r
+            # 拖动格：左边那个小点，按住上下拖能整行换位置
+            self.biao.setCellWidget(r, TUBIAO_LIE_TUO, _TuoShouBing(self, i))
+            # 排序格：一对小箭头，点一下挪一格
+            self.biao.setCellWidget(r, TUBIAO_LIE_JIAN, self._pai_xu_jian_tou(i))
             # 序号格：点它就整行选中（右键的「并入」认选中这一行）
             hao = QtWidgets.QTableWidgetItem(str(i + 1))
             hao.setTextAlignment(Qt.AlignCenter)
             hao.setToolTip("点这一格选中整行；再在表上点右键可以「并入到…」别的组")
-            self.biao.setItem(r, 0, hao)
+            self.biao.setItem(r, TUBIAO_LIE_XU, hao)
             # 颜色格：一个小色块按钮 —— 点一下就能弹调色板重设这一组的主色
-            self.biao.setCellWidget(r, 1, self._se_an(h["se"]))
+            self.biao.setCellWidget(r, TUBIAO_LIE_SE, self._se_an(h["se"]))
             # 条数格：点一下展开这一组的行号（再点收起）
-            self.biao.setCellWidget(r, 2, self._shu_an(i))
+            self.biao.setCellWidget(r, TUBIAO_LIE_SHU, self._shu_an(i))
             # 说话人
             shu = QtWidgets.QLineEdit(h["ming"])
             shu.setStyleSheet(_ys_shuru())
-            self.biao.setCellWidget(r, 3, shu)
+            self.biao.setCellWidget(r, TUBIAO_LIE_MING, shu)
             # 样式
             ya = QtWidgets.QComboBox()
             ya.setEditable(True)
@@ -11204,7 +11286,7 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
                 ya.addItem(h["yang"])
             ya.setCurrentText(h["yang"])
             ya.setMaxVisibleItems(20)
-            self.biao.setCellWidget(r, 4, ya)
+            self.biao.setCellWidget(r, TUBIAO_LIE_YANG, ya)
             if i in self._zhankai:
                 self._cha_zhan_kai(i)
         self.biao.resizeRowsToContents()
@@ -11225,6 +11307,137 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         an.setToolTip("点开看这一组都是哪几条（点行号跳过去）")
         an.clicked.connect(lambda _=False, x=i: self._kai_he(x))
         return an
+
+    # ---- 排序：左边小点按住拖 / 点上下箭头，两种都能整行换位置 ----
+    def _pai_xu_jian_tou(self, i):
+        """排序格那一对小箭头（点一下这一组往上 / 往下挪一格）"""
+        kuang = QtWidgets.QWidget()
+        bu = QtWidgets.QVBoxLayout(kuang)
+        bu.setContentsMargins(0, 0, 0, 0)
+        bu.setSpacing(0)
+        for biao, pian in (("\u25b2", -1), ("\u25bc", 1)):
+            an = QtWidgets.QPushButton(biao)
+            an.setCursor(Qt.PointingHandCursor)
+            an.setFocusPolicy(Qt.NoFocus)
+            an.setFixedSize(TUBIAO_JIAN_KUAN - 2, 13)
+            an.setStyleSheet(
+                "QPushButton{border:none;background:transparent;color:#7A7A7A;"
+                "font-size:9px;padding:0;}"
+                "QPushButton:hover{background:#DCE9F7;color:#1A5FA8;}"
+            )
+            an.setToolTip("上移一组" if pian < 0 else "下移一组")
+            an.clicked.connect(
+                lambda _=False, x=i, d=pian: self._yi_dong_zu(x, d)
+            )
+            bu.addWidget(an)
+        return kuang
+
+    def _yi_dong_zu(self, i, pian):
+        """这一组往上 / 往下挪一格（箭头按钮走这里）"""
+        if pian < 0:
+            self._yi_dong_dao(i, i - 1)
+        else:
+            self._yi_dong_dao(i, i + 2)
+
+    def _yi_dong_dao(self, cong, dao):
+        """把第 cong 组挪到 dao 这个插入点（dao 取值 0..组数）
+
+        组挪了，展开状态跟着一起挪；默认名（说话人1 / 说话人2…）按新顺序
+        重算，自己手改过的名字不动（_chong_bian_hao 只碰默认名）。
+        """
+        if not (0 <= cong < len(self._hang)):
+            return
+        dao = max(0, min(int(dao), len(self._hang)))
+        if dao > cong:
+            dao -= 1
+        if dao == cong:
+            return
+        self._cun_biao()                # 表里刚改过的名字先收回来
+        hang = self._hang.pop(cong)
+        self._hang.insert(dao, hang)
+        xin = set()
+        for x in self._zhankai:
+            if x == cong:
+                xin.add(dao)
+            elif cong < x <= dao:
+                xin.add(x - 1)
+            elif dao <= x < cong:
+                xin.add(x + 1)
+            else:
+                xin.add(x)
+        self._zhankai = xin
+        self._chong_bian_hao()
+        self._tian_biao()
+        self._shua_tishi()
+        self.biao.selectRow(self._biao_hang.get(dao, dao))
+
+    def _tuo_kaishi(self, zu):
+        """手柄被按住：记下拖的是哪一组，落点线先收起来"""
+        self._tuo_zu = zu
+        self._tuo_mubiao = zu
+        self._tuo_xian.hide()
+
+    def _tuo_yidong(self, quanju):
+        """拖的途中：算出会插到哪儿、把那条横线画在那儿
+
+        拖到表格上下边缘就自己滚，不然组多了拖不到远处去。
+        """
+        if self._tuo_zu is None:
+            return
+        dian = self.biao.viewport().mapFromGlobal(quanju)
+        tiao = self.biao.verticalScrollBar()
+        if dian.y() < 6:
+            tiao.setValue(tiao.value() - 14)
+        elif dian.y() > self.biao.viewport().height() - 6:
+            tiao.setValue(tiao.value() + 14)
+        mu = self._tuo_dao_hang(dian.y())
+        self._tuo_mubiao = mu
+        self._hua_tuo_xian(mu)
+
+    def _tuo_jieshu(self, quanju):
+        """松手：真挪了才挪，原地没动就什么都不做"""
+        self._tuo_xian.hide()
+        qi = self._tuo_zu
+        mu = self._tuo_mubiao
+        self._tuo_zu = None
+        self._tuo_mubiao = None
+        if qi is None or mu is None:
+            return
+        self._yi_dong_dao(qi, mu)
+
+    def _tuo_dao_hang(self, y):
+        """鼠标落在表格的 y 位置上 -> 会插到第几组之前（末尾返回组数）
+
+        展开行（点条数铺出来那行）不参与排序，落在它上面就算它头顶那一组
+        的后面 —— 因为下一组那一行的上沿还远着呢。
+        """
+        for zu in range(len(self._hang)):
+            r = self._biao_hang.get(zu)
+            if r is None:
+                continue
+            kuang = self.biao.visualRect(self.biao.model().index(r, 0))
+            if y < kuang.top() + kuang.height() / 2.0:
+                return zu
+        return len(self._hang)
+
+    def _hua_tuo_xian(self, mu):
+        """把落点那条横线画在第 mu 个位置的上沿（拖到最后就画在最末行下沿）"""
+        hang_men = sorted(self._biao_hang.items())
+        if not hang_men:
+            return
+        if mu >= len(hang_men):
+            r = hang_men[-1][1]
+            kuang = self.biao.visualRect(self.biao.model().index(r, 0))
+            y = kuang.bottom() + 1
+        else:
+            r = hang_men[mu][1]
+            kuang = self.biao.visualRect(self.biao.model().index(r, 0))
+            y = kuang.top()
+        self._tuo_xian.setGeometry(
+            0, max(0, y - 1), self.biao.viewport().width(), 2
+        )
+        self._tuo_xian.show()
+        self._tuo_xian.raise_()
 
     def _kai_he(self, i):
         """这一组展开 / 收起（展开就是在它下面插一行摆行号格子）"""
@@ -11294,7 +11507,7 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         r = self._biao_hang.get(i, -1) + 1
         if r <= 0 or r >= self.biao.rowCount():
             return
-        qu = self.biao.cellWidget(r, 0)
+        qu = self.biao.cellWidget(r, TUBIAO_LIE_TUO)
         nei = qu.widget() if qu is not None else None
         bu = nei.layout() if nei is not None else None
         if bu is None:
@@ -11326,8 +11539,8 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
             r = self._biao_hang.get(i)
             if r is None:
                 continue
-            shu = self.biao.cellWidget(r, 3)
-            ya = self.biao.cellWidget(r, 4)
+            shu = self.biao.cellWidget(r, TUBIAO_LIE_MING)
+            ya = self.biao.cellWidget(r, TUBIAO_LIE_YANG)
             if shu is not None:
                 ming = shu.text().strip()
                 if ming:
@@ -11394,7 +11607,7 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         """
         hang = None
         for i, r in self._biao_hang.items():
-            if self.biao.cellWidget(r, 1) is an:
+            if self.biao.cellWidget(r, TUBIAO_LIE_SE) is an:
                 hang = i
                 break
         if hang is None:
@@ -11419,8 +11632,8 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         jieguo = []
         for i, h in enumerate(self._hang):
             r = self._biao_hang.get(i)
-            shu = self.biao.cellWidget(r, 3) if r is not None else None
-            ya = self.biao.cellWidget(r, 4) if r is not None else None
+            shu = self.biao.cellWidget(r, TUBIAO_LIE_MING) if r is not None else None
+            ya = self.biao.cellWidget(r, TUBIAO_LIE_YANG) if r is not None else None
             ming = (shu.text().strip() if shu is not None else "") or h["ming"]
             yang = (ya.currentText().strip() if ya is not None else "") or h["yang"]
             jieguo.append({
@@ -14279,6 +14492,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shijianzhou.tuo_kaishi.connect(self._tuo_bofangtou_kaishi)
         self.shijianzhou.tuo_jieshu.connect(self._tuo_bofangtou_wancheng)
         self.shijianzhou.xuan_zhong.connect(self._shoudao_xuan_zhong_zimu)
+        self.shijianzhou.shuangji_zimu.connect(self._shoudao_shuangji_zimu)
         self.shijianzhou.zimu_tuo.connect(self._shoudao_zimu_tuo)
         self.shijianzhou.shanchu_zimu.connect(self._shoudao_zimu_shanchu)
         self.shijianzhou.hebing_zimu.connect(self._shoudao_zimu_hebing)
@@ -16252,6 +16466,35 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.bianji_mianban.shezhi_xuan_zhong(xu)
         self._shuaxin_gongju()
         self.shijianzhou.gundong_dao_zimu(xu)
+
+    def _shoudao_shuangji_zimu(self, xu):
+        """时间轴上双击某块字幕 -> 翻到「字幕编辑」页，光标放进编辑框，直接开打
+
+        选中那一步（时间轴描框 / 两个列表高亮 / 编辑区换成这条）已经由紧挨
+        着发过来的 xuan_zhong 走完了，这里只剩两件事：把页翻过来、把焦点给
+        编辑框。
+        """
+        xu = int(xu)
+        if xu < 0:
+            return
+        try:
+            if self.you_tabs.currentWidget() is not self.bianji_mianban:
+                self.you_tabs.setCurrentWidget(self.bianji_mianban)
+        except Exception as cuowu:  # noqa
+            logger.warning(f"视频工作台：双击字幕块切页失败 {cuowu}")
+            return
+        kuang = self.bianji_mianban.kuang
+
+        def _kai_da():
+            # 等这次双击的尾巴走完再抢焦点：当场 setFocus 会被随后的
+            # 鼠标处理（第二次松开）抢回去
+            if not kuang.isEnabled():
+                return
+            kuang.setFocus(Qt.MouseFocusReason)
+            # 光标落到末尾：接着敲是往后接，不会把原来的字顶掉
+            kuang.moveCursor(QtGui.QTextCursor.End)
+
+        QtCore.QTimer.singleShot(0, _kai_da)
 
     def _bofangtou_xuanzhong_genjin(self):
         """「播放头选中」：播放头压在哪条字幕里，就把那条设成选中
