@@ -108,6 +108,8 @@ ZIMU_LIEBIAO_ZIHAO_MOREN = 13    # 「字幕列表」那张表的字号（px）�
 ZIMU_LIEBIAO_ZIHAO_ZUI_XIAO = 10  # Ctrl+滚轮 在字幕列表上能缩到多小
 ZIMU_LIEBIAO_ZIHAO_ZUIDA = 100    # Ctrl+滚轮 在字幕列表上能放到多大
 ZIMU_LIEBIAO_ZIHAO_PEIZHI = "jiemian/liebiao_zihao"   # 记住字幕列表字号用的配置项名
+# 「隐藏项目」：字幕列表里哪几列不显示（存列号，逗号隔开）
+ZIMU_YINCANG_PEIZHI = "jiemian/liebiao_yincang"
 ZIMU_LIEBIAO_ZITI = "新兰圆-B"   # 字幕列表字体（跟编辑框一个脸）；没装就按链子退回
 ZIMU_LIEBIAO_DISE = "#595151"    # 字幕列表底色（照 AEG）
 ZIMU_LIEBIAO_BIAN = "#ffffff"    # 字幕列表的框线和格线（照 AEG，白的）
@@ -375,6 +377,39 @@ def xie_liebiao_zihao(zihao):
         q.setValue(ZIMU_LIEBIAO_ZIHAO_PEIZHI, int(zihao))
         q.sync()
     except Exception:  # noqa
+        pass
+
+
+# ---------------------------------------------------------------- 字幕列表隐藏项目
+def du_liebiao_yincang():
+    """上次「隐藏项目」勾掉了哪几列 -> 列号集合；没存过 = 一列都不隐藏
+
+    存的是列号（0~6），不是列名：列名以后要是改字，存下来的勾选也不会失效。
+    """
+    try:
+        zhi = buju_qsettings().value(ZIMU_YINCANG_PEIZHI, "")
+    except Exception:       # noqa
+        return set()
+    if zhi is None:
+        return set()
+    ming = set()
+    for kuai in str(zhi).replace("，", ",").split(","):
+        kuai = kuai.strip()
+        if kuai.isdigit():
+            ming.add(int(kuai))
+    return ming
+
+
+def xie_liebiao_yincang(lie_set):
+    """把「隐藏项目」的勾选记下来（列号集合）"""
+    try:
+        q = buju_qsettings()
+        q.setValue(
+            ZIMU_YINCANG_PEIZHI,
+            ",".join(str(int(x)) for x in sorted(lie_set or ())),
+        )
+        q.sync()
+    except Exception:       # noqa
         pass
 
 
@@ -790,7 +825,10 @@ def _ys_zimu_biao(zihao=None):
         {zi}gridline-color: {ZIMU_LIEBIAO_BIAN};
         outline: none;
     }}
-    QTableWidget::item {{ padding: 2px 4px; }}
+    /* 单元格不写 padding：Qt 只给「走样式表绘制」的选中行应用它，未选中行不吃，
+       于是选中那一行的字会整体往右下偏几个像素（看着像多个空格、字往下沉）。
+       行高由 setDefaultSectionSize 给足，不需要这个 padding 撑。 */
+    QTableWidget::item {{ padding: 0px; }}
     QTableWidget::item:selected {{
         background-color: {ZIMU_LIEBIAO_XUAN};
         color: #ffffff;
@@ -5876,6 +5914,78 @@ class YangshiGuanliDialog(QtWidgets.QDialog):
             self._shuo(f"字幕里删掉样式「{ming}」")
 
 
+class _JuZhongDelegate(QtWidgets.QStyledItemDelegate):
+    """单元格文字按「字形实际占的高度」垂直居中
+
+    Qt 默认是按字体的 ascent + descent 那个框居中，可这个框上下不对称：
+    ascent 留得宽，中文在基线以下又只占一点点。照那个框算出来虽然数学上居中，
+    看着却偏下（上面空得多、下面挤）。这里把底（背景 / 选中底色 / 序号列黑底）
+    交给底层画，文字自己按量出来的字形框定基线，上下留白一样多。
+    """
+
+    def paint(self, hua, xuan, ci):
+        xuan = QtWidgets.QStyleOptionViewItem(xuan)
+        self.initStyleOption(xuan, ci)
+        wen = xuan.text
+        xuan.text = ""      # 底照画，但别让底层顺手把字画了
+        kang = (
+            xuan.widget.style()
+            if xuan.widget is not None
+            else QtWidgets.QApplication.style()
+        )
+        kang.drawControl(
+            QtWidgets.QStyle.CE_ItemViewItem, xuan, hua, xuan.widget
+        )
+        if not wen:
+            return
+        kuang = kang.subElementRect(
+            QtWidgets.QStyle.SE_ItemViewItemText, xuan, xuan.widget
+        )
+        heng = xuan.displayAlignment & (
+            Qt.AlignLeft | Qt.AlignRight | Qt.AlignHCenter | Qt.AlignJustify
+        )
+        # 左对齐的列（样式 / 说话人 / 文本）左边留几个像素，别贴着格线；
+        # 居中的列不动（时间那几列本来就窄，再挤就把字挤成省略号了）
+        if kuang.width() > 12:
+            if heng == 0 or heng & (Qt.AlignLeft | Qt.AlignJustify):
+                kuang = kuang.adjusted(5, 0, 0, 0)
+            elif heng & Qt.AlignRight:
+                kuang = kuang.adjusted(0, 0, -5, 0)
+        liang = QtGui.QFontMetricsF(xuan.font)
+        xia = liang.tightBoundingRect("国")    # 字形真正占的那块（不是整行框）
+        if xia.isEmpty():
+            xia = liang.boundingRect("国")
+        # 上下居中按**整个格子**算，不能按 kuang 算 —— subElementRect 给回来的是
+        # 文字自己那块大小（跟字一样高），它的中心不在格子中间，照它算就偏上。
+        # 也不要用 QRect.center()：高度是偶数时它取 floor，会白白少半个像素
+        ji = (
+            xuan.rect.top() + xuan.rect.height() / 2.0
+            - (xia.top() + xia.bottom()) / 2.0
+        )   # 基线
+        if xuan.textElideMode != Qt.ElideNone and kuang.width() > 0:
+            wen = liang.elidedText(wen, xuan.textElideMode, kuang.width())
+        se = QtGui.QColor(ZIMU_LIEBIAO_ZI)
+        qian = ci.data(Qt.ForegroundRole)
+        if isinstance(qian, QtGui.QBrush):
+            se = qian.color()
+        elif xuan.state & QtWidgets.QStyle.State_Selected:
+            se = QtGui.QColor("#ffffff")
+        hua.save()
+        hua.setFont(xuan.font)
+        hua.setPen(QtGui.QPen(se))
+        hua.drawText(
+            QtCore.QRectF(
+                kuang.left(),
+                ji - liang.ascent(),
+                kuang.width(),
+                liang.height() + 4,
+            ),
+            int(heng) | int(Qt.TextSingleLine) | int(Qt.AlignTop),
+            wen,
+        )
+        hua.restore()
+
+
 class _ZimuLiebiaoBiao(QtWidgets.QTableWidget):
     """字幕列表那张表：Ctrl+滚轮 改字号
 
@@ -5896,6 +6006,7 @@ class _ZimuLiebiaoBiao(QtWidgets.QTableWidget):
 
     def __init__(self, hang=0, lie=0, parent=None):
         super().__init__(hang, lie, parent)
+        self.setItemDelegate(_JuZhongDelegate(self))
         self._zihao = du_liebiao_zihao()
         self._lie_kuan_jichu = ()       # 基准列宽（按 ZIMU_LIEBIAO_ZIHAO_MOREN 号字定的），外面给
         self._wenben_lie = 0            # 文本列在第几列（外面给；它吃剩余宽度）
@@ -6052,6 +6163,71 @@ class _ZimuLiebiaoBiao(QtWidgets.QTableWidget):
         event.accept()
 
 
+class _YincangXuanxiangDialog(QtWidgets.QDialog):
+    """字幕列表的「隐藏项目」：勾上哪一列，列表里就不显示那一列
+
+    非模态小窗（show 不是 exec）：开着照样能点列表、拖时间轴、改字幕。
+    勾一下立刻生效，不用再点确定 —— 边看表边挑最直观。
+    """
+
+    hide_gai = pyqtSignal(object)       # 勾了哪几列（列号集合）
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("隐藏项目")
+        # 还是工作台底下的小窗（不在任务栏单独占一格），只是多给一个最小化按钮
+        self.setWindowFlags(
+            Qt.Dialog
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowCloseButtonHint
+            | Qt.WindowMinimizeButtonHint
+        )
+        self.setModal(False)        # 非模态：开着照样能点列表、拖时间轴
+        self.setMinimumWidth(190)
+        bu = QtWidgets.QVBoxLayout(self)
+        bu.setContentsMargins(16, 14, 16, 14)
+        bu.setSpacing(7)
+
+        shuo = QtWidgets.QLabel("勾上 = 列表里不显示这一列")
+        shuo.setObjectName("YsgHint")
+        shuo.setWordWrap(True)
+        bu.addWidget(shuo)
+        bu.addSpacing(2)
+
+        self._gou = {}
+        for lie, ming in ZimuBianjiMianban.LIE_KE_YINCANG:
+            gou = QtWidgets.QCheckBox(ming)
+            gou.stateChanged.connect(self._fa)
+            bu.addWidget(gou)
+            self._gou[int(lie)] = gou
+
+        bu.addSpacing(4)
+        quan = QtWidgets.QPushButton("全部显示")
+        quan.clicked.connect(self._quan_bu)
+        bu.addWidget(quan)
+        guan = QtWidgets.QPushButton("关闭")
+        guan.clicked.connect(self.close)
+        bu.addWidget(guan)
+
+    def shezhi_zhuangtai(self, lie_set):
+        """按外面记着的状态摆好勾选（不往回发信号，免得自己触发自己）"""
+        lie_set = set(int(x) for x in (lie_set or ()))
+        for lie, gou in self._gou.items():
+            gou.blockSignals(True)
+            gou.setChecked(lie in lie_set)
+            gou.blockSignals(False)
+
+    def _fa(self, *_a):
+        self.hide_gai.emit(
+            {lie for lie, gou in self._gou.items() if gou.isChecked()}
+        )
+
+    def _quan_bu(self):
+        for gou in self._gou.values():
+            gou.setChecked(False)
+
+
 class ZimuBianjiMianban(QtWidgets.QSplitter):
     """字幕编辑：上面字幕列表（一张 ASS 字段表），下面编辑区
 
@@ -6078,7 +6254,18 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
     LIE = ("#", "开始时间", "结束时间", "字/秒", "样式", "说话人", "文本")
     LIE_ZHEN = ("#", "开始帧", "结束帧", "字/秒", "样式", "说话人", "文本")
     LIE_KUAN = (40, 78, 78, 44, 68, 74)     # 前几列的宽度（文本列吃掉剩下的）
-    LIE_TOU_ZUO = (4, 5)                    # 表头左对齐的列：样式 / 说话人
+    # 表头左对齐的列：样式 / 说话人 / 文本。文本列宽是 5000，居中的话
+    # "文本"两个字会飘到列中间（视口外），表头就成了空白 —— 跟 AEG 一样左对齐
+    LIE_TOU_ZUO = (4, 5, 6)
+    # 「隐藏项目」能勾的列：(列号, 写给人看的名字)。#列不给隐藏
+    LIE_KE_YINCANG = (
+        (1, "开始时间"),
+        (2, "结束时间"),
+        (3, "字/秒"),
+        (4, "样式"),
+        (5, "说话人"),
+        (6, "文本"),
+    )
     LIE_WENBEN = 6                          # 文本列是第几列
     HANG_GAO = 24                           # 一行多高
 
@@ -6199,7 +6386,41 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         biao.xiayitiao.connect(self._xia_yi_tiao)   # 列表里按回车 = 换下一条
         # Alt+↑ / Alt+↓ = 整批挪行，具体怎么挪是外面的事（照 AEG 的 Move line up/down）
         biao.yao_yidong.connect(self.yao_yidong)
+        # 「隐藏项目」按上次记着的勾选把列藏起来（头一回 = 一列都不藏）
+        # 右键菜单不在这儿挂：统一由工作台那张菜单出（见 _tan_liebiao_caidan），
+        # 这儿再挂一份会把原有菜单顶掉
+        self._yincang = du_liebiao_yincang()
+        for lie, _ming in self.LIE_KE_YINCANG:
+            biao.setColumnHidden(int(lie), int(lie) in self._yincang)
         return biao
+
+    def _kai_yincang_kuang(self):
+        """开「隐藏项目」小窗：勾选框，非模态，开着照样能改字幕"""
+        kuang = getattr(self, "_yincang_kuang", None)
+        if kuang is None:
+            kuang = _YincangXuanxiangDialog(self)
+            kuang.hide_gai.connect(self._she_yincang)
+            self._yincang_kuang = kuang
+        kuang.shezhi_zhuangtai(self._yincang)
+        # 第一次开放在工作台窗口正中
+        if not kuang.isVisible() and kuang.pos().isNull():
+            ding = self.window()
+            if ding is not None:
+                kuang.adjustSize()
+                kuang.move(
+                    ding.x() + (ding.width() - kuang.width()) // 2,
+                    ding.y() + (ding.height() - kuang.height()) // 2,
+                )
+        kuang.show()
+        kuang.raise_()
+        kuang.activateWindow()
+
+    def _she_yincang(self, lie_set):
+        """勾选变了：哪几列藏起来，顺手记进 ini，下次打开照旧"""
+        self._yincang = set(int(x) for x in (lie_set or ()))
+        for lie, _ming in self.LIE_KE_YINCANG:
+            self.biao.setColumnHidden(int(lie), int(lie) in self._yincang)
+        xie_liebiao_yincang(self._yincang)
 
     def _tou_wenben(self):
         """表头文字：看帧的时候那两列写成「开始帧 / 结束帧」"""

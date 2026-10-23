@@ -13095,6 +13095,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
             else:
                 caidan.addAction(a)
         caidan.addSeparator()
+        # 列表显示哪几列（开始/结束时间、字秒、样式、说话人、文本 可勾掉）
+        caidan.addAction("隐藏项目", self.bianji_mianban._kai_yincang_kuang)
+        caidan.addSeparator()
         zhou, lie = self._tian_weizhi_caidan(caidan)
         dian = caidan.exec_(QtGui.QCursor.pos())
         self._youjian_mu = None          # 菜单关了，之后只认列表里选中的
