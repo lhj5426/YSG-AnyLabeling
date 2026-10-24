@@ -6941,10 +6941,12 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
                 x_dang * fangda, di * fangda
             )
             lu = QtGui.QTransform().scale(1.0 / fangda, 1.0 / fangda).map(lu_da)
-            # 只有字身全透明（\1a&HFF&，要镂空）的段才需要「只在外侧」那圈描边路径：
-            # 别的段直接描，字身会盖住内侧那半圈。路径按字缓存，不是每帧现算。
+            # 字身不是全不透明（\1a 拉到半透、或全透要镂空）的段，描边都只能画
+            # 在字形外面那圈 —— 不然内侧那半圈白边会垫在半透明的字身底下，越
+            # 拖越白，到底才突然变镂空，中间没有过渡。字身全不透明的段直接描，
+            # 那半圈会被字身盖住，快。路径按字缓存，不是每帧现算。
             bd = max(0.0, _ass_shuzi(gs_hua.get("bord"), 0.0))
-            if bd > 0.05 and int(_ass_shuzi(gs_hua.get("a1"), 255)) < 1:
+            if bd > 0.05 and int(_ass_shuzi(gs_hua.get("a1"), 255)) < 255:
                 wai = _wai_lu(ziti_d, wen_d, ming_d, fangda, bd).translated(
                     x_dang * fangda, di * fangda
                 )
@@ -16854,11 +16856,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
             wei, se = zhi[0], zhi[1]
             xuan = zhi[2] if len(zhi) > 2 else None
             a = zhi[3] if len(zhi) > 3 else 0
+            jiu_a = zhi[4] if len(zhi) > 4 else None
             # 主色写 \c（Aegisub 那四个色块就是这么写的），其它三个照 ASS 写
             bian = {"c1": "\\c", "c2": "\\2c", "c3": "\\3c", "c4": "\\4c"}
             tou = bian.get(wei) or bian["c1"]
-            # 调色板里「透明」是多少就写多少，0 也照写（跟 AEG 一样，始终保持一对
-            biao = tou + str(se) + _touming_biaoqian(wei, a)
+            # 透明度跟调之前一样就只写颜色（AEG 不动透明度时只出 \c&H..&，
+            # 不会顺带甩一个 \1a&H00& 出来）
+            biao = tou + str(se)
+            if jiu_a is None or int(a) != int(jiu_a):
+                biao += _touming_biaoqian(wei, a)
             wen = str(zimu[xu][2] or "")
             if xuan:
                 # 选中的那一段上色，尾巴 {\r} 截断 —— 后面的字还是原来的颜色
@@ -17424,6 +17430,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
             return
         wei, se, xuan = dong[0], dong[1], dong[2]
         a = dong[3] if len(dong) > 3 else 0
+        jiu_a = dong[4] if len(dong) > 4 else None
         xu = self.bianji_mianban.dangqian_xu()
         zimu = self.zimu_mianban.zimu_liebiao()
         if not (0 <= xu < len(zimu)):
@@ -17436,7 +17443,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 主色写 \c（Aegisub 那四个色块就是这么写的），其它三个照 ASS 写
         bian = {"c1": "\\c", "c2": "\\2c", "c3": "\\3c", "c4": "\\4c"}
         tou = bian.get(wei) or bian["c1"]
-        biao = tou + str(se) + _touming_biaoqian(wei, a)
+        biao = tou + str(se)
+        if jiu_a is None or int(a) != int(jiu_a):
+            biao += _touming_biaoqian(wei, a)
         if xuan:
             kuai = _suo_zai_kuai(wen, xuan)
             if kuai:
@@ -17449,9 +17458,18 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._hua_yulan(xu, xin)
 
     def _hua_yulan(self, xu, wen):
-        """预览：只换内存里的文字 + 重画画面上的字幕（不写文件、不刷列表）"""
+        """预览：只换内存里的文字 + 重画画面上的字幕（不写文件、不刷列表）
+
+        编辑区也当场换成这份 —— AEG 调颜色时那串 {\\c…\\1a…} 是边调边在编辑区
+        里长出来的，不是等点了确定才冒出来。
+        """
         self.zimu_mianban.gai_zimu_wenben(xu, wen)
         self.shijianzhou.gai_zimu_wenben(xu, wen)
+        if xu == self.bianji_mianban.dangqian_xu():
+            kuang = getattr(self.bianji_mianban, "kuang", None)
+            huan = getattr(kuang, "gengxin_wenben", None)
+            if huan is not None:
+                huan(wen)
         self._zimu_hang_ji = None          # 折行缓存作废，按新标签重算
         self._shuaxin_huamian_zimu()
 

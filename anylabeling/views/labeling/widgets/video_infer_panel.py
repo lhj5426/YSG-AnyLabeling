@@ -3213,6 +3213,44 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
             return self._suoding_yuan
         return self._suoding_qian + self._suoding_hide + xian
 
+    def gengxin_wenben(self, wen):
+        """边调边看用：换掉框里的文字，但不往外发 textChanged（这不算用户改字）
+
+        调色板里拖颜色的时候，框里那串 {\\c…\\1a…} 要跟着一段段变出来（AEG
+        就是这样），所以每调一下都得重填一次。重填会把选中冲掉，填完按原来
+        圈住的那几个字再圈回去 —— 那几个字本身没变，只是前后多了标签。
+        """
+        wen = str(wen or "")
+        if not self._suoding and self.wenben() == wen:
+            return
+        jiu = self.textCursor()
+        xuan_zi = ""
+        wei = int(jiu.position())
+        if jiu.hasSelection():
+            xuan_zi = self.toPlainText()[jiu.selectionStart():jiu.selectionEnd()]
+            wei = int(jiu.selectionStart())
+        self.blockSignals(True)
+        self.shezhi_wenben(wen)
+        self.blockSignals(False)
+        if not xuan_zi:
+            return
+        # 圈住的那段字在新文本里还在（前后多了标签而已）：找离原位置最近的那一处
+        quan = self.toPlainText()
+        qi, zhi = -1, -1
+        kai = 0
+        while True:
+            zhao = quan.find(xuan_zi, kai)
+            if zhao < 0:
+                break
+            if qi < 0 or abs(zhao - wei) < abs(qi - wei):
+                qi, zhi = zhao, zhao + len(xuan_zi)
+            kai = zhao + 1
+        if qi >= 0 and zhi > qi:
+            ze = self.textCursor()
+            ze.setPosition(qi)
+            ze.setPosition(zhi, QtGui.QTextCursor.KeepAnchor)
+            self.setTextCursor(ze)
+
     def _kuang_wei(self, wei):
         """字幕文本里的位置 -> 框里的位置
 
@@ -3311,6 +3349,9 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         self._ziti_se = "#FFFFFF"   # 现在的主色（字体框「颜色」）
         self._yanse = {"c1": "#FFFFFF", "c2": "#FF0000",
                        "c3": "#000000", "c4": "#000000"}
+        # 四个色现在的透明度（ASS 口径 0 = 不透明）：调色板打开时摆上它，
+        # 调完跟它一样就不写 \1a（AEG 不动透明度只写 \c）
+        self._yanse_tou = {"c1": 0, "c2": 0, "c3": 0, "c4": 0}
         self._wenben_kuang = None   # 编辑框（外面给）：有选中的字就只对那段动手
 
         wai = QtWidgets.QVBoxLayout(self)
@@ -3850,11 +3891,12 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         if self._tian:
             return
         xuan = self._xuan_qu()
-        qi = QtGui.QColor(str(self._yanse.get(wei) or "#FFFFFF"))
+        jiu_a = int(self._yanse_tou.get(wei, 0) or 0)
+        qi = _yanse_qt(self._yanse.get(wei) or "#FFFFFF", 255 - jiu_a)
 
         def kan(se):
             self.shishi_yanse.emit(
-                (wei, _yanse_to_ass(se), xuan, 255 - int(se.alpha()))
+                (wei, _yanse_to_ass(se), xuan, 255 - int(se.alpha()), jiu_a)
             )
 
         yan, hao = YsgColorDialog.tiao(
@@ -3865,7 +3907,7 @@ class _ZimuGongjulan(QtWidgets.QWidget):
             return
         self._fa(
             "yanse",
-            (wei, _yanse_to_ass(yan), xuan, 255 - int(yan.alpha())),
+            (wei, _yanse_to_ass(yan), xuan, 255 - int(yan.alpha()), jiu_a),
         )
 
     # ---- 往控件里填值 / 换候选 ----
@@ -3968,6 +4010,14 @@ class _ZimuGongjulan(QtWidgets.QWidget):
             if not re.match(r"^#[0-9A-Fa-f]{6}$", ming):
                 ming = self._yanse.get(wei) or "#FFFFFF"
             self._yanse[wei] = ming
+            # 这一色现在的透明度（ASS 口径：0 = 不透明）。调色板打开时先摆上它，
+            # 调完跟它一样就不写 \1a —— AEG 也是不动透明度就只写 \c
+            you = gs.get("a" + wei[1])
+            try:
+                you = int(round(float(255 if you is None else you)))
+            except (TypeError, ValueError):
+                you = 255
+            self._yanse_tou[wei] = max(0, min(255, 255 - you))
             an.setStyleSheet(
                 _ys_ci_anniu()
                 + f"\nQPushButton {{ background-color: {ming}; }}"

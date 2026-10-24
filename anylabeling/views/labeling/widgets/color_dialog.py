@@ -346,7 +346,9 @@ class _YulanSe(QtWidgets.QFrame):
         super().__init__(parent)
         self._se = [255, 255, 255, 0]
         self.setFixedSize(40, 40)
-        self.setFrameStyle(QtWidgets.QFrame.StyledPanel)
+        # AEG 那个预览块是整块 40×40 都填色，外面没有边框。以前留了 1 像素
+        # 的内缩再加一圈边框，右边和下边就露出一条背景缝
+        self.setFrameStyle(QtWidgets.QFrame.NoFrame)
 
     def shezhi_se(self, se):
         self._se = list(se) + [0] * 4
@@ -354,7 +356,7 @@ class _YulanSe(QtWidgets.QFrame):
 
     def paintEvent(self, _shi):
         huabi = QtGui.QPainter(self)
-        kuang = self.rect().adjusted(1, 1, -1, -1)
+        kuang = self.rect()
         ge = 5
         for y in range(kuang.top(), kuang.bottom() + 1, ge):
             for x in range(kuang.left(), kuang.right() + 1, ge):
@@ -431,7 +433,10 @@ class _SePu(QtWidgets.QWidget):
         huabi.end()
 
     def _an(self, dian):
-        x = max(0, min(int(dian.x()) - 1, self.width() - 3 - self._jian))
+        # 色板图贴在 (1, 1)，宽高各 256；索引 0..255 对应图上第 1..256 个像素。
+        # 只减边距那 1 像素 —— 以前多减了色条三角的 4 像素，右下角够不着，
+        # 饱和度最多只能到 251，拖到底也不是纯色（会带一点绿蓝）
+        x = max(0, min(int(dian.x()) - 1, self.width() - 3))
         y = max(0, min(int(dian.y()) - 1, self.height() - 3))
         if self._fangxiang == "tiao":
             x = 0
