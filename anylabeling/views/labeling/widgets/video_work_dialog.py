@@ -3609,6 +3609,22 @@ _BIAOQIAN_ZHENG = {
 }
 
 
+# 四个颜色对应的透明度标签（ASS 里 0 = 不透明，255 = 全透明）
+_YANSE_TOUMING = {"c1": "1a", "c2": "2a", "c3": "3a", "c4": "4a"}
+
+
+def _touming_biaoqian(wei, a):
+    """颜色按钮挑完，无条件补一个 \\1a&HAA& 这种（照 AEG，拉到 0 也写）
+
+    调色板里「透明」那栏跟 ASS 一个口径（0 = 不透明），所以直接写进去。
+    """
+    try:
+        a = int(a or 0) & 255
+    except (TypeError, ValueError):
+        a = 0
+    return "\\%s&H%02X&" % (_YANSE_TOUMING.get(str(wei), "1a"), a)
+
+
 def _jia_biaoqian(wen, biao):
     """往开头那对花括号里加一个行内标签（没有就新建一对）"""
     wen = str(wen or "")
@@ -3630,7 +3646,59 @@ def _wei_yiduan(wen, xuan, qian, hou):
     zhi = max(0, min(n, int(xuan[1])))
     if zhi < qi:
         qi, zhi = zhi, qi
-    return wen[:qi] + str(qian) + wen[qi:zhi] + str(hou) + wen[zhi:]
+    # 选区的口子正好落在 {…} 里面（{\u1} 中间那种）：把口子挪到块外面。
+    # 直接在块中间插标签会把块劈成两半，标签当场作废。
+    # 起点正好压在块的 } 上，说明这段文字是从块后面开始的 —— 挪到 } 后面，
+    # 别插进块里把 {\r} 变成 {\r\c…}。
+    kai = wen.rfind("{", 0, qi)
+    if kai > wen.rfind("}", 0, qi):
+        if wen[qi:qi + 1] == "}":
+            qi = qi + 1
+        else:
+            qi = kai
+    kai = wen.rfind("{", 0, zhi)
+    if kai > wen.rfind("}", 0, zhi) and wen[zhi:zhi + 1] != "}":
+        he = wen.find("}", kai + 1)
+        if he >= 0:
+            zhi = he + 1
+    if zhi < qi:
+        zhi = qi
+    hou = str(hou or "")
+    # 尾巴后面本来就接着 {\r}：这一处已经有截断了，别再叠一个（同一段连着
+    # 换字体 / 换颜色，末尾会越攒越多的 {\r}{\r}{\r}）
+    if hou == "{\\r}" and wen[zhi:].startswith("{\\r}"):
+        hou = ""
+    return wen[:qi] + str(qian) + wen[qi:zhi] + hou + wen[zhi:]
+
+
+def _suo_zai_kuai(wen, xuan):
+    """选区整段落在同一个 {…} 块里 -> (块的 { 下标, 块的 } 下标)；不在给 None
+
+    这种时候往里插「{\\c…} + {\\r}」会把原来那个块劈成两半：
+    {\\u1} 变成 {\\{\\c…}u1{\\r}}，标签就废了（编辑框里那个 u1 会被撕出来）。
+    碰到这种情况调用方改成把标签并进块里（见 _jia_jin_kuai）。
+    """
+    wen = str(wen or "")
+    n = len(wen)
+    qi = max(0, min(n, int(xuan[0])))
+    zhi = max(0, min(n, int(xuan[1])))
+    if zhi < qi:
+        qi, zhi = zhi, qi
+    kai = wen.rfind("{", 0, qi + 1)
+    if kai < 0:
+        return None
+    he = wen.find("}", kai + 1)
+    if he < 0 or he < zhi - 1:
+        return None
+    if "{" in wen[kai + 1:he]:
+        return None
+    return (kai, he)
+
+
+def _jia_jin_kuai(wen, kuai, biao):
+    """把标签并进那个块里：{\\u1} + \\c&H…& -> {\\u1\\c&H…&}"""
+    kai, he = kuai
+    return wen[:he] + str(biao) + wen[he:]
 
 
 def _qu_biaoqian(wen, jian):
@@ -3643,6 +3711,13 @@ def _qu_biaoqian(wen, jian):
     if not zheng:
         return wen
     nei = re.sub(zheng, "", pi.group(1))
+    # 颜色连它那份透明度一起抠（\c&H..& 旁边常跟着 \1a&H..&）
+    for cai in ("c1", "c2", "c3", "c4"):
+        if str(jian or "").lower() == cai:
+            nei = re.sub(
+                r"\\%s(?![a-zA-Z0-9])[^\\]*" % _YANSE_TOUMING[cai], "", nei
+            )
+            break
     hou = wen[pi.end():]
     if not nei.strip():
         return hou
@@ -5068,7 +5143,7 @@ def _chai_biaoqian_ming(m, zhi):
     拆回来才认得出来。打字机脚本生成的就是这个写法（没有 & 也没括号），不拆
     的话整条动画都不生效。
     """
-    for qian in ("alpha", "1a", "3a", "4a"):
+    for qian in ("alpha", "1a", "2a", "3a", "4a"):
         if m.startswith(qian) and len(m) > len(qian):
             return qian, m[len(qian):] + zhi
     return m, zhi
@@ -5119,7 +5194,7 @@ def _jia_t_dong(g, zhi):
             # \alpha 一次管主色 / 描边 / 阴影三样（跟上面 \alpha 那个分支一致）
             for jian in ("a1", "a3", "a4"):
                 dong.append((t1, t2, jia, jian, int(g.get(jian, 255)), dao))
-        elif m in ("1a", "3a", "4a"):
+        elif m in ("1a", "2a", "3a", "4a"):
             jian = "a" + m[0]
             dong.append((t1, t2, jia, jian, int(g.get(jian, 255)), dao))
     if dong:
@@ -5170,12 +5245,26 @@ def _yi_ge_biaoqian(pian, g, jichu, yangshi_biao):
         g.clear()
         g.update(jiu)
         return
-    pi = re.match(r"^\s*(\d?[a-zA-Z]+)\s*(.*)$", pian)
+    s = str(pian or "").strip()
+    pi = re.match(r"^(\d?[a-zA-Z]+)(.*)$", s)
     if not pi:
         return
-    m = pi.group(1).lower()
-    zhi = pi.group(2).strip()
-    m, zhi = _chai_biaoqian_ming(m, zhi)
+    ming_yuan = pi.group(1)         # 原始写法：字体名大小写敏感，得留原样
+    sheng = pi.group(2)             # 后面的原文（空格、连字符都还在）
+    m = ming_yuan.lower()
+    zhi = sheng.strip()
+    # \fn 后面既没括号也没空格，字体名直接黏在标签名上（\fnGen Jyuu Gothic Bold）。
+    # 正则会把名字开头那串字母一起吞进标签名（fnGen -> fngen），于是整条被当
+    # 成不认识的标签丢掉 —— 画面就永远只有样式字体。这儿按原始大小写拆回来。
+    # 拼回去用没 strip 的 sheng，字体名里带 - 的（DFHSMincho-W9）才不会被塞空格。
+    if m.startswith("fontname") and len(ming_yuan) > 8:
+        m = "fontname"
+        zhi = (ming_yuan[8:] + sheng).strip()
+    elif m.startswith("fn") and len(ming_yuan) > 2:
+        m = "fn"
+        zhi = (ming_yuan[2:] + sheng).strip()
+    else:
+        m, zhi = _chai_biaoqian_ming(m, zhi)
     if m == "pos" or m == "move":
         # 一行里只认**第一个** \pos / \move，后面的全当没写 —— Aegisub 实装的
         # xy-vsfilter 就是这样：\pos 和 \move 共用同一个槽位 m_effects[EF_MOVE]，
@@ -5229,6 +5318,9 @@ def _yi_ge_biaoqian(pian, g, jichu, yangshi_biao):
     elif m in ("fn", "fontname"):
         if zhi:
             g["font"] = zhi
+        else:
+            # \fn 不带名字 = 回到样式里定的那个字体（照 libass）
+            g["font"] = (jichu or {}).get("font")
     elif m in ("c", "1c"):
         y = _ass_yanse(zhi)
         if y:
@@ -5268,7 +5360,7 @@ def _yi_ge_biaoqian(pian, g, jichu, yangshi_biao):
         if t is not None:
             for jian in ("a1", "a3", "a4"):
                 g[jian] = t
-    elif m in ("1a", "3a", "4a"):
+    elif m in ("1a", "2a", "3a", "4a"):
         t = _ass_touming(zhi)
         if t is not None:
             g["a" + m[0]] = t
@@ -5337,7 +5429,9 @@ def _jie_ass_tiao(yuan_wen, yangshi, yangshi_biao=None):
             _yi_ge_biaoqian(pian, g, jichu, yangshi_biao)
         wei = pi.end()
     _jia_wenben(hang, wen[wei:], g)
-    return [x for x in hang if x], g
+    # 空行（连着好几个 \N 中间那些）必须留着：libass 里一个 \N 就占一行高，
+    # 丢了空行就变成"打一堆 \N 只换一次行"。
+    return hang, g
 
 
 _ZITI_CHIDU = {}        # (字体名, 走不走粗档) -> 字身倍率（算一次存着，见 _ziti_chidu）
@@ -6146,26 +6240,54 @@ def _bai_dao_maodian(lu, ax, ay, an):
     return lu
 
 
+_KUAN_JI = {}       # 同一段文字 + 同一份格式 -> 每个字的宽度（逐字量很贵，量一次存着）
+
+
 def _ziti_kuan_biao(fangda, yi_hang):
     """一段文字 -> [(字, 格式, 宽度), ...]（宽度是当前坐标的像素，竖排按竖排算）"""
+    jian = tuple(
+        (
+            str(wen), str(gs.get("font") or ""), str(gs.get("fs")),
+            bool(gs.get("b")), bool(gs.get("i")), bool(gs.get("u")),
+            bool(gs.get("s")), str(gs.get("fscx")), str(gs.get("fsp")),
+            str(gs.get("fscy")), str(gs.get("p")), round(float(fangda), 4),
+        )
+        for wen, gs in yi_hang
+    )
+    piao = _KUAN_JI.get(jian)
+    if piao is None:
+        piao = []
+        for wen, gs in yi_hang:
+            if int(_ass_shuzi(gs.get("p"), 0) or 0) > 0:
+                # 矢量绘图：整段当一个物件，宽度按画出来的框算（同行文字要靠它排）
+                p = max(1, min(20, int(_ass_shuzi(gs.get("p"), 1) or 1)))
+                kuang = _huitu_lu(wen, float(1 << (p - 1))).boundingRect()
+                piao.append(max(0.0, kuang.width()))
+                continue
+            ziti = _hua_ziti(gs, fangda)
+            fm = QtGui.QFontMetricsF(ziti)
+            ming = str(gs.get("font") or "").strip()
+            shu = _shi_shu(ming)
+            bi = (_ziti_xiangsu(ziti) / float(_shu_duliang(ming)[0])) if shu else 1.0
+            for ch in str(wen):
+                if shu and ord(ch) >= _SHENG_SHU:
+                    piao.append(float(_shu_adv(ming, ch)) * bi)
+                else:
+                    piao.append(float(fm.width(ch)))
+        if len(_KUAN_JI) > 400:
+            _KUAN_JI.clear()
+        _KUAN_JI[jian] = piao
     jieguo = []
+    k = 0
     for wen, gs in yi_hang:
         if int(_ass_shuzi(gs.get("p"), 0) or 0) > 0:
-            # 矢量绘图：整段当一个物件，宽度按画出来的框算（同行文字要靠它排）
-            p = max(1, min(20, int(_ass_shuzi(gs.get("p"), 1) or 1)))
-            kuang = _huitu_lu(wen, float(1 << (p - 1))).boundingRect()
-            jieguo.append((str(wen), gs, max(0.0, kuang.width())))
+            jieguo.append((str(wen), gs, piao[k]))
+            k += 1
             continue
-        ziti = _hua_ziti(gs, fangda)
-        fm = QtGui.QFontMetricsF(ziti)
-        ming = str(gs.get("font") or "").strip()
-        shu = _shi_shu(ming)
-        bi = (_ziti_xiangsu(ziti) / float(_shu_duliang(ming)[0])) if shu else 1.0
         for ch in str(wen):
-            if shu and ord(ch) >= _SHENG_SHU:
-                jieguo.append((ch, gs, float(_shu_adv(ming, ch)) * bi))
-            else:
-                jieguo.append((ch, gs, float(fm.width(ch))))
+            w = piao[k] if k < len(piao) else 0.0
+            jieguo.append((ch, gs, w))
+            k += 1
     return jieguo
 
 
@@ -6197,8 +6319,19 @@ def _ziti_chidu(ming, cu=False):
     return bili
 
 
+_ZITI_JI = {}       # 同一份格式 -> 建好的 QFont（播一帧要建几十个，建一次就够了）
+
+
 def _hua_ziti(gs, bi):
     """格式字典 + 画面缩放比 -> 字体（字号 / 粗斜体 / 字距都按比例算好）"""
+    jian = (
+        str(gs.get("font") or ""), str(gs.get("fs")), str(gs.get("fscy")),
+        str(gs.get("fsp")), bool(gs.get("b")), bool(gs.get("i")),
+        bool(gs.get("u")), bool(gs.get("s")), round(float(bi), 4),
+    )
+    jiu = _ZITI_JI.get(jian)
+    if jiu is not None:
+        return jiu
     ziti = QtGui.QFont()
     ming = str(gs.get("font") or "").strip()
     if ming:
@@ -6219,7 +6352,70 @@ def _hua_ziti(gs, bi):
         ziti.setLetterSpacing(
             QtGui.QFont.AbsoluteSpacing, _ass_shuzi(gs["fsp"], 0.0) * bi
         )
+    if len(_ZITI_JI) > 256:
+        _ZITI_JI.clear()        # 攒太多就清空重来（样式改来改去会攒）
+    _ZITI_JI[jian] = ziti
     return ziti
+
+
+_ZI_LU_JI = {}      # 一段字在原点画出来的路径（同样的字 / 字体 / 倍数只建一次）
+
+
+def _ziyuan_lu(ziti, wen, ming, fangda):
+    """一段字在原点画出来的路径
+
+    画面上每帧都要把每段字重新 addText 一遍（一拍三十次），字没变就是白算。
+    这儿按「字 + 字体 + 放大倍数」缓存路径，用的时候再 translate 到位置上。
+    竖排（@字体那种）也走同一条路，只是 0,0 起排。
+    """
+    jian = (
+        str(wen), ziti.family(), ziti.pixelSize(), ziti.bold(), ziti.italic(),
+        ziti.underline(), ziti.strikeOut(), round(ziti.letterSpacing(), 3),
+        _shi_shu(str(ming or "").strip()), round(float(fangda), 4),
+    )
+    jiu = _ZI_LU_JI.get(jian)
+    if jiu is not None:
+        return jiu
+    if jian[8]:
+        # 竖排那一支：字一个躺倒横着排（照 libass 的算法）
+        lu = _shu_lu(ziti, str(ming or "").strip(), str(wen), 0.0, 0.0)
+    else:
+        lu = QtGui.QPainterPath()
+        lu.addText(0.0, 0.0, ziti, str(wen))
+    if len(_ZI_LU_JI) > 600:
+        _ZI_LU_JI.clear()
+    _ZI_LU_JI[jian] = lu
+    return lu
+
+
+_WAI_LU_JI = {}     # 一段字的「只在外侧」描边路径（键同字形路径 + 描边宽度）
+
+
+def _wai_lu(ziti, wen, ming, fangda, bord):
+    """一段字在原点画的「外圈」描边路径（缓存）
+
+    fill 的这块就是 libass 的 \\bord 该有的样子：字形往外扩 bord 像素，字肚子里
+    一点都不占。路径布尔运算很贵，所以按「字 + 字体 + 放大倍数 + 描边宽度」存一份。
+    """
+    jian = (
+        str(wen), ziti.family(), ziti.pixelSize(), ziti.bold(), ziti.italic(),
+        ziti.underline(), ziti.strikeOut(), round(ziti.letterSpacing(), 3),
+        _shi_shu(str(ming or "").strip()), round(float(fangda), 4),
+        round(float(bord), 2),
+    )
+    jiu = _WAI_LU_JI.get(jian)
+    if jiu is not None:
+        return jiu
+    cuo = QtGui.QPainterPathStroker()
+    cuo.setWidth(float(bord) * 2.0 * float(fangda))
+    cuo.setJoinStyle(Qt.RoundJoin)
+    cuo.setCapStyle(Qt.RoundCap)
+    lu = _ziyuan_lu(ziti, wen, ming, fangda)
+    wai = cuo.createStroke(lu).subtracted(lu)
+    if len(_WAI_LU_JI) > 600:
+        _WAI_LU_JI.clear()
+    _WAI_LU_JI[jian] = wai
+    return wai
 
 
 def _zhe_hang(fm, wen, kuan):
@@ -6359,11 +6555,20 @@ def _hua_yi_hang_nei(huabi, lu, gs, bi, fscx, zhong_x, bei=1.0, ceng="quan",
             huabi.fillPath(yin, _gs_yanse(gs, "c4", "a4", bei))
         bord = max(0.0, _ass_shuzi(gs.get("bord"), 0.0)) * bi
         if bord > 0.05:
-            bi_bi = QtGui.QPen(_gs_yanse(gs, "c3", "a3", bei))
-            bi_bi.setWidthF(bord * 2.0)
-            bi_bi.setJoinStyle(Qt.RoundJoin)
-            bi_bi.setCapStyle(Qt.RoundCap)
-            huabi.strokePath(lu, bi_bi)
+            se_bian = _gs_yanse(gs, "c3", "a3", bei)
+            if se_bian.alpha() > 0:
+                jie = gs.get("_lu_bian")
+                if jie is not None and abs(float(jie[0]) - bord) < 0.01:
+                    # 字身是透明的（要镂空）：描边只画字形外面那一圈，一点不进
+                    # 字肚子里。路径在 _hua_ass_tiao 那边按字缓存好了。
+                    huabi.fillPath(jie[1], se_bian)
+                else:
+                    # 字身不透明：描边那半圈压在字里会被字身盖住，直接描最快
+                    bi_bi = QtGui.QPen(se_bian)
+                    bi_bi.setWidthF(bord * 2.0)
+                    bi_bi.setJoinStyle(Qt.RoundJoin)
+                    bi_bi.setCapStyle(Qt.RoundCap)
+                    huabi.strokePath(lu, bi_bi)
     if ceng in ("quan", "zi"):
         bian = _vc_bijiao(gs, vc_kuang, bei) if vc_kuang is not None else None
         if bian is not None:
@@ -6522,8 +6727,9 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
     if qu.width() <= 8 or qu.height() <= 8:
         return
     gs = tiao.get("gs") or dict(_ASS_MOREN_YANGSHI)
-    hang = [x for x in (tiao.get("hang") or []) if x]
-    if not hang:
+    # 空行（[]）也要留着：它占一行高，连着几个 \N 才是连着几行空
+    hang = list(tiao.get("hang") or [])
+    if not any(hang):
         return
     bei = _fad_bei(tiao)
     if bei <= 0.004:
@@ -6730,15 +6936,25 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
                 continue
             ziti_d = _hua_ziti(gs_d, fangda)
             ming_d = str(gs_d.get("font") or "").strip()
-            if _shi_shu(ming_d):
-                # 竖排那一支：字一个躺倒横着排（照 libass 的算法）
-                lu_da = _shu_lu(
-                    ziti_d, ming_d, wen_d, x_dang * fangda, di * fangda
-                )
-            else:
-                lu_da = QtGui.QPainterPath()
-                lu_da.addText(x_dang * fangda, di * fangda, ziti_d, wen_d)
+            # 字在原点画好一份路径存着，用的时候平移过去（每帧重新 addText 太贵）
+            lu_da = _ziyuan_lu(ziti_d, wen_d, ming_d, fangda).translated(
+                x_dang * fangda, di * fangda
+            )
             lu = QtGui.QTransform().scale(1.0 / fangda, 1.0 / fangda).map(lu_da)
+            # 只有字身全透明（\1a&HFF&，要镂空）的段才需要「只在外侧」那圈描边路径：
+            # 别的段直接描，字身会盖住内侧那半圈。路径按字缓存，不是每帧现算。
+            bd = max(0.0, _ass_shuzi(gs_hua.get("bord"), 0.0))
+            if bd > 0.05 and int(_ass_shuzi(gs_hua.get("a1"), 255)) < 1:
+                wai = _wai_lu(ziti_d, wen_d, ming_d, fangda, bd).translated(
+                    x_dang * fangda, di * fangda
+                )
+                gs_hua = dict(gs_hua)
+                gs_hua["_lu_bian"] = (
+                    bd,
+                    QtGui.QTransform().scale(
+                        1.0 / fangda, 1.0 / fangda
+                    ).map(wai),
+                )
             fg = gs_hua.get("fg")
             if fg:
                 # 外发光：同一条字先垫一层"粗白边 + 模糊 + 填充全透明"。排在本体
@@ -14452,6 +14668,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self._shoudao_zimu_bianji_wancheng
         )
         self.bianji_mianban.gongju_gaile.connect(self._shoudao_gongju)
+        # 调色板里边拖边看：画面上当场换颜色（不写文件）
+        self.bianji_mianban.shishi_yanse.connect(self._shoudao_shishi_yanse)
         # 列表里 Alt+↑ / Alt+↓ = 整批挪字幕行（照 AEG 的 Move line up / down）
         self.bianji_mianban.yao_yidong.connect(self._yidong_zimu_hang)
         return self.bianji_mianban
@@ -16120,14 +16338,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 zhi_shu = int(fu.get(wei) or 0)
                 if zhi_shu > 0:
                     ge[jian] = zhi_shu
-            # 整条（文字 + 行内标签）跟原文一模一样才照原文来；只要动过 ——
-            # 改了字，或者上面那排加了 \1c \b \fn 这些标签 —— 就按列表里这份画。
-            # （只比"纯文字"会把只加标签的改动当成没改，改完颜色画面不动）
-            wen = (
-                str(yuan or "")
-                if yuan and _ass_yuan_wen(yuan) == _ass_yuan_wen(wenben)
-                else str(wenben or "")
-            )
+            # 列表里这份是空的（编辑框被清空）就画空的，不能拿原文顶上 ——
+            # 不然清空文字以后画面上还挂着原来的台词，怎么删都删不掉
+            wen = str(wenben or "")
             hang, gs = _jie_ass_tiao(wen, ge, biao)
             # qi / zhi / ms 是给 \fad 渐入渐出算这一刻透明度用的
             xuan.append(
@@ -16611,7 +16824,16 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 # 编辑框里选中了一段：只给这一段插标签（照 AEG）
                 # B/I/U/S 尾巴上用反向标签（{\b1}…{\b0}），这样就掀不掉前面
                 # 已经打好的颜色；字体用 {\r} 截断。
-                if ming == "fn":
+                kuai = _suo_zai_kuai(wen, xuan)
+                if kuai:
+                    # 选区落在一个已经存在的标签块里（{\u1} 这种）：并进去，
+                    # 别在块中间插一段又补 {\r}，那会把块劈成两半
+                    if ming == "fn":
+                        biao = "\\fn" + str(can)
+                    else:
+                        biao = "\\%s%s" % (ming, "1" if can else "0")
+                    xin = _jia_jin_kuai(wen, kuai, biao)
+                elif ming == "fn":
                     xin = _wei_yiduan(wen, xuan, "{\\fn" + str(can) + "}", "{\\r}")
                 else:
                     kai, fan = ("1", "0") if can else ("0", "1")
@@ -16631,16 +16853,24 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if jian == "yanse":
             wei, se = zhi[0], zhi[1]
             xuan = zhi[2] if len(zhi) > 2 else None
+            a = zhi[3] if len(zhi) > 3 else 0
             # 主色写 \c（Aegisub 那四个色块就是这么写的），其它三个照 ASS 写
             bian = {"c1": "\\c", "c2": "\\2c", "c3": "\\3c", "c4": "\\4c"}
             tou = bian.get(wei) or bian["c1"]
+            # 调色板里「透明」是多少就写多少，0 也照写（跟 AEG 一样，始终保持一对
+            biao = tou + str(se) + _touming_biaoqian(wei, a)
             wen = str(zimu[xu][2] or "")
             if xuan:
                 # 选中的那一段上色，尾巴 {\r} 截断 —— 后面的字还是原来的颜色
-                xin = _wei_yiduan(wen, xuan, "{" + tou + str(se) + "}", "{\\r}")
+                kuai = _suo_zai_kuai(wen, xuan)
+                if kuai:
+                    # 选区落在已有的标签块里（{\u1}）：并进去，别把块劈开
+                    xin = _jia_jin_kuai(wen, kuai, biao)
+                else:
+                    xin = _wei_yiduan(wen, xuan, "{" + biao + "}", "{\\r}")
             else:
                 xin = _qu_biaoqian(wen, wei)
-                xin = _jia_biaoqian(xin, tou + str(se))
+                xin = _jia_biaoqian(xin, biao)
             self._huan_zimu_wenben(xu, xin)
             return
         if jian in ("qi", "zhi"):
@@ -17013,11 +17243,14 @@ class VideoWorkDialog(QtWidgets.QDialog):
         zimu = self.zimu_mianban.zimu_liebiao()
         hang = [int(x) for x in (hang or []) if 0 <= int(x) < len(zimu)]
         if not hang:
-            self.shezhi_mianban.zhuangtai_shezhi("先选中要加「」的字幕")
+            self.shezhi_mianban.zhuangtai_shezhi("先选中要套括号的字幕")
             return
         pei = du_zidonghua_peizhi()
         guan = [str(x) for x in (pei.get("paichu_ci") or []) if str(x)]
         fuhao = [str(x) for x in (pei.get("paichu_fuhao") or []) if str(x)]
+        # 外面套什么：配置里那两栏（默认就是「 和 」），可以写代码
+        zuo = str(pei.get("kuohao_zuo") or "「")
+        you = str(pei.get("kuohao_you") or "」")
         fu_men = self._zimu_fu_ji
         if len(fu_men) != len(zimu):
             fu_men = self._zimu_fujia(zimu)
@@ -17030,7 +17263,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
             if any(k in shuo or k in yang for k in guan):
                 continue        # 旁白之类的：不套
             jiu = str(zimu[i][2] or "")
-            tou = re.match(r"^(\{[^}]*\})", jiu)
+            # 开头连着好几个标签块（{\fad(..)}{\pos(..)} 这种）都算标签，
+            # 括号只套在正文外面，标签原样留在前头
+            tou = re.match(r"^((?:\{[^}]*\})+)", jiu)
             biaoqian = tou.group(1) if tou else ""
             zhengwen = jiu[len(biaoqian):]
             chun = re.sub(r"\{[^}]*\}", "", zhengwen)
@@ -17038,9 +17273,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 continue        # 只有标签 / 空行
             if re.match(r"^（.+）$", chun) or re.match(r"^\(.+\)$", chun):
                 continue        # 已经是括号了
-            if any(h in chun for h in fuhao):
-                continue        # 已经有那些符号了
-            xin = biaoqian + "「" + zhengwen + "」"
+            # 排除分两类：带 \ 或以 { 开头的是「代码」，只在整条原文里找；
+            # 其它是「符号」，只看剥掉标签的正文 —— 不然 {\pos(75,705)} 里的
+            # 括号会被当成"正文里已经有括号了"，一条都加不上
+            if any(
+                (h in jiu) if ("\\" in h or h.startswith("{")) else (h in chun)
+                for h in fuhao
+            ):
+                continue
+            xin = biaoqian + zuo + zhengwen + you
             self.zimu_mianban.gai_zimu_wenben(i, xin)
             self.shijianzhou.gai_zimu_wenben(i, xin)
             gai += 1
@@ -17146,6 +17387,51 @@ class VideoWorkDialog(QtWidgets.QDialog):
             "字幕已改" + ("，SRT / ASS 已重写" if xie else "")
             + "（Ctrl+S 保存字幕）"
         )
+
+    def _shoudao_shishi_yanse(self, dong):
+        """调色板里拖动：画面上当场换颜色，一个字都不写进文件
+
+        dong = (哪个色, ASS 色值, 选区)；None = 这一轮调完了，预览撤掉。
+        预览永远拿「调色前那份原文」算，所以拖来拖去不会一层层叠标签。
+        """
+        if dong is None:
+            yuan = getattr(self, "_yulan_yuan", None)
+            self._yulan_yuan = None
+            if yuan is not None:
+                self._hua_yulan(yuan[0], yuan[1])
+            return
+        wei, se, xuan = dong[0], dong[1], dong[2]
+        a = dong[3] if len(dong) > 3 else 0
+        xu = self.bianji_mianban.dangqian_xu()
+        zimu = self.zimu_mianban.zimu_liebiao()
+        if not (0 <= xu < len(zimu)):
+            return
+        yuan = getattr(self, "_yulan_yuan", None)
+        if yuan is None or yuan[0] != xu:
+            yuan = (xu, str(zimu[xu][2] or ""))
+            self._yulan_yuan = yuan
+        wen = yuan[1]
+        # 主色写 \c（Aegisub 那四个色块就是这么写的），其它三个照 ASS 写
+        bian = {"c1": "\\c", "c2": "\\2c", "c3": "\\3c", "c4": "\\4c"}
+        tou = bian.get(wei) or bian["c1"]
+        biao = tou + str(se) + _touming_biaoqian(wei, a)
+        if xuan:
+            kuai = _suo_zai_kuai(wen, xuan)
+            if kuai:
+                xin = _jia_jin_kuai(wen, kuai, biao)
+            else:
+                xin = _wei_yiduan(wen, xuan, "{" + biao + "}", "{\\r}")
+        else:
+            xin = _qu_biaoqian(wen, wei)
+            xin = _jia_biaoqian(xin, biao)
+        self._hua_yulan(xu, xin)
+
+    def _hua_yulan(self, xu, wen):
+        """预览：只换内存里的文字 + 重画画面上的字幕（不写文件、不刷列表）"""
+        self.zimu_mianban.gai_zimu_wenben(xu, wen)
+        self.shijianzhou.gai_zimu_wenben(xu, wen)
+        self._zimu_hang_ji = None          # 折行缓存作废，按新标签重算
+        self._shuaxin_huamian_zimu()
 
     def _shoudao_xiayitiao(self):
         """焦点在时间轴上按 Ins：换到下一条字幕（跟字幕列表回车一个走法）"""
@@ -18232,7 +18518,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if not xiugai or not zimu:
             return 0
         gai = 0
-        if jian == "wenben":
+        jiu_di = jian == "wenben"      # 只是改文字：就地刷，不重建列表
+        if jiu_di:
             for xu, xin in xiugai:
                 xu = int(xu)
                 if not (0 <= xu < len(zimu)):
@@ -18241,6 +18528,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
                     continue
                 self.zimu_mianban.gai_zimu_wenben(xu, str(xin))
                 self.shijianzhou.gai_zimu_wenben(xu, str(xin))
+                self.bianji_mianban.gai_wenben_ji(xu, str(xin))
                 gai += 1
         else:
             for xu, xin in xiugai:
@@ -18253,13 +18541,14 @@ class VideoWorkDialog(QtWidgets.QDialog):
                     continue
                 fu[jian] = xin
                 self.zimu_mianban.shezhi_hang_fu(xu, fu)
+                self.bianji_mianban.gai_hang_fu(xu, fu)
                 gai += 1
         if not gai:
             return 0
-        self._shezhi_bianji_zimu(
-            self.zimu_mianban.zimu_liebiao(),
-            self.bianji_mianban.dangqian_xu(),
-        )
+        if not jiu_di:
+            # 样式 / 说话人变了：画面用的字段缓存得作废，不然还照旧样式画
+            self._zimu_fu_ji = []
+            self._zimu_pei_ji = []
         self._zimu_hang_ji = None
         self._zimu_tiao_wen = None
         self._shuaxin_zimu_tiao()

@@ -226,6 +226,18 @@ def huan_yiduan(wenben, qi, zhi, xin):
     return wen[:qi] + str(xin) + wen[zhi:]
 
 
+def _tihuan_moban(wen):
+    """「替换为」那一栏 -> re.sub 能吃的模板
+
+    勾了「使用正则表达式」时，替换串会被当成模板解析，反斜杠后面跟错东西就算
+    非法转义 —— 写 {\pos(75,705)} 直接报 bad escape。字幕里这种写法满地都是，
+    而 \\1 \\2 在 ASS 里又恰恰是颜色 / 透明标签，不能当"第几个括号组"用。
+    所以：除 \\g<名字> 之外，一律按普通反斜杠本身处理。
+    """
+    wen = str(wen or "")
+    return re.sub(r"\\(?!g<)", lambda _m: "\\\\", wen)
+
+
 # =====================================================================
 # 窗口通用样式
 # =====================================================================
@@ -744,7 +756,7 @@ class SuoSuoDialog(QtWidgets.QDialog):
         jiu = str(hang[xu][jian] or "")
         if pei["zhengze"]:
             biao = re.compile(pei["chazhao"], 0 if pei["qufen"] else re.IGNORECASE)
-            xin = biao.sub(pei["tihuan"], jiu[qi:zhi], count=1)
+            xin = biao.sub(_tihuan_moban(pei["tihuan"]), jiu[qi:zhi], count=1)
         else:
             xin = pei["tihuan"]
         xin_wen = huan_yiduan(jiu, qi, zhi, xin)
@@ -796,6 +808,7 @@ class SuoSuoDialog(QtWidgets.QDialog):
             return
         jian = LAN_JIAN[pei["lan"]]
         suoding = self._jian_bi_you(pei)
+        xuan_jiu = self._zhuren.ss_xuan_hang()      # 换之前选了哪几条，换完还选着
         xiugai = []
         zong = 0
         try:
@@ -809,7 +822,7 @@ class SuoSuoDialog(QtWidgets.QDialog):
                     biao = re.compile(
                         pei["chazhao"], 0 if pei["qufen"] else re.IGNORECASE
                     )
-                    xin, ci = biao.subn(pei["tihuan"], jiu)
+                    xin, ci = biao.subn(_tihuan_moban(pei["tihuan"]), jiu)
                 else:
                     xin = jiu
                     ci = 0
@@ -835,6 +848,8 @@ class SuoSuoDialog(QtWidgets.QDialog):
             self._zhuren.ss_tishi("替换", "没有找到匹配")
             return
         self._zhuren.ss_gai(jian, xiugai)
+        # 整表重建会把选中冲掉（只剩最后动过的那条），换回原来选的那批
+        self._zhuren.ss_she_xuan(xuan_jiu)
         self._ji_peizhi(pei)
         _jia_lishi(PEI_CHAZHAO, pei["chazhao"])
         _jia_lishi(self._q + PEI_TIHUAN, pei["tihuan"])

@@ -743,6 +743,8 @@ class YsgColorDialog(QtWidgets.QDialog):
         yan, hao = YsgColorDialog.tiao(self, yan, alpha=True, biaoti="选颜色")
     """
 
+    se_gai_le = QtCore.pyqtSignal(object)     # 颜色一动就发（拖动 / 色板 / 数字框）
+
     def __init__(self, parent=None, yanse=None, alpha=True, biaoti="选择颜色"):
         super().__init__(parent)
         self.setWindowTitle(biaoti or "选择颜色")
@@ -1079,6 +1081,9 @@ class YsgColorDialog(QtWidgets.QDialog):
                                   self.shuru["hsv"][2].value())
         self.alpha_tiao.shezhi_dian(0, self._se[3])
         self.yulan.shezhi_se(self._se if self._alpha else self._se[:3] + [0])
+        # 颜色一变就往外报（光谱拖动 / 色条 / 透明度条 / 数字框 / 色板 / 滴管
+        # 最后都汇到这儿），外面接了「边调边看」的就把画面当场换色
+        self.se_gai_le.emit(self.yanse())
 
     # ---- 各个入口（照 AEG 的 UpdateFrom*）----
     def _cong_shuzi(self, jian):
@@ -1293,12 +1298,16 @@ class YsgColorDialog(QtWidgets.QDialog):
         super().accept()
 
     @staticmethod
-    def tiao(parent=None, yanse=None, alpha=True, biaoti="选择颜色"):
+    def tiao(parent=None, yanse=None, alpha=True, biaoti="选择颜色", shishi=None):
         """弹一次调色板 -> (QColor, 确定没确定)
 
         yanse 可以给 QColor / "#RRGGBB" / [r, g, b, 透明度] / ASS 写法 / 颜色名。
+        shishi：给了就把「颜色一动」回调过去（QColor），用来边调边看画面；
+        调完（确定 / 取消）这里不再回调，由调用方自己收尾。
         """
         chuang = YsgColorDialog(parent, guiyi_yanse(yanse), alpha, biaoti)
+        if shishi is not None:
+            chuang.se_gai_le.connect(shishi)
         if chuang.exec_() == QtWidgets.QDialog.Accepted:
             return (chuang.yanse(), True)
         return (None, False)

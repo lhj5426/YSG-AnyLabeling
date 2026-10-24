@@ -36,6 +36,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 
 from anylabeling.views.labeling.logger import logger
 from anylabeling.views.labeling.widgets.color_dialog import YsgColorDialog
+from anylabeling.views.labeling.widgets.font_dialog import YsgFontDialog
 from anylabeling.views.labeling.widgets.video_work_styles import (
     du_ku,
     ku_zai,
@@ -422,6 +423,10 @@ def _zidonghua_mo_ren():
         ],
         "paichu_ci": ["旁白", "narration", "Narration"],
         "paichu_fuhao": ["「", "」", "『", "』", "（", "）", "(", ")"],
+        # 套在正文外面的东西（默认就是「」）。可以写代码，比如左边写
+        # {\fnGen Jyuu Gothic Monospace Bold}、右边写 {\r}
+        "kuohao_zuo": "「",
+        "kuohao_you": "」",
         # 打字机（逐字淡入）的参数：跟 AEG 那个 Lua 脚本问的一样
         "daziji": {
             "fanwei": "zixuan",     # zixuan = 只作用于选中的行 / quanbu = 全部行
@@ -484,6 +489,8 @@ def du_zidonghua_peizhi():
             "caowei": cao,
             "paichu_ci": _chai_yi_hang(pei.value("zidonghua/paichu_ci", None), mo["paichu_ci"]),
             "paichu_fuhao": _chai_yi_hang(pei.value("zidonghua/paichu_fuhao", None), mo["paichu_fuhao"]),
+            "kuohao_zuo": str(pei.value("zidonghua/kuohao_zuo", mo["kuohao_zuo"]) or ""),
+            "kuohao_you": str(pei.value("zidonghua/kuohao_you", mo["kuohao_you"]) or ""),
             "daziji": _du_daziji(pei, mo["daziji"]),
         }
     except Exception:  # noqa
@@ -508,6 +515,8 @@ def xie_zidonghua_peizhi(pei):
             "zidonghua/paichu_fuhao",
             "|".join(str(x) for x in (pei.get("paichu_fuhao") or [])),
         )
+        q.setValue("zidonghua/kuohao_zuo", str(pei.get("kuohao_zuo") or ""))
+        q.setValue("zidonghua/kuohao_you", str(pei.get("kuohao_you") or ""))
         zi = dict((pei.get("daziji") or _zidonghua_mo_ren()["daziji"]))
         q.setValue("zidonghua/daziji_fanwei", str(zi.get("fanwei") or "zixuan"))
         q.setValue("zidonghua/daziji_kongge", "1" if zi.get("kongge", True) else "0")
@@ -2755,6 +2764,10 @@ class _AssGaoliang(QtGui.QSyntaxHighlighter):
 
     正文不设色，用编辑框自己的字色。颜色是按我们的深色底调过的，AEG 那套是
     浅色底的配色，直接抄过来会看不清。
+
+    字体也跟着 \\fn 走：{\\fnDFHSMincho-W9}ー 这种写法，后面那几个字就用明朝体
+    显示；\\r 之后回到编辑框自己的字体。只管字体名，字号还是编辑框统一那个
+    （跟 AEG 一样，编辑区不做逐段字号）。
     """
 
     HUI = QtGui.QColor("#9AA0A6")       # 括号 / 小括号 / 逗号
@@ -2762,14 +2775,92 @@ class _AssGaoliang(QtGui.QSyntaxHighlighter):
     HONG = QtGui.QColor("#FF7AD9")      # 标签名
     LU = QtGui.QColor(ZIMU_HUANHANG_SE)  # 换行标签 \N
 
+    @staticmethod
+    def _qie_biao(biao):
+        """{\\fnA\\c&H..&} 里那一串 -> 一个个标签
+
+        括号里还有反斜杠的（\\t(0,500,\\fs30)）不切开，整块留一个 —— 跟字幕
+        解析那份一个规矩。
+        """
+        jieguo = []
+        dang = ""
+        shen = 0
+        for ch in str(biao or ""):
+            if ch == "(":
+                shen += 1
+            elif ch == ")":
+                shen = max(0, shen - 1)
+            if ch == "\\" and shen == 0:
+                if dang.strip():
+                    jieguo.append(dang)
+                dang = ""
+                continue
+            dang += ch
+        if dang.strip():
+            jieguo.append(dang)
+        return jieguo
+
+    def _sao_ziti(self, wen, ziti):
+        """扫这一块里的 \\fn / \\r，算出往后该用哪款字体（空 = 编辑框自己的）"""
+        for kuo in re.finditer(r"\{([^}]*)\}", str(wen or "")):
+            for pian in self._qie_biao(kuo.group(1)):
+                p = str(pian or "").strip()
+                if not p:
+                    continue
+                if p[:1] in ("r", "R"):
+                    # \r（带不带样式名都一样）：回到样式字体，编辑框里就是它自己那个
+                    ziti = ""
+                    continue
+                zhao = re.match(r"^(\d?[a-zA-Z]+)(.*)$", p)
+                if not zhao:
+                    continue
+                m = zhao.group(1)               # 原始大小写：字体名大小写敏感
+                xiao = m.lower()
+                wei = zhao.group(2) or ""
+                # \fn 后面既没空格也没括号，名字直接黏在标签名上（fnGen Jyuu…）。
+                # 正则会把名字开头那串字母一起吞进标签名，得按原始写法拆回来。
+                if xiao.startswith("fontname") and len(m) > 8:
+                    xiao, zhi = "fontname", (m[8:] + wei).strip()
+                elif xiao.startswith("fn") and len(m) > 2:
+                    xiao, zhi = "fn", (m[2:] + wei).strip()
+                else:
+                    continue
+                if xiao in ("fn", "fontname"):
+                    ziti = zhi                 # 不带名字就是回样式字体（空）
+        return ziti
+
+    def _ziti_qian(self):
+        """从文档开头扫到这一行之前：\\fn 管到这一行结束，下一行得接着用"""
+        ziti = ""
+        b = self.document().firstBlock()
+        dang = self.currentBlock()
+        while b.isValid() and b != dang:
+            ziti = self._sao_ziti(b.text(), ziti)
+            b = b.next()
+        return ziti
+
+    def _she_ziti(self, qi, chang, ziti):
+        """给一段正文设字体；ziti 空就什么都不设（用编辑框自己的字体）"""
+        if chang <= 0 or not ziti:
+            return
+        ge = QtGui.QTextCharFormat()
+        try:
+            ge.setFontFamilies([ziti])
+        except AttributeError:      # 老一点儿的 Qt 没这个
+            ge.setFontFamily(ziti)
+        self.setFormat(qi, chang, ge)
+
     def highlightBlock(self, wen):
         wen = str(wen or "")
         chang = len(wen)
+        ziti = self._ziti_qian()        # 进这一行时该用的字体
         i = 0
+        zheng = 0                       # 眼下这段正文从第几个字开始
         while i < chang:
             if wen[i] != "{":
                 i += 1
                 continue
+            self._she_ziti(zheng, i - zheng, ziti)
             jie = wen.find("}", i + 1)          # 这一对花括号到哪儿结束
             if jie < 0:
                 jie = chang
@@ -2797,7 +2888,11 @@ class _AssGaoliang(QtGui.QSyntaxHighlighter):
                         k += bu
             if jie < chang:
                 self.setFormat(jie, 1, self.HUI)
+            # 这一块里的 \fn / \r 改的是"后面该用哪款字体"
+            ziti = self._sao_ziti(wen[i:jie + 1], ziti)
             i = jie + 1
+            zheng = i
+        self._she_ziti(zheng, chang - zheng, ziti)
         # 换行标签 \N 单独画绿（摆最后，盖掉上面花括号里那层配色）
         for zhao in re.finditer(r"\\N", wen):
             self.setFormat(zhao.start(), 2, self.LU)
@@ -3181,6 +3276,9 @@ class _ZimuGongjulan(QtWidgets.QWidget):
     """
 
     gongju_gaile = pyqtSignal(str, object)
+    # 调色板里拖动时的临时颜色（还没点确定）：(哪个色, ASS 色值, 选区) / None
+    # None = 这一轮调色结束，把预览撤掉、原文还回去
+    shishi_yanse = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3196,6 +3294,7 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         self._mid = []          # 第 2 排的控件
         self._bot = []          # 第 3 排的控件
         self._ziti = QtGui.QFont()
+        self._ziti_daxiao = 0   # 这条字幕现在用的字号（给字体框先摆上）
         self._yanse = {"c1": "#FFFFFF", "c2": "#FF0000",
                        "c3": "#000000", "c4": "#000000"}
         self._wenben_kuang = None   # 编辑框（外面给）：有选中的字就只对那段动手
@@ -3224,7 +3323,7 @@ class _ZimuGongjulan(QtWidgets.QWidget):
             QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
         )
         self.xia_yang.setMinimumContentsLength(4)
-        self.xia_yang.setToolTip("这一条用的样式")
+        self.xia_yang.setToolTip("该行的样式")
         # 弹出列表往"大而长"上做：行更高、比输入框宽、一次列 20 条。
         # Qt 默认那条又窄又挤，样式名长一点就看不全，翻起来也累。
         bang = self.xia_yang.view()
@@ -3249,7 +3348,7 @@ class _ZimuGongjulan(QtWidgets.QWidget):
             QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
         )
         self.xia_shuo.setMinimumContentsLength(4)
-        self.xia_shuo.setToolTip("说话人（只作标记，不影响画面）")
+        self.xia_shuo.setToolTip("作为标记备注用的")
         y1.addWidget(self.xia_shuo, 2)
 
         # 最长一行字数：我们没有特效框，它就直接跟在说话人后面，也拿框装起来
@@ -3257,7 +3356,7 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         self.lian_zishu.setReadOnly(True)
         self.lian_zishu.setAlignment(Qt.AlignCenter)
         self.lian_zishu.setFixedWidth(46)
-        self.lian_zishu.setToolTip("这条字幕最长一行的字数")
+        self.lian_zishu.setToolTip("在当前字幕行的最长行的字符数。")
         self.lian_zishu.setStyleSheet(_ys_shuru())
         y1.addWidget(self.lian_zishu)
 
@@ -3319,21 +3418,21 @@ class _ZimuGongjulan(QtWidgets.QWidget):
             return kuang
 
         _mid(_zici_wenben("层"))
-        self.shuzi_ceng = _mid(self._shuzi(0, 99999, 54, "层：数大的盖在上面"))
+        self.shuzi_ceng = _mid(self._shuzi(0, 99999, 54, "层次编号"))
 
         _mid(_zici_wenben("开始"))
-        self.shuru_kaishi = _mid(self._shijian_shuru("这一条的开始时间"))
+        self.shuru_kaishi = _mid(self._shijian_shuru("开始时间"))
 
         _mid(_zici_wenben("结束"))
-        self.shuru_jieshu = _mid(self._shijian_shuru("这一条的结束时间"))
+        self.shuru_jieshu = _mid(self._shijian_shuru("结束时间"))
 
         # 时长：能改 —— 改它就等于改结束时间（开始时间不动），照 AEG
         self.lian_shichang = _mid(
-            self._shijian_shuru("这一条的时长（改了 = 结束时间跟着变）")
+            self._shijian_shuru("该行持续时间")
         )
 
         for jian, zi, tip in (
-            ("b", "B", "粗体"),
+            ("b", "B", "加粗"),
             ("i", "I", "斜体"),
             ("u", "U", "下划线"),
             ("s", "S", "删除线"),
@@ -3341,33 +3440,33 @@ class _ZimuGongjulan(QtWidgets.QWidget):
             an = QtWidgets.QPushButton(zi)
             an.setCheckable(True)
             an.setFixedSize(26, 24)
-            an.setToolTip(f"{tip}：往这条字幕里加 / 去 \\{jian}1")
+            an.setToolTip(f"在光标位置添加{tip}标签(\\{jian})")
             an.setStyleSheet(self._an_yangshi())
             _bot(an)
             self._zi_anniu[jian] = an
 
         self.an_fn = QtWidgets.QPushButton("fn")
         self.an_fn.setFixedSize(34, 24)
-        self.an_fn.setToolTip("换字体：往这条字幕里加 \\fn")
+        self.an_fn.setToolTip("设置字体和大小")
         self.an_fn.setStyleSheet(_ys_ci_anniu())
         _bot(self.an_fn)
 
         for wei, tip in (
-            ("c1", "主要颜色"),
-            ("c2", "次要颜色"),
-            ("c3", "边框颜色"),
-            ("c4", "阴影颜色"),
+            ("c1", "设置主要填充色标签(\\c)，应用于光标的位置之后"),
+            ("c2", "设置次要填充色（用于卡拉OK效果）标签(\\2c)，应用于鼠标的位置之后"),
+            ("c3", "设置边框填充色标签(\\3c)，应用于光标的位置之后"),
+            ("c4", "设置阴影填充色标签(\\4c)，应用于光标的位置之后"),
         ):
             an = QtWidgets.QPushButton()
             an.setFixedSize(28, 24)
-            an.setToolTip(f"{tip}（点一下改）")
+            an.setToolTip(tip)
             an.setStyleSheet(_ys_ci_anniu())
             _bot(an)
             self._yanse_anniu[wei] = an
 
         self.an_xiayihang = QtWidgets.QPushButton("✓")
         self.an_xiayihang.setFixedSize(26, 24)
-        self.an_xiayihang.setToolTip("这一条改完，跳到下一条（到底了就新建一条）")
+        self.an_xiayihang.setToolTip("提交并换行")
         self.an_xiayihang.setStyleSheet(_ys_ci_anniu())
         _bot(self.an_xiayihang)
 
@@ -3614,11 +3713,9 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         self._tian = True
         try:
             if self._zhen:
-                self.shuru_kaishi.setToolTip("这一条的开始帧号（直接写数字）")
-                self.shuru_jieshu.setToolTip("这一条的结束帧号（直接写数字）")
-                self.lian_shichang.setToolTip(
-                    "这一条的时长，算帧数（改了 = 结束帧跟着变）"
-                )
+                self.shuru_kaishi.setToolTip("开始时间")
+                self.shuru_jieshu.setToolTip("结束时间")
+                self.lian_shichang.setToolTip("该行持续时间")
                 self.shuru_kaishi.setText(
                     _zhen_wenben(self._qi_ms, self._fps, wei=False)
                 )
@@ -3636,15 +3733,9 @@ class _ZimuGongjulan(QtWidgets.QWidget):
                     )
                 )
             else:
-                self.shuru_kaishi.setToolTip(
-                    "这一条的开始时间（0:00:05.65 这种写法）"
-                )
-                self.shuru_jieshu.setToolTip(
-                    "这一条的结束时间（0:00:05.65 这种写法）"
-                )
-                self.lian_shichang.setToolTip(
-                    "这一条的时长（改了 = 结束时间跟着变；0:00:02.34 这种写法）"
-                )
+                self.shuru_kaishi.setToolTip("开始时间")
+                self.shuru_jieshu.setToolTip("结束时间")
+                self.lian_shichang.setToolTip("该行持续时间")
                 self.shuru_kaishi.setText(
                     _ass_shi_jian_wenben(self._qi_ms)
                 )
@@ -3693,29 +3784,53 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         return (qi, zhi) if zhi > qi else None
 
     def _xuan_ziti(self):
-        """fn 按钮：挑一个字体，往这条字幕里写 \\fn字体名"""
+        """fn 按钮：挑字体 + 字号，往这条字幕里写 \\fn字体名\\fs字号
+
+        字号跟字体一起写，是因为系统那个字体框本来就带「大小」——AEG 也是
+        这么用的。对话框里不动的话，字号还是原来那个，不会变。
+        """
         if self._tian:
             return
         xuan = self._xuan_qu()
-        zi, cheng = QtWidgets.QFontDialog.getFont(self._ziti, self, "选字体")
-        if not cheng:
+        ming, daxiao, hao = YsgFontDialog.tiao(
+            self, self._ziti.family(), self._ziti_daxiao, "字体"
+        )
+        if not hao or not ming:
             return
-        self._fa("tag", ("fn", zi.family(), xuan))
+        biao = ming
+        if daxiao > 0 and daxiao != self._ziti_daxiao:
+            biao += "\\fs" + str(daxiao)
+        self._fa("tag", ("fn", biao, xuan))
 
     def _xuan_yanse(self, wei):
         """四个颜色按钮：挑一个颜色，往这条字幕里写 \\c / \\2c / \\3c / \\4c
 
         调色板是照 AEG 复刻的那一个（widgets/color_dialog.py）。行内 \\c 只写
         RGB，不带 alpha（要透明得另写 \\1a），所以这儿不给透明度那一栏。
+
+        边调边看：调色板里每动一下颜色就把临时结果发出去（画面跟着变），
+        点确定才真正写回去；取消就把原文还回来。跟 AEG 一样。
         """
         if self._tian:
             return
         xuan = self._xuan_qu()
         qi = QtGui.QColor(str(self._yanse.get(wei) or "#FFFFFF"))
-        yan, hao = YsgColorDialog.tiao(self, qi, alpha=False, biaoti="选颜色")
+
+        def kan(se):
+            self.shishi_yanse.emit(
+                (wei, _yanse_to_ass(se), xuan, 255 - int(se.alpha()))
+            )
+
+        yan, hao = YsgColorDialog.tiao(
+            self, qi, alpha=True, biaoti="选颜色", shishi=kan
+        )
+        self.shishi_yanse.emit(None)      # 撤掉预览（后面按确定的结果重来）
         if not hao or yan is None:
             return
-        self._fa("yanse", (wei, _yanse_to_ass(yan), xuan))
+        self._fa(
+            "yanse",
+            (wei, _yanse_to_ass(yan), xuan, 255 - int(yan.alpha())),
+        )
 
     # ---- 往控件里填值 / 换候选 ----
     def shezhi_yangshi_ming(self, ming_liebiao):
@@ -3793,12 +3908,15 @@ class _ZimuGongjulan(QtWidgets.QWidget):
             zi.setFamily(ming)
         zi.setPixelSize(100)
         self._ziti = zi
-        # AEG 的 fn 按钮就是两个字，不显示字体名（字体名放提示里）
+        try:
+            self._ziti_daxiao = max(
+                0, int(round(float(gs.get("fs") or 0)))
+            )
+        except (TypeError, ValueError):
+            self._ziti_daxiao = 0
+        # AEG 的 fn 按钮就是两个字，提示也照它那一句（不带字体名）
         self.an_fn.setText("fn")
-        self.an_fn.setToolTip(
-            f"换字体（现在是 {ming}）：往这条字幕里加 \\fn" if ming
-            else "换字体：往这条字幕里加 \\fn"
-        )
+        self.an_fn.setToolTip("设置字体和大小")
 
     def _tian_yanse(self, gs):
         for wei, an in self._yanse_anniu.items():
@@ -4350,6 +4468,32 @@ class KuohaoPaichuDialog(QtWidgets.QDialog):
         shuo.setStyleSheet(_ys_biao_ti())
         wai.addWidget(shuo)
 
+        # ---- 自定义：正文外面套什么 ----
+        zi = QtWidgets.QHBoxLayout()
+        zi.setSpacing(6)
+        zi.addWidget(QtWidgets.QLabel("正文左边加："))
+        self.shuru_zuo = QtWidgets.QLineEdit(
+            str((pei or {}).get("kuohao_zuo") or "「")
+        )
+        self.shuru_zuo.setStyleSheet(_ys_shuru())
+        self.shuru_zuo.setMinimumWidth(180)
+        zi.addWidget(self.shuru_zuo, 2)
+        zi.addWidget(QtWidgets.QLabel("右边加："))
+        self.shuru_you = QtWidgets.QLineEdit(
+            str((pei or {}).get("kuohao_you") or "」")
+        )
+        self.shuru_you.setStyleSheet(_ys_shuru())
+        self.shuru_you.setMinimumWidth(180)
+        zi.addWidget(self.shuru_you, 2)
+        wai.addLayout(zi)
+
+        zhu = QtWidgets.QLabel(
+            "这两栏可以写代码，括号要跟着写进去。比如左边 {\fnGen Jyuu Gothic "
+            "Monospace Bold}「、右边 」{\r}"
+        )
+        zhu.setStyleSheet(_ys_biao_ti())
+        wai.addWidget(zhu)
+
         wang = QtWidgets.QGridLayout()
         wang.setHorizontalSpacing(6)
         wang.setVerticalSpacing(3)
@@ -4409,6 +4553,8 @@ class KuohaoPaichuDialog(QtWidgets.QDialog):
             "paichu_fuhao": [
                 k.text().strip() for k in self.shuru_fu if k.text().strip()
             ],
+            "kuohao_zuo": self.shuru_zuo.text(),
+            "kuohao_you": self.shuru_you.text(),
         }
 
 
@@ -6248,6 +6394,7 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
     wenben_gaile = pyqtSignal(int, str)     # 正在打字：第几条的文字改成了什么
     bianji_wancheng = pyqtSignal(int, str)  # 离开编辑框：这一条改完了
     gongju_gaile = pyqtSignal(str, object)  # 工具栏改了哪一样（见 _ZimuGongjulan）
+    shishi_yanse = pyqtSignal(object)       # 调色板里拖着的临时颜色（还没点确定）
     yao_yidong = pyqtSignal(int)            # 列表里 Alt+↑ / Alt+↓：选中的行整批挪一格
     suoding_gaile = pyqtSignal(bool)        # 「锁定代码」开关变了（时间轴那边跟着换显示）
 
@@ -6322,6 +6469,7 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         # 编辑区上方那排字段（照 AEG 的主工具栏）：改哪一样就往外发哪一样
         self.gongjulan = _ZimuGongjulan()
         self.gongjulan.gongju_gaile.connect(self.gongju_gaile.emit)
+        self.gongjulan.shishi_yanse.connect(self.shishi_yanse.emit)
         xia_bu.addWidget(self.gongjulan)
 
         self.kuang = _ZimuWenbenKuang()
