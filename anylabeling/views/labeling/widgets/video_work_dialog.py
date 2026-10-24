@@ -17375,9 +17375,31 @@ class VideoWorkDialog(QtWidgets.QDialog):
         zimu = self.zimu_mianban.zimu_liebiao()
         if not (0 <= xu < len(zimu)) or str(zimu[xu][2]) == str(xin):
             return
+        # 重填编辑框会把选中冲掉：先记下选的是哪几个字，填完再圈回去 ——
+        # 连着改颜色 / 字号 / 字体的时候不该每改一次就丢一次选中
+        kuang = getattr(self.bianji_mianban, "kuang", None)
+        jiu_qi, jiu_zhi, jiu_xuan = -1, -1, ""
+        if kuang is not None:
+            cur = kuang.textCursor()
+            if cur.hasSelection():
+                jiu_qi = int(cur.selectionStart())
+                jiu_zhi = int(cur.selectionEnd())
+                jiu_xuan = kuang.toPlainText()[jiu_qi:jiu_zhi]
         self.zimu_mianban.gai_zimu_wenben(xu, xin)
         self.shijianzhou.gai_zimu_wenben(xu, xin)
         self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao(), xu)
+        if kuang is not None and jiu_xuan:
+            # 新文本里同一段字多半还在原位附近（前面可能多插了个标签）
+            quanwen = kuang.toPlainText()
+            zhao = quanwen.find(jiu_xuan, max(0, jiu_qi - 8))
+            if zhao < 0:
+                zhao = quanwen.find(jiu_xuan)
+            if zhao >= 0:
+                ze = kuang.textCursor()
+                ze.setPosition(zhao)
+                ze.setPosition(zhao + len(jiu_xuan),
+                                QtGui.QTextCursor.KeepAnchor)
+                kuang.setTextCursor(ze)
         # 文字 / 标签都动了：折行缓存作废，画面和时间轴上的块立刻重画
         self._zimu_hang_ji = None
         self._zimu_tiao_wen = None

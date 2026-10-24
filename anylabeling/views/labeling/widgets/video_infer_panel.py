@@ -2990,6 +2990,15 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
         self._suoding_yuan = ""     # 锁定时整行原文（一个字没动过就整行还回去）
         self._suoding_chun = ""     # 藏完之后该显示的样子（拿它比用户动没动过字）
         self.setStyleSheet(_ys_bianji_kuang(self._zihao, self._suoding))
+        # 失焦（比如弹出字体 / 调色板）以后，框里的选中高亮也得照样看得见 ——
+        # Qt 默认用的是系统「不活动」那套高亮色，在深底上跟背景糊成一片
+        _se = self.palette()
+        for zu in (QtGui.QPalette.Active, QtGui.QPalette.Inactive):
+            _se.setColor(zu, QtGui.QPalette.Highlight, QtGui.QColor("#2E6FC4"))
+            _se.setColor(
+                zu, QtGui.QPalette.HighlightedText, QtGui.QColor("#FFFFFF")
+            )
+        self.setPalette(_se)
         self._gaoliang = _AssGaoliang(self.document())
 
         # Ctrl+滚轮 调字号时，框右上角闪一个小浮标报当前数值，免得瞎调
@@ -3295,6 +3304,11 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         self._bot = []          # 第 3 排的控件
         self._ziti = QtGui.QFont()
         self._ziti_daxiao = 0   # 这条字幕现在用的字号（给字体框先摆上）
+        self._ziti_cu = False   # 现在是不是粗体（同上，字体框「字形」先摆上）
+        self._ziti_xie = False  # 现在是不是斜体
+        self._ziti_xia = False  # 现在有没有下划线（字体框「效果」）
+        self._ziti_shan = False  # 现在有没有删除线
+        self._ziti_se = "#FFFFFF"   # 现在的主色（字体框「颜色」）
         self._yanse = {"c1": "#FFFFFF", "c2": "#FF0000",
                        "c3": "#000000", "c4": "#000000"}
         self._wenben_kuang = None   # 编辑框（外面给）：有选中的字就只对那段动手
@@ -3784,22 +3798,44 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         return (qi, zhi) if zhi > qi else None
 
     def _xuan_ziti(self):
-        """fn 按钮：挑字体 + 字号，往这条字幕里写 \\fn字体名\\fs字号
+        """fn 按钮：挑字体 + 字号 + 字形 + 下划线/删除线 + 颜色
 
-        字号跟字体一起写，是因为系统那个字体框本来就带「大小」——AEG 也是
-        这么用的。对话框里不动的话，字号还是原来那个，不会变。
+        往这条字幕里写 \\fn \\fs \\b \\i \\u \\s \\c，跟 AEG 的 fn 按钮一个
+        做法：只有跟原来那条不一样的才写。选「粗斜体」就是
+        {\\fn宋体\\b1\\i1}。（AEG 那个框的颜色、下划线、删除线是坏的，
+        它只认字体名和字号；我们这边三项都真写进去。）
         """
         if self._tian:
             return
         xuan = self._xuan_qu()
-        ming, daxiao, hao = YsgFontDialog.tiao(
-            self, self._ziti.family(), self._ziti_daxiao, "字体"
+        ming, daxiao, cu, xie, xia, shan, se, hao = YsgFontDialog.tiao(
+            self,
+            self._ziti.family(),
+            self._ziti_daxiao,
+            "字体",
+            self._ziti_cu,
+            self._ziti_xie,
+            self._ziti_xia,
+            self._ziti_shan,
+            self._ziti_se,
         )
         if not hao or not ming:
             return
         biao = ming
         if daxiao > 0 and daxiao != self._ziti_daxiao:
             biao += "\\fs" + str(daxiao)
+        if cu != self._ziti_cu:
+            biao += "\\b" + ("1" if cu else "0")
+        if xie != self._ziti_xie:
+            biao += "\\i" + ("1" if xie else "0")
+        if xia != self._ziti_xia:
+            biao += "\\u" + ("1" if xia else "0")
+        if shan != self._ziti_shan:
+            biao += "\\s" + ("1" if shan else "0")
+        if se and str(se).upper() != str(self._ziti_se or "").upper():
+            zi_se = QtGui.QColor(str(se))
+            if zi_se.isValid():
+                biao += "\\c" + _yanse_to_ass(zi_se)
         self._fa("tag", ("fn", biao, xuan))
 
     def _xuan_yanse(self, wei):
@@ -3914,6 +3950,14 @@ class _ZimuGongjulan(QtWidgets.QWidget):
             )
         except (TypeError, ValueError):
             self._ziti_daxiao = 0
+        # 粗体 / 斜体 / 下划线 / 删除线 / 主色：字体框打开时就摆在这几项上
+        self._ziti_cu = bool(gs.get("b"))
+        self._ziti_xie = bool(gs.get("i"))
+        self._ziti_xia = bool(gs.get("u"))
+        self._ziti_shan = bool(gs.get("s"))
+        se = str(gs.get("c1") or "#FFFFFF")
+        if re.match(r"^#[0-9A-Fa-f]{6}$", se):
+            self._ziti_se = se.upper()
         # AEG 的 fn 按钮就是两个字，提示也照它那一句（不带字体名）
         self.an_fn.setText("fn")
         self.an_fn.setToolTip("设置字体和大小")
