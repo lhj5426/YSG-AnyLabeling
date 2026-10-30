@@ -252,9 +252,15 @@ class MangaOCR(Model):
 
         return adjusted_boxes, adjusted_scores
 
-    def _run_color_only(self, image, boxes):
+    def _run_color_only(self, image, boxes, zhen_bian=False):
         """Fast color-only: backbone + encoder + 1 decoder step, no beam search.
-        Returns list of (fg_color, bg_color) for each box."""
+        Returns list of (fg_color, bg_color) for each box.
+
+        zhen_bian=False（默认，漫画标注那套）：第二个色不取模型判的值，
+            一律「浅色字配深色描边 / 深色字配浅色描边」—— 白字给黑、黑字给白。
+        zhen_bian=True：第二个色直接用模型判出来的那个（视频硬字幕取描边色
+            走这条），模型说没有第二色时才落回上面那套黑白兜底。
+        """
         if len(boxes) == 0:
             return []
 
@@ -304,7 +310,15 @@ class MangaOCR(Model):
                     fb = int(np.clip(fg_pred[j, 2].item() * 255, 0, 255))
                     fg_color = (fr, fg, fb)
                     fg_lum = 0.299 * fr + 0.587 * fg + 0.114 * fb
-                    bg_color = (0, 0, 0) if fg_lum > 190 else (255, 255, 255)
+                    if zhen_bian and has_bg:
+                        # 模型自己判出来的第二色（描边 / 衬底），原样用
+                        bg_color = (
+                            int(np.clip(bg_pred[j, 0].item() * 255, 0, 255)),
+                            int(np.clip(bg_pred[j, 1].item() * 255, 0, 255)),
+                            int(np.clip(bg_pred[j, 2].item() * 255, 0, 255)),
+                        )
+                    else:
+                        bg_color = (0, 0, 0) if fg_lum > 190 else (255, 255, 255)
                 else:
                     fg_color = None
                     bg_color = None

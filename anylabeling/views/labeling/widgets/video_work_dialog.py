@@ -146,6 +146,7 @@ JIEMIAN_BILI_JIAN = "jiemian/fenlan_bili2"           # 记住各处拖的分栏�
                                                      #  老存的位置对不上，换一把新键）
 JIEMIAN_ZUOYOU_DUO = "jiemian/zuoyou_tuoguo"         # 左右大分栏你自己拖过没有
 JIEMIAN_PUMAN_JIAN = "jiemian/huamian_puman"         # 记住「画面铺满整列」还是「画面在上栏」
+JIEMIAN_SI_CENG_JIAN = "jiemian/si_ceng_bili"        # 记住四层布局里各层拖过的高度
 JIEMIAN_SUOFANG_JIAN = "jiemian/shijianzhou_suofang"  # 记住时间轴的放大倍数
 JIEMIAN_MEIHANG_GAO = "jiemian/meihang_gao"          # 记住字幕块每行多高
 JIEMIAN_BO_FANGDA = "jiemian/bo_fangda"              # 记住波形振幅放大倍数
@@ -1962,6 +1963,10 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         self._shipin_gao = 0
         self._kuang = []             # 检测框 [(名字, 分数, (x1,y1,x2,y2))] 原始像素
         self._quyu = None            # 检测区域 (x,y,w,h) 原始像素；None = 整图
+        # 只看框选的这一块（四层布局的第 1 层）：(x, y, w, h) 原始像素。
+        # 跟 _quyu 不是一回事 —— _quyu 是"框外压暗"，这块是"只显示这一块"，
+        # 交给 mpv 的 video-crop 真裁掉，画面放大铺满整个控件。
+        self._kan_qu = None
         self._zai_tuo_quyu = False   # 正按着检测区域的边 / 角 / 框里拖
         self._quyu_shou = None       # 鼠标压在检测区域的哪儿（"l"/"r"/"t"/"b"/"lt"… / "nei"）
         self._tuo_quyu_qi = None     # 拖检测区域按下那一刻的账（手柄 / 起始框 / 按点）
@@ -2015,6 +2020,64 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         """从外面同步区域（面板清空/换视频时用）"""
         self._quyu = tuple(int(v) for v in quyu) if quyu else None
         self.update()
+
+    # ---- 只看框选的那一块（四层布局第 1 层）----------------------
+    def kan_qu(self):
+        """现在只看的是哪一块（视频原始像素）；看整幅时给 None"""
+        return self._kan_qu
+
+    def shezhi_kan_qu(self, qu):
+        """只显示框选的这一块：mpv 真裁掉框外，剩下这块放大铺满控件
+
+        坐标还是按视频原始像素算（字幕、遮罩、拖放方块都不变），只是画的时候
+        把原点挪到框的左上角、比例换成"框宽 -> 控件宽"。
+        """
+        qu = tuple(int(v) for v in qu) if qu else None
+        if qu == self._kan_qu:
+            return
+        self._kan_qu = qu
+        self._gao_mpv_crop()
+        self._zimu_tu = None            # 字幕层缓存作废（基准变了）
+        self.chicun_bian.emit()
+        self.update()
+
+    def _gao_mpv_crop(self):
+        """把「只看这一块」告诉 mpv：video-crop=WxH+X+Y（视频像素）
+
+        空串 = 撤掉裁剪，恢复整幅。mpv 0.36 起才有这个属性，读不到就什么都不做
+        （画面照样是整幅，只是不放大）。
+        """
+        mpv = getattr(self, "_mpv", None)
+        if mpv is None or getattr(mpv, "h", None) is None:
+            return
+        qu = self._kan_qu
+        if qu:
+            x, y, w, h = qu
+            # 夹在视频范围内：拖框拖出界也不能把裁剪尺寸报大
+            vw = int(self._shipin_kuan or 0)
+            vh = int(self._shipin_gao or 0)
+            if vw > 0 and vh > 0:
+                x = max(0, min(x, vw - 1))
+                y = max(0, min(y, vh - 1))
+                w = max(1, min(w, vw - x))
+                h = max(1, min(h, vh - y))
+            zhi = f"{max(1, w)}x{max(1, h)}+{max(0, x)}+{max(0, y)}"
+        else:
+            zhi = ""
+        try:
+            mpv._she("video-crop", zhi)
+        except Exception:  # noqa
+            pass
+
+    def _kan_chi(self):
+        """显示用的 (原点x, 原点y, 宽, 高)：看区域时是区域，否则整幅"""
+        if self._kan_qu:
+            x, y, w, h = self._kan_qu
+            return float(x), float(y), float(max(1, w)), float(max(1, h))
+        w, h = self._shipin_kuan, self._shipin_gao
+        if (w <= 0 or h <= 0) and self._tupian is not None and not self._tupian.isNull():
+            w, h = self._tupian.width(), self._tupian.height()
+        return 0.0, 0.0, float(max(0, w)), float(max(0, h))
 
     def zai_kuang_xuan(self):
         return self._zai_kuang_xuan
@@ -2247,11 +2310,9 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
 
     # ---- 坐标换算：控件像素 <-> 视频原始像素 ----
     def _suofang_bi(self):
-        """原始像素 -> 控件像素的比例；算不出来给 0"""
+        """显示用的原始像素 -> 控件像素的比例；算不出来给 0"""
         mubiao = self.mubiao_qu()
-        iw = self._shipin_kuan
-        if iw <= 0 and self._tupian is not None and not self._tupian.isNull():
-            iw = self._tupian.width()
+        _qx, _qy, iw, _ih = self._kan_chi()
         if iw <= 0 or mubiao.width() <= 0:
             return 0.0, mubiao
         return mubiao.width() / float(iw), mubiao
@@ -2261,13 +2322,12 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         bi, mubiao = self._suofang_bi()
         if bi <= 0:
             return None
-        iw = self._shipin_kuan or self._tupian.width()
-        ih = self._shipin_gao or self._tupian.height()
-        x = (dian.x() - mubiao.left()) / bi
-        y = (dian.y() - mubiao.top()) / bi
+        qx, qy, iw, ih = self._kan_chi()
+        x = qx + (dian.x() - mubiao.left()) / bi
+        y = qy + (dian.y() - mubiao.top()) / bi
         return (
-            max(0.0, min(float(iw), x)),
-            max(0.0, min(float(ih), y)),
+            max(qx, min(qx + float(iw), x)),
+            max(qy, min(qy + float(ih), y)),
         )
 
     def _quyu_kongjian_ju(self):
@@ -2278,14 +2338,12 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         mubiao = self.mubiao_qu()
         if mubiao.width() <= 0:
             return None
-        iw = self._shipin_kuan
-        if iw <= 0 and self._tupian is not None and not self._tupian.isNull():
-            iw = self._tupian.width()
+        qx, qy, iw, _ih = self._kan_chi()
         if iw <= 0:
             return None
         bi = mubiao.width() / float(iw)
-        x1 = mubiao.left() + qu[0] * bi
-        y1 = mubiao.top() + qu[1] * bi
+        x1 = mubiao.left() + (qu[0] - qx) * bi
+        y1 = mubiao.top() + (qu[1] - qy) * bi
         return (x1, y1, x1 + qu[2] * bi, y1 + qu[3] * bi)
 
     def _quyu_shou_ming(self, dian):
@@ -2293,6 +2351,10 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
 
         没设检测区域、或鼠标没挨着它，返回 None。
         """
+        if self._kan_qu:
+            # 只看框选区域时，整幅画面就是那个框 —— 再让它能拖着改，
+            # 左键点哪儿都会被它抢走，字幕拖不动、遮罩也画不了
+            return None
         ju = self._quyu_kongjian_ju()
         if ju is None:
             return None
@@ -2646,9 +2708,10 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         jw, jh = self._zimu_jizhun
         ix = float(jx) * float(yuan[0]) / float(jw)
         iy = float(jy) * float(yuan[1]) / float(jh)
+        qx, qy, _qw, _qh = self._kan_chi()
         return QtCore.QPoint(
-            int(round(mubiao.left() + ix * bi)),
-            int(round(mubiao.top() + iy * bi)),
+            int(round(mubiao.left() + (ix - qx) * bi)),
+            int(round(mubiao.top() + (iy - qy) * bi)),
         )
 
     def shezhi_kuang(self, kuang):
@@ -2723,13 +2786,9 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         """画面在控件里的实际显示矩形"""
         w = max(1, self.width())
         h = max(1, self.height())
-        iw = self._shipin_kuan
-        ih = self._shipin_gao
+        _qx, _qy, iw, ih = self._kan_chi()
         if iw <= 0 or ih <= 0:
-            if self._tupian is None or self._tupian.isNull():
-                return QtCore.QRect()
-            iw = max(1, self._tupian.width())
-            ih = max(1, self._tupian.height())
+            return QtCore.QRect()
         bi = min(w / float(iw), h / float(ih))
         tw = max(1, int(round(iw * bi)))
         th = max(1, int(round(ih * bi)))
@@ -3058,7 +3117,21 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         """
         if not self._zimu or mubiao.width() <= 8 or mubiao.height() <= 8:
             return None
-        qian = _zimu_qian(self._zimu, mubiao, self._zimu_jizhun)
+        # 画字幕的基准矩形 qu：平时就是整块画面；只看框选区域时，把 qu 放大成
+        # "整幅视频按框的倍率放大、原点挪到框左上角"，框外的部分自然落到画面外
+        qu = QtCore.QRect(0, 0, mubiao.width(), mubiao.height())
+        if self._kan_qu:
+            qx, qy, kw, kh = self._kan_chi()
+            bi_kan = mubiao.width() / float(max(1.0, kw))
+            vw = self._shipin_kuan or kw
+            vh = self._shipin_gao or kh
+            qu = QtCore.QRect(
+                int(round(-qx * bi_kan)),
+                int(round(-qy * bi_kan)),
+                max(1, int(round(vw * bi_kan))),
+                max(1, int(round(vh * bi_kan))),
+            )
+        qian = _zimu_qian(self._zimu, qu, self._zimu_jizhun)
         jiu = self._zimu_tu
         if jiu is not None and jiu[0] == qian:
             return jiu[1]
@@ -3071,7 +3144,6 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         tu.setDevicePixelRatio(bi)
         tu.fill(Qt.transparent)
         huabi = QtGui.QPainter(tu)
-        qu = QtCore.QRect(0, 0, mubiao.width(), mubiao.height())
         # 锚点底账以 shezhi_zimu 算的那份打底（这一笔没画到的行——比如
         # 渐隐到全透明的——账也留着），真画出来的再盖一遍，两边一个算法
         maodian = dict(self._maodian_ji)
@@ -3109,6 +3181,9 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         """
         qu = self._quyu
         se = YANSE_QUYU
+        if self._kan_qu:
+            # 只看框选的这一块：整幅画面就是这块，没有"框外"要压暗
+            return
         if self._zai_kuang_xuan and self._tuo_qi is not None:
             qu = self._tuo_chu_de_qu()
             if self._kuang_xuan_yong == "zhemo":
@@ -3160,7 +3235,7 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         """按视频原始像素 -> 屏幕像素的比例，把检测框画上去"""
         if not self._kuang:
             return
-        iw = self._shipin_kuan or (self._tupian.width() if self._tupian else 0)
+        qx, qy, iw, _ih = self._kan_chi()
         if iw <= 0 or mubiao.width() <= 0:
             return
         bi = mubiao.width() / float(iw)
@@ -3169,10 +3244,10 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         huabi.setFont(ziti)
         zhun = huabi.fontMetrics()
         for mingzi, fenshu, kuang in self._kuang:
-            x1 = mubiao.left() + kuang[0] * bi
-            y1 = mubiao.top() + kuang[1] * bi
-            x2 = mubiao.left() + kuang[2] * bi
-            y2 = mubiao.top() + kuang[3] * bi
+            x1 = mubiao.left() + (kuang[0] - qx) * bi
+            y1 = mubiao.top() + (kuang[1] - qy) * bi
+            x2 = mubiao.left() + (kuang[2] - qx) * bi
+            y2 = mubiao.top() + (kuang[3] - qy) * bi
             if x2 < x1:
                 x1, x2 = x2, x1
             if y2 < y1:
@@ -4360,12 +4435,19 @@ def _shi_duihua(wenben):
     return False
 
 
-def _shuohua_qu_se(wenben):
-    """从这一行里抠文字色（\\c&HBBGGRR& / \\1c&HBBGGRR&）-> (R, G, B)
+def _shuohua_qu_se(wenben, qu_bian=False):
+    """从这一行里抠颜色 -> (R, G, B)
 
-    颜色是上一趟「提取文字颜色」写进行首那块 {...} 的；没写过给 None。
+    默认抠文字内部的色（\\c&HBBGGRR& / \\1c&HBBGGRR&）；qu_bian=True 时抠外圈
+    描边的色（\\3c&HBBGGRR&）—— 面板 ⑨ 切到「提取描边颜色」那趟写进去的就是
+    \\3c，分说话人得跟着按描边色分，不然每行文字色都是同一个，全挤成一组。
+    没写过给 None。
     """
-    m = re.search(r"\\1?c&H([0-9A-Fa-f]{6})&", str(wenben or ""))
+    wen = str(wenben or "")
+    if qu_bian:
+        m = re.search(r"\\3c&H([0-9A-Fa-f]{6})&", wen)
+    else:
+        m = re.search(r"\\1?c&H([0-9A-Fa-f]{6})&", wen)
     if not m:
         return None
     hao = m.group(1).upper()
@@ -7059,12 +7141,13 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
     huabi.restore()
 
 
-def _zimu_qian(tiao_men, mubiao, jizhun):
+def _zimu_qian(tiao_men, qu, jizhun):
     """给画面上这一屏字幕算个指纹：指纹一样就不用重画
 
-    影响画面的全在这儿：折好的行、各段格式、这一刻的透明度、画面多大、
-    ASS 的基准分辨率。毫秒不进指纹 —— 毫秒只用来算透明度，剔掉之后正常
-    播放（没写 \\fad 的那种）每一帧的指纹都跟上一帧一模一样，图直接复用。
+    影响画面的全在这儿：折好的行、各段格式、这一刻的透明度、画面多大（含
+    原点 —— 只看框选区域时原点不是 0）、ASS 的基准分辨率。毫秒不进指纹 ——
+    毫秒只用来算透明度，剔掉之后正常播放（没写 \\fad 的那种）每一帧的指纹
+    都跟上一帧一模一样，图直接复用。
     """
     bu = []
     for tiao in tiao_men:
@@ -7078,8 +7161,10 @@ def _zimu_qian(tiao_men, mubiao, jizhun):
         )
     return (
         tuple(bu),
-        int(mubiao.width()),
-        int(mubiao.height()),
+        int(qu.x()),
+        int(qu.y()),
+        int(qu.width()),
+        int(qu.height()),
         tuple(jizhun or ()),
     )
 
@@ -12389,7 +12474,7 @@ class _YanseXiancheng(QtCore.QThread):
 
     zhuangtai = pyqtSignal(str)        # 加载模型 / 取色中的说明
     jindu = pyqtSignal(int, int)       # 已完成 / 总共
-    jieguo = pyqtSignal(int, object)   # 第几条, (R,G,B) 或 None
+    jieguo = pyqtSignal(int, object)   # 第几条, ((文字色R,G,B), (描边色R,G,B)或None) 或 None
     wancheng = pyqtSignal(bool, str)   # 成不成 / 说明
     moxing_hao = pyqtSignal(str, object)   # (YAML 路径, 模型) —— 交回界面存着，下次复用
 
@@ -12484,7 +12569,11 @@ class _YanseXiancheng(QtCore.QThread):
             return shang_hao, None
 
     def _qu_yanse(self, moxing, zhen):
-        """在检测区域里跑颜色模型，取面积最大那个框的文字色 (R,G,B)
+        """在检测区域里跑颜色模型，取面积最大那个框的（文字色, 描边色）
+
+        模型本身一次就给出两个颜色：文字内部色 + 外圈那一层（背景）色。
+        这里两个都带回去，界面按「提取文字颜色 / 描边颜色」那个开关挑用哪
+        个 —— 碰上「白字 + 彩色描边」那种片子也不用重跑。
 
         直接喂 BGR 数组给模型（不走它的读图那一步，那一步只认 QImage）。
         """
@@ -12503,7 +12592,13 @@ class _YanseXiancheng(QtCore.QThread):
             kuang, _fen = moxing._run_detection(tu)
             if not kuang:
                 return None
-            yan = moxing._run_color_only(tu, kuang)
+            try:
+                # zhen_bian：第二个色用模型自己判的那个（真描边 / 衬底），
+                # 不要「白字就配黑边」那套兜底
+                yan = moxing._run_color_only(tu, kuang, zhen_bian=True)
+            except TypeError:
+                # 别的模型 / 老实现没这个开关：按老样子来
+                yan = moxing._run_color_only(tu, kuang)
             zui = None
             zui_mian = -1.0
             for i, xiang in enumerate(yan):
@@ -12512,6 +12607,7 @@ class _YanseXiancheng(QtCore.QThread):
                 fg = xiang[0]
                 if not fg or len(fg) < 3:
                     continue
+                bg = xiang[1] if len(xiang) > 1 else None
                 try:
                     xs = [float(p[0]) for p in kuang[i]]
                     ys = [float(p[1]) for p in kuang[i]]
@@ -12520,7 +12616,11 @@ class _YanseXiancheng(QtCore.QThread):
                 mian = (max(xs) - min(xs)) * (max(ys) - min(ys))
                 if mian > zui_mian:
                     zui_mian = mian
-                    zui = (int(fg[0]), int(fg[1]), int(fg[2]))
+                    zui = (
+                        (int(fg[0]), int(fg[1]), int(fg[2])),
+                        (int(bg[0]), int(bg[1]), int(bg[2]))
+                        if bg and len(bg) >= 3 else None,
+                    )
             return zui
         except Exception as cuowu:      # noqa
             logger.error(f"视频工作台：取文字颜色失败 {cuowu}")
@@ -13027,6 +13127,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._huamian_puman = str(
             self._weizhi_peizhi.value(JIEMIAN_PUMAN_JIAN, "0")
         ) in ("1", "true", "True")
+        # 四层布局（只看框选区域）：视频 / 字幕列表 / 字幕编辑区 / 时间轴
+        # 竖着摞。只在这次打开里有效，不记进配置（下次开头仍是左右布局）
+        self._si_ceng_kai = False
+        self._si_ceng_chi = None
+        self._si_ceng_mang = False      # 正在切换四层布局（防重入）
         # 标签页里面的分栏：那一页藏着的时候摆不准，先记着，等它露出来再摆
         self._ye_bili = {}
 
@@ -13415,6 +13520,190 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 列表铺在下方时，把「字幕列表 + 条数」那行收掉（照 AEG 顶格显示）
         ce.shezhi_liebiao_dingge(self._liebiao_zai_xia)
 
+    # --------------------------------------------------------------
+    # 四层布局：视频（只看框选区域）/ 字幕列表 / 字幕编辑区 / 时间轴
+    # --------------------------------------------------------------
+    def si_ceng_kai_zhe(self):
+        """现在是不是四层布局"""
+        return self._si_ceng_kai
+
+    def qiehuan_si_ceng(self):
+        """右键菜单那一项：开 / 关四层布局"""
+        if getattr(self, "_si_ceng_mang", False):
+            return              # 正在切，别重入（画面搬一半再搬会踩空）
+        self._si_ceng_mang = True
+        try:
+            if self._si_ceng_kai:
+                self._guan_si_ceng()
+            else:
+                self._kai_si_ceng()
+        finally:
+            self._si_ceng_mang = False
+
+    def _kai_si_ceng(self):
+        """开四层布局：画面（只看框选区域）/ 字幕列表 / 字幕编辑区 / 时间轴
+
+        **画面控件一步都不搬**。只改三处结构：
+          1. 左右大分栏 zuo_you 由横变竖 —— 画面挪到最上面、占满整个宽度；
+          2. 右栏（you_kuang）里的选项卡收起来，换成「字幕列表 + 字幕编辑区」；
+          3. 时间轴挪到窗口最下面那一格。
+        画面控件的父级始终是 zuo_you，GL 上下文不变，mpv 不用重开内核 ——
+        所以既不会黑屏，也不会有搬控件搬崩的风险。
+        """
+        if self._si_ceng_kai:
+            return
+        qu = self.huamian.quyu()
+        if not qu:
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "先在画面上拖一个框（框选区域），再开四层布局"
+            )
+            return
+        if self._duli_chuang is not None:
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "先把「拆分视频」那个独立窗口关掉，再开四层布局"
+            )
+            return
+        ce = self.bianji_mianban
+        bian = getattr(ce, "bianji_kuang", None)
+        if bian is None:
+            return
+        if self._huamian_puman:
+            # 画面铺满整列时下面那一格是收着的，先回到普通摆法
+            self._shangxia_dao_di(False)
+        self._si_ceng_chi = (
+            list(self.zuo_you.sizes()),
+            list(self.shang_xia.sizes()),
+            list(ce.sizes()),
+            list(self.you_kuang.sizes()),
+        )
+        self._si_ceng_kai = True
+        # ① 左右分栏 -> 上下分栏：画面在上，其余在下
+        self.zuo_you.setOrientation(Qt.Vertical)
+        # ② 选项卡收起来
+        self.you_tabs.hide()
+        # ③ 四块按「谁在下面」摆好（第 2 层 / 第 4 层会在列表和时间轴之间换）
+        self._bai_si_ceng(chong_zhi=True)
+        # 第 1 层只显示框选区域（mpv 真裁掉框外，剩下的放大铺满）
+        self.huamian.shezhi_kan_qu(qu)
+        zong = max(400, self.height() - 40)
+        self.zuo_you.setSizes([
+            max(160, int(zong * 0.42)),     # 上：画面（框选区域）
+            max(200, int(zong * 0.58)),     # 下：第 2 / 3 层
+        ])
+        # 上次在这个布局里拖过的高度：等这一轮布局落定再放回去
+        QtCore.QTimer.singleShot(0, self._huan_si_ceng_bili)
+        self.shezhi_mianban.zhuangtai_shezhi(
+            "四层布局：上=框选区域，往下依次是 "
+            + ("时间轴 / 字幕编辑区 / 字幕列表"
+               if self._liebiao_zai_xia
+               else "字幕列表 / 字幕编辑区 / 时间轴")
+        )
+
+    def _bai_si_ceng(self, chong_zhi=False):
+        """四层布局里那三块（第 2 / 3 / 4 层）按「谁在下面」摆好
+
+        三块都塞在同一个竖分栏（you_kuang）里，窗口最下面那一格（xia_kuang）
+        直接收起来 —— 这样每两层之间那条分割线都是它们自己的，拖哪条就只改
+        那两层，不会连带把上面的画面一起挤掉。
+        第 2 层 / 第 4 层按右键菜单里「谁放在下方」来换：
+            时间轴放下方 -> 字幕列表 / 字幕编辑区 / 时间轴
+            字幕列表放下方 -> 时间轴 / 字幕编辑区 / 字幕列表
+        """
+        ce = self.bianji_mianban
+        lie = ce.lie_biao_kuang
+        bian = getattr(ce, "bianji_kuang", None)
+        zhou = self.shijianzhou_kuang
+        # QSplitter 没有 removeWidget：先都摘下来（换父级就摘掉了），再按顺序挂
+        for w in (lie, bian, zhou):
+            if w is not None:
+                w.setParent(None)
+        ceng = [zhou, bian, lie] if self._liebiao_zai_xia else [lie, bian, zhou]
+        for w in ceng:
+            if w is not None:
+                self.you_kuang.addWidget(w)
+        for i in (1, 2, 3):
+            self.you_kuang.setStretchFactor(i, 1)
+        # 列表铺在最下面时把它那行标题收掉（照 AEG 顶格显示）
+        ce.shezhi_liebiao_dingge(self._liebiao_zai_xia)
+        for w in ceng:
+            if w is not None:
+                w.show()        # setParent(None) 会让它变隐藏，挂回来得显出来
+        # 第三第四层之间那条分割线归竖分栏自己管，最下面那一格整个收起来
+        self.xia_kuang.hide()
+        if chong_zhi:
+            zong = max(400, self.height() - 40)
+            xia = max(300, int(zong * 0.58))
+            self.you_kuang.setSizes([
+                0,                               # 收起来的选项卡
+                max(110, int(xia * 0.34)),       # 第 2 层
+                max(110, int(xia * 0.42)),       # 第 3 层
+                max(80, int(xia * 0.24)),        # 第 4 层
+            ])
+            self.shang_xia.setSizes([zong, 0])
+
+    def _guan_si_ceng(self):
+        """关四层布局：结构改回左右，四块各回原位，尺寸照开之前的放回去"""
+        if not self._si_ceng_kai:
+            return
+        self._cun_si_ceng_bili()        # 先把这次拖成的高度记下来，下次进来接着用
+        self._si_ceng_kai = False
+        self.huamian.shezhi_kan_qu(None)     # 画面恢复整幅
+        ce = self.bianji_mianban
+        bian = getattr(ce, "bianji_kuang", None)
+        lie = ce.lie_biao_kuang
+        # 列表 / 编辑区搬回「字幕编辑」页（时间轴由 _bai_weizhi 归位）
+        if bian is not None:
+            ce.insertWidget(0, bian)
+        ce.insertWidget(0, lie)
+        self.you_kuang.setStretchFactor(0, 1)
+        self.you_kuang.setStretchFactor(1, 0)
+        self.you_tabs.show()
+        self.zuo_you.setOrientation(Qt.Horizontal)
+        self.xia_kuang.show()       # 四层时收起来的那一格放出来（时间轴/列表要回这儿）
+        self._bai_weizhi(chi_cun=False)
+        chi = self._si_ceng_chi or ()
+        self._si_ceng_chi = None
+        try:
+            if len(chi) >= 4:
+                for kuang, da in (
+                    (self.zuo_you, chi[0]),
+                    (self.shang_xia, chi[1]),
+                    (ce, chi[2]),
+                    (self.you_kuang, chi[3]),
+                ):
+                    if da and len(da) == len(kuang.sizes()):
+                        kuang.setSizes(da)
+        except Exception:  # noqa
+            pass
+        QtCore.QTimer.singleShot(0, self.huamian.update)
+        self.shezhi_mianban.zhuangtai_shezhi("回到左右布局（画面整幅显示）")
+
+    def _cun_si_ceng_bili(self):
+        """记住四层布局里两处分栏拖成的高度（退出四层 / 关窗口时存）"""
+        try:
+            self._weizhi_peizhi.setValue(
+                JIEMIAN_SI_CENG_JIAN,
+                self._bili_wenben(self.zuo_you.sizes())
+                + ";"
+                + self._bili_wenben(self.you_kuang.sizes()),
+            )
+        except Exception:  # noqa
+            pass
+
+    def _huan_si_ceng_bili(self):
+        """把上次记下的四层高度放回去；没存过 / 对不上就按默认"""
+        if not self._si_ceng_kai:
+            return
+        duan = str(
+            self._weizhi_peizhi.value(JIEMIAN_SI_CENG_JIAN, "") or ""
+        ).split(";")
+        if len(duan) != 2:
+            return
+        for kuang, zhi in ((self.zuo_you, duan[0]), (self.you_kuang, duan[1])):
+            da = self._wenben_bili(zhi)
+            if da and len(da) == len(kuang.sizes()):
+                kuang.setSizes(da)
+
     def _qiehuan_weizhi(self):
         """把「时间轴」和「字幕列表」换个位置，并把这次的选择记下来"""
         self._liebiao_zai_xia = not self._liebiao_zai_xia
@@ -13422,6 +13711,24 @@ class VideoWorkDialog(QtWidgets.QDialog):
             WEIZHI_PEIZHI_JIAN,
             "liebiao" if self._liebiao_zai_xia else "shijianzhou",
         )
+        if self._si_ceng_kai:
+            # 四层布局里换的就是第 2 层和第 4 层那两块（高度照现在这份不变）
+            chi = (list(self.zuo_you.sizes()), list(self.you_kuang.sizes()))
+            self._bai_si_ceng()
+
+            def _fang_chi():
+                for kuang, da in ((self.zuo_you, chi[0]),
+                                  (self.you_kuang, chi[1])):
+                    if da and len(da) == len(kuang.sizes()):
+                        kuang.setSizes(da)
+
+            QtCore.QTimer.singleShot(0, _fang_chi)
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "四层布局：字幕列表挪到最下面（第 2 层换成时间轴）"
+                if self._liebiao_zai_xia
+                else "四层布局：时间轴挪到最下面（第 2 层换成字幕列表）"
+            )
+            return
         self._bai_weizhi()
         self.shezhi_mianban.zhuangtai_shezhi(
             "字幕列表挪到右下（时间轴收进「字幕编辑」页）"
@@ -13493,6 +13800,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
 
     def _zuoyou_dong_le(self, _wei=0, _hao=0):
         """你亲手拖过左右大分栏：记一笔，以后不再自动贴合画面比例"""
+        if getattr(self, "_si_ceng_kai", False):
+            return              # 四层布局时它变成上下分栏了，别把这笔记成"左右拖过"
         self._zuoyou_duoguo = True
 
     def _cun_jiemian_buju(self):
@@ -13777,6 +14086,14 @@ class VideoWorkDialog(QtWidgets.QDialog):
         a_duli.setCheckable(True)
         a_duli.setChecked(self._duli_chuang is not None)
         cai.addSeparator()
+        # 四层布局：第 1 层只放框选区域，往下是字幕列表 / 字幕编辑区 / 时间轴
+        a_si_ceng = cai.addAction("只看框选区域（四层布局）")
+        a_si_ceng.setCheckable(True)
+        a_si_ceng.setChecked(self._si_ceng_kai)
+        a_si_ceng.setEnabled(
+            self._duli_chuang is None and bool(self.huamian.quyu())
+        )
+        cai.addSeparator()
         a_bz = cai.addAction("标准模式（双击画面 = 选中的字幕搬到那儿）")
         a_bz.setCheckable(True)
         a_bz.setChecked(self._shu_biao_mo == "biaozhun")
@@ -13794,6 +14111,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self._kaishi_hua_shiliang()
         elif dian_le is a_duli:
             self._qiehuan_huamian_duli()
+        elif dian_le is a_si_ceng:
+            # 菜单这会儿还开着（exec_ 的嵌套事件循环里），别在里头搬画面：
+            # 等菜单关掉、回到主事件循环再切
+            QtCore.QTimer.singleShot(0, self.qiehuan_si_ceng)
         elif dian_le is a_bz:
             self._qiehuan_shu_biao_mo("biaozhun")
         elif dian_le is a_tf:
@@ -14603,6 +14924,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if self._duli_chuang is not None:
             self._duli_chuang.close()   # 关窗时它自己会把画面搬回来
             return
+        if self._si_ceng_kai:
+            self.shezhi_mianban.zhuangtai_shezhi(
+                "四层布局开着，先把「只看框选区域」关掉再拆分视频"
+            )
+            return
         self._hua_chu_qu()
 
     def _jide_huamian_zhuangtai(self):
@@ -14985,7 +15311,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shezhi_mianban.kaishi_qingqiu.connect(self._kaishi_yunsuan)
         self.shezhi_mianban.tingzhi_qingqiu.connect(self._tingzhi_yunsuan)
         self.shezhi_mianban.kuang_xuan_qingqiu.connect(self._qiehuan_kuang_xuan)
-        self.shezhi_mianban.quyu_biangeng.connect(self.huamian.shezhi_quyu)
+        self.shezhi_mianban.quyu_biangeng.connect(self._shoudao_quyu_bian)
         self.shezhi_mianban.huamian_jingzhi.connect(
             self._shoudao_huamian_jingzhi
         )
@@ -15062,6 +15388,12 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shezhi_mianban.kuang_xuan_zhuangtai(False)
         if quyu:
             self.shezhi_mianban.shezhi_quyu(quyu)
+
+    def _shoudao_quyu_bian(self, quyu):
+        """检测区域变了（面板里改 / 画面上拖完）：四层布局开着就跟着换裁剪"""
+        self.huamian.shezhi_quyu(quyu)
+        if self._si_ceng_kai:
+            self.huamian.shezhi_kan_qu(quyu)
 
     def _jian_shijianzhou_mianban(self):
         kuang = QtWidgets.QFrame()
@@ -15195,6 +15527,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 换视频了：退出框选、清掉上一部片子的检测区域
         self.huamian.tingzhi_kuang_xuan()
         self.huamian.shezhi_quyu(None)
+        # 四层布局还开着的话：区域没了，第 1 层先回到整幅（布局不动）
+        if self._si_ceng_kai:
+            self.huamian.shezhi_kan_qu(None)
         self.shezhi_mianban.kuang_xuan_zhuangtai(False)
 
         if self.fps <= 0:
@@ -15287,6 +15622,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.huamian.qingkong()
         self.huamian.qingkong_kuang()
         self.huamian.tingzhi_kuang_xuan()
+        self.huamian.shezhi_kan_qu(None)   # 片子关了，裁剪跟着撤掉
         # 换片子 / 关窗口：字幕块和画面下方那条都清掉
         self.zimu_mianban.qingkong()
         self._chexiao_qingkong()
@@ -15361,6 +15697,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
             return              # 左右大分栏你自己拖过：听你的，不自动贴合
         if self._duli_chuang is not None:
             return              # 画面拆到独立窗口了：这一列的尺寸跟它不搭界
+        if getattr(self, "_si_ceng_kai", False):
+            return              # 四层布局：画面占满整宽，没有左右分栏可收
         if getattr(self, "zuo_you", None) is None:
             return
         yuan = self.huamian.yuan_chicun()
@@ -16994,13 +17332,20 @@ class VideoWorkDialog(QtWidgets.QDialog):
         return None
 
     def _kuai_yanse_yise(self, fu, biao):
-        """一条字幕该用什么底色：没说话人 / 样式查不到 -> None（用默认蓝）"""
+        """一条字幕该用什么底色：没说话人 / 样式查不到 -> None（用默认蓝）
+
+        取哪个色看 ⑨ 上那个「提取文字颜色 / 描边颜色」的开关：
+          取文字色 -> 样式的 c1（文字色）
+          取描边色 -> 样式的 c3（描边色）—— 那才是这一组真正的代表色，
+                  c1 这时是面板上那个统一色，用它每块都一个样，分不出人
+        """
         if not str(fu.get("shuo") or "").strip():
             return None
         ge = biao.get(str(fu.get("yang") or "Default").strip().lower())
         if not ge:
             return None
-        se = str(ge.get("c1") or "").strip()
+        jian = "c3" if self._yanse_qu_bian() else "c1"
+        se = str(ge.get(jian) or "").strip()
         if len(se) != 7 or not se.startswith("#"):
             return None
         yanse = QtGui.QColor(se)
@@ -17450,6 +17795,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 return zi
         return di
 
+    def _yanse_qu_bian(self):
+        """面板 ⑨ 现在取的是不是描边色（"wen" 文字内部 / "bian" 外圈描边）"""
+        try:
+            return self.shezhi_mianban.yanse_mubiao() == "bian"
+        except Exception:      # noqa
+            return False
+
     def _kaishi_shuohua_fenpei(self):
         """⑨「用颜色设置样式和说话人」：按提取到的文字颜色分说话人 / 样式
 
@@ -17477,8 +17829,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 "先把 ASS 字幕拖进来（或先跑一遍硬字幕提取），再点这个。",
             )
             return
+        # 按哪种颜色分组：跟着面板 ⑨ 那个开关走。取的是描边色就按 \3c 分，
+        # 取的是文字色就按 \c 分（否则描边模式下行行文字色都一样，会全并成一组）
+        qu_bian = self._yanse_qu_bian()
         tiao = [
-            (_shuohua_qu_se(wen), _shi_duihua(wen))
+            (_shuohua_qu_se(wen, qu_bian), _shi_duihua(wen))
             for _qi, _zhi, wen in zimu
         ]
         # 非阻塞（跟「切片设置」一个规矩）：开着预览框照样能操作时间轴。
@@ -17540,6 +17895,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         fen = dlg.fen_zu()
         if not fen:
             return
+        # 按哪种颜色分的组（面板 ⑨ 那个开关）：取描边色就把主色落到描边上
+        qu_bian = self._yanse_qu_bian()
         # 这份分组反过来写回「设置说话人+样式」那 12 个槽位（槽位1 旁白、
         # 槽位2 说话人1…），没占到的槽位原样留着
         self._xie_hui_caowei(dlg.caowei_pei())
@@ -17560,11 +17917,18 @@ class VideoWorkDialog(QtWidgets.QDialog):
             zi = dict(ji_zhun)
             zi["name"] = ming
             zi.update(bianju)               # 文字位置：左 / 右 / 垂直边距 + 对齐
-            if zu["se"] is not None:
-                zi["c1"] = _se_hao(zu["se"])    # 主色 = 这组的代表色
-                                                # （旁白 = 旁白里最多的那个色）
-            # 只有「没取到色」的那种没代表色，主色沿用基准样式
+            # 先照面板 ⑨ 把描边色 / 描边宽写进去，再按"这次取的是哪种颜色"
+            # 落主色：取文字色 -> 主色进文字（c1）；取描边色 -> 主色进描边（c3），
+            # 文字内部用面板上那个色
             self._tiqu_bian_ru(zi)
+            if zu["se"] is not None:
+                if qu_bian:
+                    zi["c3"] = _se_hao(zu["se"])    # 主色 = 这组的代表色（描边）
+                    zi["c1"] = self._mianban_se_hao()
+                else:
+                    zi["c1"] = _se_hao(zu["se"])    # 主色 = 这组的代表色
+                                                    # （旁白 = 旁白里最多的那个色）
+            # 只有「没取到色」的那种没代表色，主色沿用基准样式
             if self.ym_jiao_cun("", zi):
                 jian_le += 1
 
@@ -17605,6 +17969,14 @@ class VideoWorkDialog(QtWidgets.QDialog):
             + ("，SRT / ASS 已重写" if xie else "")
             + "（Ctrl+S 保存字幕）"
         )
+
+    def _mianban_se_hao(self):
+        """面板 ⑨ 上那个颜色按钮的色号（#RRGGBB）—— 取描边色时当文字内部色用"""
+        se = getattr(self.shezhi_mianban, "yanse_bian_se", None)
+        try:
+            return QtGui.QColor(se if se is not None else "#FFFFFF").name().upper()
+        except Exception:      # noqa
+            return "#FFFFFF"
 
     def _tiqu_bian_ru(self, zi):
         """把面板 ⑨「提取颜色」那套设置写进这份样式
@@ -20495,6 +20867,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
             QtGui.QColor(se_bian) if se_bian is not None
             else QtGui.QColor(255, 255, 255)
         )
+        # 这次取的是哪种颜色：文字内部 / 外圈描边（面板 ⑨ 上那个开关，拍快照）
+        try:
+            self._yanse_mubiao = str(
+                self.shezhi_mianban.yanse_mubiao() or "wen"
+            )
+        except Exception:      # noqa
+            self._yanse_mubiao = "wen"
         try:
             self._yanse_bian_kuan = int(
                 self.shezhi_mianban.yanse_bian_kuan.value()
@@ -20599,9 +20978,33 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if not (0 <= xu < len(zimu)):
             return
         jiu = str(zimu[xu][2] or "")
+        # 模型一次给两个色：(文字内部色, 外圈描边色)。按面板 ⑨ 那个「提取
+        # 文字颜色 / 描边颜色」的开关挑一个用，另一个用面板上那个按钮的色
+        wen_se, qu_bian_se = None, None
+        try:
+            if isinstance(se[0], (tuple, list)):
+                wen_se, qu_bian_se = se[0], se[1]
+            else:
+                wen_se = se
+        except (TypeError, IndexError):
+            wen_se = se
+        mubiao = getattr(self, "_yanse_mubiao", "wen")
+        se_ban = getattr(self, "_yanse_bian_se", None) or QtGui.QColor(
+            255, 255, 255
+        )
+        if mubiao == "bian" and qu_bian_se:
+            # 取的是描边色：\c 用面板上那个色，\3c 用取到的描边色
+            se_tian = QtGui.QColor(se_ban)
+            bian_tian = QtGui.QColor(*[int(v) for v in qu_bian_se])
+        else:
+            # 取文字色（默认）：\c 用取到的，描边用面板上那个色
+            if not wen_se:
+                return
+            se_tian = QtGui.QColor(*[int(v) for v in wen_se])
+            bian_tian = QtGui.QColor(se_ban)
         xin = _zhemo_jia_yanse(
-            jiu, QtGui.QColor(int(se[0]), int(se[1]), int(se[2])), True,
-            getattr(self, "_yanse_bian_se", None),
+            jiu, se_tian, True,
+            bian_tian,
             getattr(self, "_yanse_bian_kuan", 5),
             True,     # fu_gai：重复提取时盖掉上次写的颜色 / 描边
         )
@@ -20872,6 +21275,12 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 画面还拆在独立窗口里就先收回来（不然那块控件的 GL 上下文跟着窗口一起
         # 没了，下面松渲染上下文 / 关内核那两步会踩空）
         self._zhengzai_guan = True
+        # 四层布局还开着：先关回去，让左右分栏的尺寸回到正常布局（关窗要记比例）
+        if getattr(self, "_si_ceng_kai", False):
+            try:
+                self._guan_si_ceng()
+            except Exception:  # noqa
+                pass
         # 关窗口时要是还按着 J（拉着范围）：做个了断，别把半截范围留到下次
         if self._j_qu is not None:
             self._j_qu = None

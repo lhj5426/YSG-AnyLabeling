@@ -150,6 +150,7 @@ TIQU_YANSE_MOXING = "tiqu/yanse_moxing"   # ⑨ 文字颜色提取用的模型 Y
 TIQU_YANSE_BIAN_SE = "tiqu/yanse_bian_se"     # ⑨ 取色回写时的描边颜色（#RRGGBB）
 TIQU_YANSE_BIAN_TOU = "tiqu/yanse_bian_tou"   # ⑨ 描边的透明度（0=不透 255=全透）
 TIQU_YANSE_BIAN_KUAN = "tiqu/yanse_bian_kuan"  # ⑨ 取色回写时的描边宽度
+TIQU_YANSE_MUBIAO = "tiqu/yanse_mubiao"       # ⑨ 取的是哪种颜色：wen 文字 / bian 描边
 YANSE_BIAN_SE_MOREN = "#FFFFFF"               # 出厂默认描边色：白
 YANSE_BIAN_TOU_MOREN = 0                      # 出厂默认描边透明 = 0（不透明）
 YANSE_BIAN_KUAN_MOREN = 5                     # 出厂默认描边宽度
@@ -3645,10 +3646,14 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         if he:
             for kuang in list(self._bot):
                 self.h2.insertWidget(self.h2.count() - 1, kuang)
+            # 计数那个 [当前/总数/剩余] 也是第三排的，并排时要一起搬 ——
+            # 它不在 _bot 里（不是按钮），以前留在这儿，第三排一藏它就跟着没了
+            self.h2.addWidget(self.ji_shu)
             self.pai3.hide()
         else:
             for kuang in list(self._bot):
                 self.h3.insertWidget(self.h3.count() - 1, kuang)
+            self.h3.addWidget(self.ji_shu)
             self.pai3.show()
 
     def _fa(self, jian, zhi):
@@ -6553,6 +6558,8 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         # 下块：编辑区
         xia = QtWidgets.QFrame()
         xia.setObjectName("YsgPanel")
+        # 「字幕编辑区」这一整块也留着给外面搬（四层布局时单独占一层）
+        self.bianji_kuang = xia
         xia_bu = QtWidgets.QVBoxLayout(xia)
         xia_bu.setContentsMargins(12, 10, 12, 10)
         xia_bu.setSpacing(6)
@@ -7558,6 +7565,33 @@ class ShezhiMianban(QtWidgets.QWidget):
         hang.addStretch(1)
         bu.addLayout(hang)
 
+        # 取哪一种颜色：文字内部的色 / 外圈描边的色。
+        # 取的那一种从画面里认；另一种用下面那个按钮定的颜色（按钮上写的名字
+        # 会跟着这里换：取文字色时它写"描边颜色"，取描边色时它写"文字颜色"）
+        hang = QtWidgets.QHBoxLayout()
+        hang.setSpacing(6)
+        hang.addWidget(QtWidgets.QLabel("提取"))
+        self.xuan_yanse_wen = QtWidgets.QRadioButton("文字颜色")
+        self.xuan_yanse_wen.setToolTip(
+            "取文字内部的颜色（默认）：\\c 用取到的色，描边用下面那个按钮定的色"
+        )
+        self.xuan_yanse_wen.setStyleSheet(_ys_xuanxiang())
+        hang.addWidget(self.xuan_yanse_wen)
+        self.xuan_yanse_bian = QtWidgets.QRadioButton("描边颜色")
+        self.xuan_yanse_bian.setToolTip(
+            "取文字外圈那条描边的颜色：\\3c 用取到的色，文字内部用下面那个按钮定的色\n"
+            "碰上「白字 + 彩色描边」那种片子就切到这个"
+        )
+        self.xuan_yanse_bian.setStyleSheet(_ys_xuanxiang())
+        hang.addWidget(self.xuan_yanse_bian)
+        self._mubiao_zu = QtWidgets.QButtonGroup(self)
+        self._mubiao_zu.addButton(self.xuan_yanse_wen)
+        self._mubiao_zu.addButton(self.xuan_yanse_bian)
+        self.xuan_yanse_wen.setChecked(True)
+        self.xuan_yanse_wen.toggled.connect(self._mubiao_bian_le)
+        hang.addStretch(1)
+        bu.addLayout(hang)
+
         # 取色回写时那条描边：颜色 + 宽度，都在这儿自己定
         hang = QtWidgets.QHBoxLayout()
         hang.setSpacing(6)
@@ -7779,6 +7813,18 @@ class ShezhiMianban(QtWidgets.QWidget):
         if ji_ini:
             self._cun_tiqu_shezhi()
 
+    def yanse_mubiao(self):
+        """⑨ 这回取的是哪种颜色："wen" 文字内部 / "bian" 外圈描边"""
+        an = getattr(self, "xuan_yanse_bian", None)
+        return "bian" if (an is not None and an.isChecked()) else "wen"
+
+    def _mubiao_bian_le(self, *_):
+        """切了「取文字色 / 取描边色」：按钮上换个名字，顺手存进 ini"""
+        se = getattr(self, "yanse_bian_se", None)
+        if se is not None:
+            self._she_yanse_bian_se(se, ji_ini=False)
+        self._cun_tiqu_shezhi()
+
     def _xuan_yanse_bian_se(self):
         """⑨ 描边颜色：弹主界面「边框颜色」点开的那一个调色板
 
@@ -7801,7 +7847,10 @@ class ShezhiMianban(QtWidgets.QWidget):
         se.setAlpha(255)                    # 主界面那个调色板不带透明度，一律不透明
         self.yanse_bian_se = se
         se_hao = se.name().upper()          # #RRGGBB
-        self.a_yanse_bian_se.setText(f"描边颜色 {se_hao}")
+        # 这个按钮写的是"另一种颜色"的名字：取文字色时它是描边色，取描边色时
+        # 它是文字内部色（取的那一种是从画面里认出来的，不用在这儿定）
+        ming = "文字颜色" if self.yanse_mubiao() == "bian" else "描边颜色"
+        self.a_yanse_bian_se.setText(f"{ming} {se_hao}")
         # 按钮底就是这条描边色：底色亮就写黑字，暗就写白字，保证看得清
         liang = (se.red() * 299 + se.green() * 587 + se.blue() * 114) / 1000.0
         se_zi = "#000000" if liang > 140 else "#FFFFFF"
@@ -7813,8 +7862,12 @@ class ShezhiMianban(QtWidgets.QWidget):
             + "}"
         )
         self.a_yanse_bian_se.setToolTip(
-            f"取色写进字幕时，文字的描边用这个颜色（{se_hao}）\n"
-            "点一下弹主界面「边框颜色」那个调色板"
+            (
+                f"取文字颜色时，描边用这个颜色（{se_hao}）\n"
+                if ming == "描边颜色"
+                else f"取描边颜色时，文字内部用这个颜色（{se_hao}）\n"
+            )
+            + "点一下弹主界面「边框颜色」那个调色板"
         )
         if ji_ini:
             self._cun_tiqu_shezhi()
@@ -8064,6 +8117,7 @@ class ShezhiMianban(QtWidgets.QWidget):
             pei.setValue(
                 TIQU_YANSE_BIAN_KUAN, int(self.yanse_bian_kuan.value())
             )
+            pei.setValue(TIQU_YANSE_MUBIAO, self.yanse_mubiao())
             pei.sync()
         except Exception as cuowu:      # noqa
             logger.warning(f"视频工作台：存提取设置失败 {cuowu}")
@@ -8154,6 +8208,18 @@ class ShezhiMianban(QtWidgets.QWidget):
         for w in (self.yanse_bian_kuan,):
             w.blockSignals(True)
         try:
+            # 上次选的是「取文字色」还是「取描边色」：先把开关摆好，按钮上的
+            # 名字才对得上
+            self.xuan_yanse_wen.blockSignals(True)
+            self.xuan_yanse_bian.blockSignals(True)
+            try:
+                if str(pei.value(TIQU_YANSE_MUBIAO, "wen") or "wen") == "bian":
+                    self.xuan_yanse_bian.setChecked(True)
+                else:
+                    self.xuan_yanse_wen.setChecked(True)
+            finally:
+                self.xuan_yanse_wen.blockSignals(False)
+                self.xuan_yanse_bian.blockSignals(False)
             self._she_yanse_bian_se(se, ji_ini=False)
             self.yanse_bian_kuan.setValue(
                 _shu(
