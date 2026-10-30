@@ -2666,12 +2666,13 @@ class ZimuMianban(QtWidgets.QWidget):
             self._fu[tuple(xin)] = fu
 
     def _fu_ban(self, xin):
-        """整份列表换掉：按内容把字段搬到新表上（排序 / 删除 / 合并都走这儿）"""
-        jiu = {}
-        for z in self._zimu:
-            fu = self._fu.get(tuple(z))
-            if fu:
-                jiu[tuple(z)] = dict(fu)
+        """整份列表换掉：按内容把字段搬到新表上（排序 / 删除 / 合并都走这儿）
+
+        起点是**现在全部**字段，不是"现在列表里还剩的那几条"：撤销把删掉的几条
+        摆回来时，那几条这会儿还不在列表里，只按现存列表去捞就把它们的字段丢了
+        —— 撤销回来全成 Default。反正最后只留 xin 里有的内容，多出来的自然丢掉。
+        """
+        jiu = {tuple(k): dict(v) for k, v in self._fu.items() if v}
         self._fu = {}
         for z in xin:
             if tuple(z) in jiu:
@@ -6821,6 +6822,26 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         if not (0 <= xu < len(self._fujia)):
             return {}
         return dict(self._fujia[xu])
+
+    def shezhi_fujia_zhi(self, fu_men):
+        """整份字段换成外面算好的这份，只刷「样式 / 说话人」两列
+
+        以前列表自己留着开工时那份 _fujia，字段在外面被改过（⑨分说话人、删样式、
+        分轨道…）它不知道，结果列表一直显示旧名字，编辑区上面那排却是新的。
+        这里只改那两格，不重建表、不丢选中、不动播放行那个蓝底。
+        """
+        if not fu_men:
+            return
+        if len(fu_men) != len(self._zimu):
+            return
+        self._fujia = [dict(x or {}) for x in fu_men]
+        for i, fu in enumerate(self._fujia):
+            yang = str(fu.get("yang") or "Default")
+            shuo = str(fu.get("shuo") or "")
+            for lie, t in ((4, yang), (5, shuo)):
+                xiang = self.biao.item(i, lie)
+                if xiang is not None and xiang.text() != t:
+                    xiang.setText(t)
 
     def gai_hang_fu(self, xu, fu):
         """外面改了这一条的字段：本地这份和列表里那两列跟上"""
