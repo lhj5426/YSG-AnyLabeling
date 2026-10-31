@@ -92,6 +92,7 @@ QUYU_LISHI_TIAO = 10            # 框选区域的历史记多少条
 MOXING_LISHI_TIAO = 10          # 检测模型历史记多少条
 MOXING_LISHI_JIAN = "tiqu/moxing_lishi"   # 检测模型路径历史记在 ini 里的项名
 QUYU_LISHI_JIAN = "tiqu/quyu_lishi"       # 框选区域历史记在 ini 里的项名
+QUYU_ZUIHOU_JIAN = "tiqu/quyu_zuihou"     # 上次用的那块区域（下次开视频直接套回来）
 ZIMU_ZHUI_SHU = 5               # OCR 去重时记住最近多少条已存文字
 ZISHU_MIAO_BANJIAO = 0.5        # 字幕列表「字/秒」：半角字符算几个字（0.5 = 算半个字）
 ZIMU_BIANJI_ZIHAO_MOREN = 13    # 「字幕编辑」编辑框的字号（px），没存过就用这个
@@ -100,6 +101,7 @@ ZIMU_BIANJI_ZIHAO_ZUIDA = 100    # Ctrl+滚轮 能放到多大
 ZIMU_BIANJI_ZIHAO_PEIZHI = "jiemian/bianji_zihao"   # 记住编辑框字号用的配置项名
 # 编辑框「锁定代码」：锁上之后框里照原样显示整行，全选删除重写时代码不会真丢
 ZIMU_SUODING_PEIZHI = "jiemian/bianji_suoding"
+ZIMU_BUCHONG_PEIZHI = "jiemian/bianji_buchong"   # 字幕编辑框「输入补全」开没开
 ZIMU_SUODING_SE = (232, 176, 75)    # 锁定时编辑框那圈边框的颜色（淡琥珀）
 ZIMU_SUODING_TOUMING = 170          # 那圈边框的透明度（0~255，越小越淡）
 ZIMU_HUANHANG_SE = "#33C33C"    # 编辑框里换行标签 \N 的字色（绿，一眼看出断在哪儿）
@@ -151,6 +153,7 @@ TIQU_YANSE_BIAN_SE = "tiqu/yanse_bian_se"     # ⑨ 取色回写时的描边颜�
 TIQU_YANSE_BIAN_TOU = "tiqu/yanse_bian_tou"   # ⑨ 描边的透明度（0=不透 255=全透）
 TIQU_YANSE_BIAN_KUAN = "tiqu/yanse_bian_kuan"  # ⑨ 取色回写时的描边宽度
 TIQU_YANSE_MUBIAO = "tiqu/yanse_mubiao"       # ⑨ 取的是哪种颜色：wen 文字 / bian 描边
+TIQU_QUYU_BU_ZHEMO = "tiqu/quyu_bu_zhemo"     # ② 「不使用遮罩」：框外不压黑，整幅看得见
 YANSE_BIAN_SE_MOREN = "#FFFFFF"               # 出厂默认描边色：白
 YANSE_BIAN_TOU_MOREN = 0                      # 出厂默认描边透明 = 0（不透明）
 YANSE_BIAN_KUAN_MOREN = 5                     # 出厂默认描边宽度
@@ -352,6 +355,29 @@ def xie_bianji_suoding(kai):
     try:
         q = buju_qsettings()
         q.setValue(ZIMU_SUODING_PEIZHI, bool(kai))
+        q.sync()
+    except Exception:  # noqa
+        pass
+
+
+def du_bianji_buchong():
+    """编辑框「输入补全」开没开；没存过就是开（头一回就给用）"""
+    try:
+        zhi = buju_qsettings().value(ZIMU_BUCHONG_PEIZHI, None)
+    except Exception:  # noqa
+        return True
+    if zhi is None:
+        return True
+    if isinstance(zhi, str):
+        return str(zhi).strip().lower() in ("1", "true", "yes", "on")
+    return bool(zhi)
+
+
+def xie_bianji_buchong(kai):
+    """把「输入补全」的状态记下来"""
+    try:
+        q = buju_qsettings()
+        q.setValue(ZIMU_BUCHONG_PEIZHI, bool(kai))
         q.sync()
     except Exception:  # noqa
         pass
@@ -3003,6 +3029,19 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
         self.setPalette(_se)
         self._gaoliang = _AssGaoliang(self.document())
 
+        # ---- 输入补全：照当前字幕文件里已有的句子 / 短句补 ----
+        self._bc_ci = []            # 候选词（整行正文 + 按标点切开的短句）
+        self._bc_kai = du_bianji_buchong()   # 这个开关开没开（记在 ini 里）
+        self._bc_lb = None          # 候选列表（浮在光标下面那个小窗）
+        self._bc_qian = ""          # 这一次是拿哪个前缀筛出来的
+        self._bc_da = ""            # 最近连着敲的那几个字（输入法上屏的也算）
+        self._bc_biren = False      # 正在把候选填进框里（这时的 textChanged 不算用户打字）
+        self._bc_ji = QtCore.QTimer(self)
+        self._bc_ji.setSingleShot(True)
+        self._bc_ji.setInterval(120)        # 停手 120ms 才去筛，打字中途不闪
+        self._bc_ji.timeout.connect(self._bc_tishi)
+        self.textChanged.connect(self._bc_dong_le)
+
         # Ctrl+滚轮 调字号时，框右上角闪一个小浮标报当前数值，免得瞎调
         self._zihao_ti = QtWidgets.QLabel(self)
         self._zihao_ti.setStyleSheet(_ys_zihao_ti())
@@ -3091,7 +3130,41 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
         \\N）就按 Shift + 回车 —— 落下来的是「\\N + 真换行」，那个 \\N 就摆在
         框里，能圈能删。
         """
+        # 记「刚敲的字」：补全拿它去配候选。输入法上屏走 inputMethodEvent，
+        # 这里只收直接敲进来的字符
+        _wen = event.text()
+        if event.key() in (
+            Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Home, Qt.Key_End
+        ):
+            self._bc_qing_da()          # 光标自己挪了：不再是"连着敲"
+        elif event.key() in (Qt.Key_Backspace, Qt.Key_Delete):
+            self._bc_da = self._bc_da[:-1]
+            self._bc_guan()
+        elif _wen and (len(_wen) > 1 or _wen.isspace() or _wen in self._BC_DUAN):
+            self._bc_qing_da()          # 打了标点 / 空格：上一句算完
+        elif len(_wen) == 1:
+            self._bc_ji_ti(_wen)
+        # 候选列表正开着：这几个键先归它使（否则回车会直接换下一条）
+        if self._bc_zhankai():
+            jian = event.key()
+            if jian in (Qt.Key_Down, Qt.Key_Up):
+                self._bc_yidong(1 if jian == Qt.Key_Down else -1)
+                event.accept()
+                return
+            # 空格 / 回车上屏。Tab 不接（它绑着播放/停止，接了反而不听使唤）；
+            # 中文输入法打空格是它自己的提交键，那种情况下按键压根不会传到这儿
+            if jian in (
+                Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter
+            ):
+                self._bc_shangping()
+                event.accept()
+                return
+            if jian == Qt.Key_Escape:
+                self._bc_guan()
+                event.accept()
+                return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._bc_qing_da()      # 换行 / 换条：重新开始算
             if event.modifiers() & Qt.ShiftModifier:
                 self.textCursor().insertText("\\N\n")
             else:
@@ -3125,8 +3198,194 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
             ze.deleteChar()
         ze.endEditBlock()
 
+    # ---- 输入补全（照这条字幕文件里已有的句子补，像代码补全那样）----
+    # 打到一半停手就在光标下面列几条候选：↑↓ 挑、空格 / 回车上屏、Esc 关掉、
+    # 也能直接点。候选只来自「当前这份字幕里已有的文字」，不是模型瞎编。
+    _BC_DUAN = (
+        " \t\n\u3000，。！？、,.!?;；:：…—～「」『』（）()【】[]{}<>《》"
+        "\"'“”‘’/\\"
+    )
+
+    def shezhi_buchong_ci(self, ci):
+        """换一批补全候选（字幕列表整表变了就换一次）"""
+        men = []
+        you = set()
+        for w in ci or []:
+            w = str(w or "").strip()
+            if len(w) < 2 or len(w) > 60 or w in you:
+                continue
+            you.add(w)
+            men.append(w)
+        self._bc_ci = men
+        if not men:
+            self._bc_guan()
+
+    def shezhi_buchong_kai(self, kai):
+        """「输入补全」开 / 关"""
+        self._bc_kai = bool(kai)
+        if not self._bc_kai:
+            self._bc_guan()
+
+    def buchong_kai(self):
+        return bool(self._bc_kai)
+
+    def _bc_dong_le(self):
+        """框里字变了：等手停下来再筛（IM 打字中途会一直变，不能每次都弹）"""
+        if self._bc_biren:
+            self._bc_biren = False
+            return
+        if not self._bc_kai or not self._bc_ci:
+            self._bc_guan()
+            return
+        self._bc_ji.start()
+
+    def _bc_qianzhui(self):
+        """刚敲的那几个字（最多 12 个）；没在打字就给空串
+
+        光标前那一段不能直接当查询词：接着上一句往下打的时候，前面还有
+        一大串旧字，整段拿去配根本配不上。所以这里记的是「这一路连敲的
+        字」——用户按一下键记一个字、输入法上屏记一串，遇到标点 / 空格 /
+        换行、点鼠标、换条字幕都清零。
+        """
+        return self._bc_da[-12:]
+
+    def _bc_ji_ti(self, wen):
+        """往「刚敲的字」里接一段（超过 12 个掐头）"""
+        wen = str(wen or "")
+        if not wen:
+            return
+        self._bc_da = (self._bc_da + wen)[-12:]
+
+    def _bc_qing_da(self):
+        self._bc_da = ""
+
+    def _bc_tishi(self):
+        """按光标前那段去候选里筛：最多列 8 条"""
+        if not self._bc_kai or not self._bc_ci or not self.hasFocus():
+            self._bc_guan()
+            return
+        qian = self._bc_qianzhui()
+        if not qian:
+            self._bc_guan()
+            return
+        zhi = []
+        # 先挑「以这几个字开头」的，按原字幕顺序（跟原文对得上，好认）
+        # 上限给到 40 条：弹窗只露 8 行，多的用滚轮翻 —— 名字开头往往一大堆
+        # 句子，只挑 8 条的话想找的那句经常排不进去
+        for w in self._bc_ci:
+            if len(zhi) >= 40:
+                break
+            if len(w) > len(qian) and w.startswith(qian):
+                zhi.append(w)
+        # 还有空位：再补「中间含这几个字」的 —— 名字经常串在句子中间，
+        # 例如打「瑠依碳」，想找的却是「其实我喜欢瑠依碳」这种
+        if len(zhi) < 40:
+            for w in self._bc_ci:
+                if len(zhi) >= 40:
+                    break
+                if len(w) <= len(qian) or w in zhi:
+                    continue
+                if qian in w:
+                    zhi.append(w)
+        if not zhi:
+            self._bc_guan()
+            return
+        self._bc_kai_lie(qian, zhi)
+
+    def inputMethodEvent(self, event):
+        """输入法上屏的那一串也记进「刚敲的字」（拼音打出来的中文走这条路）"""
+        try:
+            if event.commitString():
+                wen = str(event.commitString())
+                if any(ch in self._BC_DUAN for ch in wen):
+                    self._bc_qing_da()      # 上屏的是标点 / 空格：上一句算完
+                else:
+                    self._bc_ji_ti(wen)
+                    self._bc_ji.start()     # 上屏以后重新筛一次
+        except Exception:      # noqa
+            pass
+        super().inputMethodEvent(event)
+
+    def mousePressEvent(self, event):
+        """鼠标点到别处：不再是"连着敲"，候选先收起来"""
+        self._bc_qing_da()
+        self._bc_guan()
+        super().mousePressEvent(event)
+
+    def _bc_kai_lie(self, qian, zhi):
+        """把候选列表摆到光标下面（不抢焦点：光标还在框里）"""
+        lb = self._bc_lb
+        if lb is None:
+            lb = QtWidgets.QListWidget(self)
+            lb.setWindowFlags(Qt.ToolTip)
+            lb.setFocusPolicy(Qt.NoFocus)
+            lb.setAttribute(Qt.WA_ShowWithoutActivating, True)
+            lb.setStyleSheet(
+                "QListWidget { background: #232323; color: #E8E8E8;"
+                " border: 1px solid #4A4A4A; font-size: 13px; }"
+                "QListWidget::item { padding: 3px 8px; }"
+                "QListWidget::item:selected { background: #2E6FC4; color: #FFFFFF; }"
+            )
+            lb.itemClicked.connect(lambda _it: self._bc_shangping())
+            self._bc_lb = lb
+        self._bc_qian = qian
+        lb.clear()
+        # 每行前面带序号，方便数着看；原文另存在 UserRole 里，
+        # 上屏时取原文（不然序号也跟着进框）
+        for i, w in enumerate(zhi, 1):
+            xiang = QtWidgets.QListWidgetItem(f"{i}. {w}")
+            xiang.setData(Qt.UserRole, w)
+            lb.addItem(xiang)
+        lb.setCurrentRow(0)
+        lb.setFixedWidth(max(200, min(420, self.viewport().width())))
+        lb.setFixedHeight(min(8, len(zhi)) * 24 + 4)
+        ju = self.cursorRect()
+        dian = self.viewport().mapToGlobal(ju.bottomLeft())
+        lb.move(dian.x(), dian.y() + 4)
+        lb.show()
+
+    def _bc_zhankai(self):
+        return self._bc_lb is not None and self._bc_lb.isVisible()
+
+    def _bc_yidong(self, bu):
+        lb = self._bc_lb
+        if lb is None or lb.count() <= 0:
+            return
+        lb.setCurrentRow((lb.currentRow() + bu) % lb.count())
+
+    def _bc_shangping(self):
+        """把选中的那条填进框（替掉刚打的那段前缀）"""
+        lb = self._bc_lb
+        if lb is None:
+            return
+        it = lb.currentItem()
+        if it is None:
+            return
+        # 列表上那行是「3. 某某话」，真正要填进去的是存在 UserRole 里的原文
+        wen = it.data(Qt.UserRole)
+        if not wen:
+            wen = it.text()
+        qian = self._bc_qian
+        cur = self.textCursor()
+        if qian:
+            cur.movePosition(
+                QtGui.QTextCursor.Left, QtGui.QTextCursor.KeepAnchor, len(qian)
+            )
+        self._bc_biren = True       # 这一下不是用户打字，别再弹回来
+        cur.insertText(wen)
+        self.setTextCursor(cur)
+        self._bc_qing_da()          # 上屏的字不算"刚敲"，接着打从空白算起
+        self._bc_guan()
+
+    def _bc_guan(self):
+        self._bc_ji.stop()
+        self._bc_qian = ""
+        if self._bc_lb is not None and self._bc_lb.isVisible():
+            self._bc_lb.hide()
+
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
+        self._bc_guan()
         self.likai.emit()
 
     # ---- 锁定代码 ----
@@ -3180,6 +3439,8 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
         字）都不摆进框，只摆台词；顺手把这段和整行原文记下来 —— 全选删除重写
         的时候靠它们把代码接回去。
         """
+        self._bc_guan()          # 换了一条字幕：旧的候选列表作废
+        self._bc_qing_da()       # "刚敲的字"也从空白算起
         wen = str(wen or "")
         if self._suoding:
             self._suoding_yuan = wen
@@ -6566,7 +6827,21 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
 
         self.shi_wenben = QtWidgets.QLabel("（没有选中字幕）")
         self.shi_wenben.setObjectName("YsgHint")
-        xia_bu.addWidget(self.shi_wenben)
+        # 「输入补全」开关摆这一行右边：打了字会照字幕文件里已有的句子补
+        self.gou_buchong = QtWidgets.QCheckBox("输入补全")
+        self.gou_buchong.setStyleSheet(_ys_xuanxiang())
+        self.gou_buchong.setToolTip(
+            "打字时按当前这份字幕里已有的句子补全（像代码补全那样）\n"
+            "候选只来自本片字幕：停下来 0.1 秒就在光标下面列几条\n"
+            "↑↓ 挑、空格 / 回车上屏、Esc 关掉，也可以直接点\n"
+            "取消勾选就彻底不弹（状态记在 gongzuotai.ini）"
+        )
+        self.gou_buchong.setChecked(du_bianji_buchong())
+        tou_hang = QtWidgets.QHBoxLayout()
+        tou_hang.setSpacing(6)
+        tou_hang.addWidget(self.shi_wenben, 1)
+        tou_hang.addWidget(self.gou_buchong)
+        xia_bu.addLayout(tou_hang)
 
         # 编辑区上方那排字段（照 AEG 的主工具栏）：改哪一样就往外发哪一样
         self.gongjulan = _ZimuGongjulan()
@@ -6587,9 +6862,22 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         self.gongjulan.shezhi_wenben_kuang(self.kuang)
         xia_bu.addWidget(self.kuang, 1)
 
+        # 输入补全：开关先摆好，候选等整表塞进来时再灌（见 shezhi_zimu）
+        self.kuang.shezhi_buchong_kai(self.gou_buchong.isChecked())
+        self.gou_buchong.toggled.connect(self._buchong_bian_le)
+
         self.addWidget(shang)
         self.addWidget(xia)
         self.setSizes([320, 240])
+
+    def _bc_chi_jian(self):
+        """重建补全候选（正在编辑的那一条不算，免得拿自己补自己）"""
+        try:
+            self.kuang.shezhi_buchong_ci(
+                self._buchong_ci_men(self._xu if self._xu >= 0 else None)
+            )
+        except Exception:      # noqa
+            pass
 
     def shezhi_liebiao_dingge(self, dingge):
         """字幕列表铺到窗口下方时把「标题 + 条数」那行收掉（照 AEG 顶格显示）
@@ -6754,6 +7042,42 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         self._xu = -1
         self._bofang_hang = -1      # 整表重建了，蓝底由下一次刷播放头重涂
         self.shezhi_xuan_zhong(-1 if xuan is None else int(xuan))
+        # 候选池由 shezhi_xuan_zhong 那边重建（会排掉正在编辑的那一条）
+
+    def _buchong_ci_men(self, paichu=None):
+        """整份字幕里能拿来补全的片段：每行正文 + 按标点切开的短句
+
+        paichu = 正在编辑的那一条（不算它，免得"拿自己补自己"补出重复的字）
+        """
+        men = []
+        for i, (_qi, _zhi, wen) in enumerate(self._zimu):
+            if paichu is not None and i == int(paichu):
+                continue
+            chun = _chun_wen(wen)
+            chun = chun.replace("\\N", " ").replace("\\n", " ")
+            chun = " ".join(chun.split())
+            if len(chun) < 2:
+                continue
+            men.append(chun)
+            for duan in re.split(r"[，。！？、,.!?;；:：…—～\s]+", chun):
+                duan = duan.strip("「」『』（）()【】[]<>《》\"'“”‘’ ")
+                if len(duan) >= 2:
+                    men.append(duan)
+        # 去重（同一个名字开头的句子往往重复很多，不去重的话 8 条名额全被
+        # 一模一样的候选占满，真正想找的那条排不进来）
+        chu = []
+        yong = set()
+        for w in men:
+            if w in yong:
+                continue
+            yong.add(w)
+            chu.append(w)
+        return chu
+
+    def _buchong_bian_le(self, kai):
+        """「输入补全」勾了 / 取消了"""
+        self.kuang.shezhi_buchong_kai(bool(kai))
+        xie_bianji_buchong(bool(kai))
 
     def shezhi_bofang_ms(self, ms, gensui=True):
         """播放头到哪一条了：把那一行涂成"正播到"的底色（蓝），跟着滚动
@@ -6880,6 +7204,10 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
                         xiang, QtWidgets.QAbstractItemView.EnsureVisible
                     )
         self._tian_dangqian(xu)
+        # 换到这一条：候选池当场重建一遍（把刚才在上一条里敲进去的句子收进来，
+        # 同时把这一条自己排除掉）。只有换条时才重建，打字过程中不重建 ——
+        # 打到一半候选池跟着变，弹出来的东西会跳。
+        self._bc_chi_jian()
 
     def _tian_dangqian(self, xu, duo=0):
         """把编辑区换成第 xu 条的文字 / 字段（左侧列表的选择不动）
@@ -6947,6 +7275,8 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
             return
         self._zimu[xu] = (qi, zhi, wenben)
         self._xie_hang(xu, qi, zhi, wenben)
+        # 刚敲进去的这句先不急着进候选池：等换到别的条目时一次重建
+        # （打字中途重建候选池，正在弹的那份列表会跟着变）
 
     # ---- 内部 ----
     def _hang_dise(self, hang):
@@ -7155,6 +7485,7 @@ class ShezhiMianban(QtWidgets.QWidget):
     tingzhi_qingqiu = pyqtSignal()
     kuang_xuan_qingqiu = pyqtSignal()   # 请求在工作台的视频画面上框选
     quyu_biangeng = pyqtSignal(object)  # 区域变了 -> 让画面区重画
+    quyu_zhemo_biangeng = pyqtSignal(bool)  # 「不使用遮罩」开关变了 -> 画面跟着不涂黑/涂黑
     huamian_jingzhi = pyqtSignal(bool)  # 「扫描时画面静止」被改了 -> 正在扫描的话马上生效
     yanse_qingqiu = pyqtSignal()        # ⑨ 文字颜色提取：独立跑，不掺和硬字幕提取
     yanse_xuan_qingqiu = pyqtSignal()   # ⑨ 文字颜色提取：只跑时间轴上选中的那几条
@@ -7278,6 +7609,21 @@ class ShezhiMianban(QtWidgets.QWidget):
         self.a_quan_hua.setStyleSheet(_ys_ci_anniu())
         self.a_quan_hua.clicked.connect(self._quan_hua)
         hang.addWidget(self.a_quan_hua)
+        hang.addStretch(1)
+        bu.addLayout(hang)
+        # 框选区域还留着，只是画面上不把框外压黑：想整幅看视频时勾它，
+        # 硬字幕提取 / 四层布局照样按这块区域干活
+        self.gou_bu_zhemo = QtWidgets.QCheckBox("不使用遮罩")
+        self.gou_bu_zhemo.setToolTip(
+            "勾上：框选区域照旧留着（提取、四层布局都按它来），但画面上不再把\n"
+            "框外涂黑，整幅视频都看得见\n"
+            "不勾（默认）：框外压黑，只看得到检测区域那一块"
+        )
+        self.gou_bu_zhemo.setStyleSheet(_ys_xuanxiang())
+        self.gou_bu_zhemo.toggled.connect(self._bu_zhemo_bian_le)
+        hang = QtWidgets.QHBoxLayout()
+        hang.setSpacing(6)
+        hang.addWidget(self.gou_bu_zhemo)
         hang.addStretch(1)
         bu.addLayout(hang)
         self.quyu_wenben = _zici_wenben("区域：全画面")
@@ -8118,6 +8464,9 @@ class ShezhiMianban(QtWidgets.QWidget):
                 TIQU_YANSE_BIAN_KUAN, int(self.yanse_bian_kuan.value())
             )
             pei.setValue(TIQU_YANSE_MUBIAO, self.yanse_mubiao())
+            pei.setValue(
+                TIQU_QUYU_BU_ZHEMO, bool(self.gou_bu_zhemo.isChecked())
+            )
             pei.sync()
         except Exception as cuowu:      # noqa
             logger.warning(f"视频工作台：存提取设置失败 {cuowu}")
@@ -8152,11 +8501,12 @@ class ShezhiMianban(QtWidgets.QWidget):
                self.gou_kuaisu, self.gou_tiaoxiangsi, self.gou_tiaoshi,
                self.gou_shaizhen, self.doudi_zhen, self.yolo_jiance_jiange,
                self.xuan_gensui, self.xuan_saomiao,
-               self.gou_huamian_budong)
+               self.gou_huamian_budong, self.gou_bu_zhemo)
         for w in kao:
             w.blockSignals(True)
         try:
             self.gou_yolo.setChecked(_kai(TIQU_YOLO_KAI, True))
+            self.gou_bu_zhemo.setChecked(_kai(TIQU_QUYU_BU_ZHEMO, False))
             self.zhixin_du.setValue(_shu(TIQU_ZHIXIN, 50, 1, 100))
             leibie = pei.value(TIQU_LEIBIE, None)
             if leibie is not None:
@@ -8231,6 +8581,11 @@ class ShezhiMianban(QtWidgets.QWidget):
             for w in (self.yanse_bian_kuan,):
                 w.blockSignals(False)
 
+        # 上次用的检测区域：先摆好（这会儿没视频，等打开视频再往画面上套）
+        qu = self.quyu_baocun()
+        if qu:
+            self.shezhi_quyu(qu, ji_lishi=False)
+
     def _kuang_xuan(self):
         """在工作台的视频画面上框选检测区域（不弹窗）"""
         if not self.lujing or self.kuan <= 0 or self.gao <= 0:
@@ -8250,14 +8605,53 @@ class ShezhiMianban(QtWidgets.QWidget):
             self.quyu_wenben.setText(f"区域：({x},{y}) {w}x{h}")
             if ji_lishi:
                 self._ji_lishi_quyu(self.quyu)
+            self._cun_quyu_zuihou(self.quyu)
         else:
             self.quyu = None
             self.quyu_wenben.setText("区域：全画面")
+            self._cun_quyu_zuihou(None)
+
+    def _cun_quyu_zuihou(self, qu):
+        """把「这次用的区域」记进 gongzuotai.ini：下次开视频直接套回来
+
+        清空（点「整图」）就把这条擦掉，下次不会又冒出个不该有的框。
+        """
+        try:
+            pei = buju_qsettings()
+            if qu:
+                pei.setValue(QUYU_ZUIHOU_JIAN, self._quyu_yi_wen(qu))
+            else:
+                pei.remove(QUYU_ZUIHOU_JIAN)
+            pei.sync()
+        except Exception as cuowu:      # noqa
+            logger.warning(f"视频工作台：存上次的区域失败 {cuowu}")
+
+    def quyu_baocun(self):
+        """ini 里记着的上次那块区域；没有 / 读不出来给 None"""
+        try:
+            zhi = buju_qsettings().value(QUYU_ZUIHOU_JIAN, None)
+        except Exception:      # noqa
+            return None
+        if zhi is None:
+            return None
+        return self._wen_yi_quyu(zhi)
 
     def _quan_hua(self):
-        self.quyu = None
-        self.quyu_wenben.setText("区域：全画面")
+        # 走 shezhi_quyu：标签、ini 里记的那条一起清掉（下次不会再自动套回来）
+        self.shezhi_quyu(None, ji_lishi=False)
         self.quyu_biangeng.emit(None)
+
+    def bu_yong_zhemo(self):
+        """② 那个「不使用遮罩」勾没勾：勾了 = 画面上不把框外压黑"""
+        return bool(self.gou_bu_zhemo.isChecked())
+
+    def _bu_zhemo_bian_le(self, kai):
+        """「不使用遮罩」被勾上 / 取消了：叫画面重画，顺手存进 ini
+
+        发出去的是「遮罩开不开」：勾了不使用遮罩 -> False（不涂黑）。
+        """
+        self.quyu_zhemo_biangeng.emit(not bool(kai))
+        self._cun_tiqu_shezhi()
 
     # ------------------------------------------------------------------
     # 框选区域的历史（跟模型历史一个路子，存在 gongzuotai.ini 里）

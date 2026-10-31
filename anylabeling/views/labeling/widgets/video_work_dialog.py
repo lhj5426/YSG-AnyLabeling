@@ -147,6 +147,8 @@ JIEMIAN_BILI_JIAN = "jiemian/fenlan_bili2"           # 记住各处拖的分栏�
 JIEMIAN_ZUOYOU_DUO = "jiemian/zuoyou_tuoguo"         # 左右大分栏你自己拖过没有
 JIEMIAN_PUMAN_JIAN = "jiemian/huamian_puman"         # 记住「画面铺满整列」还是「画面在上栏」
 JIEMIAN_SI_CENG_JIAN = "jiemian/si_ceng_bili"        # 记住四层布局里各层拖过的高度
+JIEMIAN_CANG_KUANG = "jiemian/quyu_cang_kuang"       # 记住选区那条虚线框藏没藏
+JIEMIAN_YINLIANG = "jiemian/yinliang"                # 记住音量滑块拉到多少
 JIEMIAN_SUOFANG_JIAN = "jiemian/shijianzhou_suofang"  # 记住时间轴的放大倍数
 JIEMIAN_MEIHANG_GAO = "jiemian/meihang_gao"          # 记住字幕块每行多高
 JIEMIAN_BO_FANGDA = "jiemian/bo_fangda"              # 记住波形振幅放大倍数
@@ -1963,6 +1965,12 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         self._shipin_gao = 0
         self._kuang = []             # 检测框 [(名字, 分数, (x1,y1,x2,y2))] 原始像素
         self._quyu = None            # 检测区域 (x,y,w,h) 原始像素；None = 整图
+        # ② 那个「不使用遮罩」：False（默认）= 框外压黑；True = 只画一圈虚线，
+        # 整幅视频都看得见（区域还留着，提取 / 四层布局照旧按它来）
+        self._quyu_zhemo = True
+        # 画面上那条选区虚线框显不显示（视频右键「隐藏选区框」）：只影响画不画，
+        # 区域本身一直留着
+        self._quyu_kuang_xian = True
         # 只看框选的这一块（四层布局的第 1 层）：(x, y, w, h) 原始像素。
         # 跟 _quyu 不是一回事 —— _quyu 是"框外压暗"，这块是"只显示这一块"，
         # 交给 mpv 的 video-crop 真裁掉，画面放大铺满整个控件。
@@ -2026,6 +2034,20 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         """现在只看的是哪一块（视频原始像素）；看整幅时给 None"""
         return self._kan_qu
 
+    def shezhi_quyu_zhemo(self, kai):
+        """② 「不使用遮罩」：True = 框外不涂黑，整幅视频都看得见（框还画着）"""
+        self._quyu_zhemo = bool(kai)
+        self.update()
+
+    def quyu_kuang_xian(self):
+        """画面上那条选区虚线框现在显不显示"""
+        return self._quyu_kuang_xian
+
+    def shezhi_quyu_kuang_xian(self, kai):
+        """视频右键「隐藏选区框」：不显示虚线框，区域本身一个字都不动"""
+        self._quyu_kuang_xian = bool(kai)
+        self.update()
+
     def shezhi_kan_qu(self, qu):
         """只显示框选的这一块：mpv 真裁掉框外，剩下这块放大铺满控件
 
@@ -2086,6 +2108,8 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         """进框选状态。yong：\"quyu\" 框检测区域 / \"zhemo\" 画字幕遮罩 / \"shiliang\" 画遮盖矢量图"""
         self._zai_kuang_xuan = True
         self._kuang_xuan_yong = yong
+        if yong == "quyu":
+            self._quyu_kuang_xian = True    # 重新框区域:那条框得显出来，不然画完看不见
         self._tuo_qi = None
         self._tuo_dao = None
         self._zai_tuo_quyu = False    # 别让"拖旧框"半路插进来
@@ -2354,6 +2378,9 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         if self._kan_qu:
             # 只看框选区域时，整幅画面就是那个框 —— 再让它能拖着改，
             # 左键点哪儿都会被它抢走，字幕拖不动、遮罩也画不了
+            return None
+        if not self._quyu_kuang_xian:
+            # 虚线框藏起来时不接鼠标：看不见的框不该抢左键
             return None
         ju = self._quyu_kongjian_ju()
         if ju is None:
@@ -3209,23 +3236,30 @@ class HuamianQu(QtWidgets.QOpenGLWidget):
         h = y2 - y1
 
         # 检测区域以外涂黑：只留这一块画面看得见
-        huabi.setPen(Qt.NoPen)
-        huabi.setBrush(QtGui.QColor(0, 0, 0))
-        for kuai in (
-            QtCore.QRectF(
-                mubiao.left(), mubiao.top(), mubiao.width(), y1 - mubiao.top()
-            ),
-            QtCore.QRectF(
-                mubiao.left(), y2, mubiao.width(), bian_xia - y2
-            ),
-            QtCore.QRectF(mubiao.left(), y1, x1 - mubiao.left(), h),
-            QtCore.QRectF(x2, y1, bian_you - x2, h),
-        ):
-            if kuai.width() > 0 and kuai.height() > 0:
-                huabi.drawRect(kuai)
-        huabi.setBrush(Qt.NoBrush)
+        # （② 勾了「不使用遮罩」就不涂，整幅都看得见，只留一圈虚线标着区域在哪）
+        if self._quyu_zhemo:
+            huabi.setPen(Qt.NoPen)
+            huabi.setBrush(QtGui.QColor(0, 0, 0))
+            for kuai in (
+                QtCore.QRectF(
+                    mubiao.left(), mubiao.top(),
+                    mubiao.width(), y1 - mubiao.top()
+                ),
+                QtCore.QRectF(
+                    mubiao.left(), y2, mubiao.width(), bian_xia - y2
+                ),
+                QtCore.QRectF(mubiao.left(), y1, x1 - mubiao.left(), h),
+                QtCore.QRectF(x2, y1, bian_you - x2, h),
+            ):
+                if kuai.width() > 0 and kuai.height() > 0:
+                    huabi.drawRect(kuai)
+            huabi.setBrush(Qt.NoBrush)
 
-        # 再框一圈虚线
+        # 再框一圈虚线（视频右键「隐藏选区框」关掉时就不画；正拖着画框时始终画）
+        if not self._quyu_kuang_xian and not (
+            self._zai_kuang_xuan and self._tuo_qi is not None
+        ):
+            return
         bi_hu = QtGui.QPen(QtGui.QColor(se), 2)
         bi_hu.setStyle(Qt.DashLine)
         huabi.setPen(bi_hu)
@@ -14093,6 +14127,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
         a_si_ceng.setEnabled(
             self._duli_chuang is None and bool(self.huamian.quyu())
         )
+        # 选区那条虚线框：不想一直看见就藏起来（区域本身还留着，提取 / 四层照旧）
+        a_cang_kuang = cai.addAction("隐藏选区框")
+        a_cang_kuang.setCheckable(True)
+        a_cang_kuang.setChecked(not self.huamian.quyu_kuang_xian())
+        a_cang_kuang.setEnabled(
+            self._duli_chuang is None and bool(self.huamian.quyu())
+        )
         cai.addSeparator()
         a_bz = cai.addAction("标准模式（双击画面 = 选中的字幕搬到那儿）")
         a_bz.setCheckable(True)
@@ -14115,6 +14156,14 @@ class VideoWorkDialog(QtWidgets.QDialog):
             # 菜单这会儿还开着（exec_ 的嵌套事件循环里），别在里头搬画面：
             # 等菜单关掉、回到主事件循环再切
             QtCore.QTimer.singleShot(0, self.qiehuan_si_ceng)
+        elif dian_le is a_cang_kuang:
+            # 勾上 = 隐藏选区框（勾选状态是"隐藏"，所以取反给画面）
+            kai = not a_cang_kuang.isChecked()
+            self.huamian.shezhi_quyu_kuang_xian(kai)
+            try:    # 记进 ini：下次开视频还是按这次的选择
+                self._weizhi_peizhi.setValue(JIEMIAN_CANG_KUANG, not kai)
+            except Exception:      # noqa
+                pass
         elif dian_le is a_bz:
             self._qiehuan_shu_biao_mo("biaozhun")
         elif dian_le is a_tf:
@@ -15095,6 +15144,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
 
         # ---- 画面（顶上不留标题栏，直接顶格） ----
         self.huamian = HuamianQu()
+        # 上次把选区那条虚线框藏起来的话，这次接着藏（藏的是显示，区域还在）
+        try:
+            _cang = str(
+                self._weizhi_peizhi.value(JIEMIAN_CANG_KUANG, "") or ""
+            ).strip().lower()
+            if _cang in ("1", "true", "yes", "on"):
+                self.huamian.shezhi_quyu_kuang_xian(False)
+        except Exception:      # noqa
+            pass
         self.huamian.shezhi_mpv(self.mpv)      # 视频由 mpv 渲染进这块画布
         # mpv 每真正画出一帧，播放头和字幕才一起跟到那一帧；这样时间轴不会
         # 按 mpv 的时钟先走，而画面还停在上一帧。
@@ -15252,7 +15310,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
         di_bu.addWidget(self.a_jingyin)
         self.yinliang_tiao = QtWidgets.QSlider(Qt.Horizontal)
         self.yinliang_tiao.setRange(0, 100)
-        self.yinliang_tiao.setValue(0 if JINGYIN else MO_REN_YINLIANG)
+        self.yinliang_tiao.setValue(0 if JINGYIN else self._du_yinliang())
         self.yinliang_tiao.setFixedWidth(90)
         self.yinliang_tiao.setStyleSheet(_ys_huadong_tiao())
         self.yinliang_tiao.valueChanged.connect(self._qiehuan_yinliang)
@@ -15312,6 +15370,16 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shezhi_mianban.tingzhi_qingqiu.connect(self._tingzhi_yunsuan)
         self.shezhi_mianban.kuang_xuan_qingqiu.connect(self._qiehuan_kuang_xuan)
         self.shezhi_mianban.quyu_biangeng.connect(self._shoudao_quyu_bian)
+        # ②「不使用遮罩」：勾上 = 画面不把框外压黑（区域照旧留着）
+        self.shezhi_mianban.quyu_zhemo_biangeng.connect(
+            self.huamian.shezhi_quyu_zhemo
+        )
+        try:
+            self.huamian.shezhi_quyu_zhemo(
+                not self.shezhi_mianban.bu_yong_zhemo()
+            )
+        except Exception:      # noqa
+            pass
         self.shezhi_mianban.huamian_jingzhi.connect(
             self._shoudao_huamian_jingzhi
         )
@@ -15394,6 +15462,40 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.huamian.shezhi_quyu(quyu)
         if self._si_ceng_kai:
             self.huamian.shezhi_kan_qu(quyu)
+
+    def _huifu_quyu(self):
+        """开视频后把上次用的检测区域套回面板和画面（尺寸对不上就当没有）
+
+        读的是 ini 里记的那一块，不是面板上那份 —— 打开视频时面板的
+        shezhi_video 会先把区域清成"全画面"（它以为换片子了），那份已经没了。
+        """
+        try:
+            qu = self.shezhi_mianban.quyu_baocun()
+        except Exception as cuowu:      # noqa
+            logger.warning(f"视频工作台：读上次的检测区域失败 {cuowu}")
+            return
+        if not qu:
+            return
+        vw = int(self.zhen_kuan or 0)
+        vh = int(self.zhen_gao or 0)
+        if vw <= 0 or vh <= 0:
+            return
+        try:
+            x, y, w, h = (int(v) for v in qu)
+        except (TypeError, ValueError):
+            return
+        if x < 0 or y < 0 or w < 8 or h < 8 or x + w > vw or y + h > vh:
+            # 换了一部分辨率不一样的片子：老区域放不下，这次先当没有
+            # （ini 里那条不动，等下次开原来那部片子还能接着用）
+            logger.info(
+                f"视频工作台：上次的区域 ({x},{y}) {w}x{h} 放不进 {vw}x{vh}，不套用"
+            )
+            return
+        self.shezhi_mianban.shezhi_quyu((x, y, w, h), ji_lishi=False)
+        self.huamian.shezhi_quyu((x, y, w, h))
+        self.shezhi_mianban.zhuangtai_shezhi(
+            f"沿用上次的检测区域 ({x},{y}) {w}x{h}"
+        )
 
     def _jian_shijianzhou_mianban(self):
         kuang = QtWidgets.QFrame()
@@ -15524,12 +15626,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
         cap.release()
         # 让取帧线程按画面区的实际显示尺寸缩放，主线程就不必每帧做大图缩放
         self.huamian.shezhi_shipin_chicun(self.zhen_kuan, self.zhen_gao)
-        # 换视频了：退出框选、清掉上一部片子的检测区域
+        # 换视频了：退出框选、先把画面上的旧区域清掉
         self.huamian.tingzhi_kuang_xuan()
         self.huamian.shezhi_quyu(None)
-        # 四层布局还开着的话：区域没了，第 1 层先回到整幅（布局不动）
-        if self._si_ceng_kai:
-            self.huamian.shezhi_kan_qu(None)
+        # 上次用的那块检测区域等 shezhi_video 之后才套 —— 它会把区域清成"全画面"
         self.shezhi_mianban.kuang_xuan_zhuangtai(False)
 
         if self.fps <= 0:
@@ -15576,6 +15676,14 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.shezhi_mianban.shezhi_video(
             lujing, self.fps, self.zhen_kuan, self.zhen_gao, self.zong_zhen
         )
+        # 面板"换片子"刚把区域清成全画面（它不知道我们记着上次那块）：
+        # 等它清完再把上次的区域套回面板和画面。放不进这部片子就当没有。
+        # 这一步必须排在 shezhi_video 后面 —— 排在前面会被它清掉，
+        # 重启后右键菜单里「四层布局 / 隐藏选区框」就一直是灰的。
+        self._huifu_quyu()
+        # 四层布局还开着：跟着新区域重新裁（没区域就回到整幅）
+        if self._si_ceng_kai:
+            self.huamian.shezhi_kan_qu(self.huamian.quyu())
         self.zimu_mianban.qingkong()
         self._chexiao_qingkong()
         self.zimu_mianban.shezhi_shichang(self.shichang_ms)
@@ -16302,13 +16410,33 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if self.yinpin.volume() > 0:
             self.yinliang_tiao.setValue(0)
         elif self.yinliang_tiao.value() == 0:
-            self.yinliang_tiao.setValue(MO_REN_YINLIANG)
+            # 取消静音：回到上次拉到的那个量（不是死板的 70）
+            self.yinliang_tiao.setValue(self._du_yinliang())
         self._shuaxin_jingyin_tubiao()
 
+    def _du_yinliang(self):
+        """上次拉到多少（0-100）：没记过 / 读不出来就给默认值"""
+        pei = getattr(self, "_weizhi_peizhi", None)
+        if pei is None:
+            return MO_REN_YINLIANG
+        try:
+            zhi = int(pei.value(JIEMIAN_YINLIANG, MO_REN_YINLIANG))
+        except (TypeError, ValueError):
+            return MO_REN_YINLIANG
+        return max(1, min(100, zhi))
+
     def _qiehuan_yinliang(self, zhi):
+        zhi = max(0, min(100, int(zhi)))
         if self.yinpin is not None:
-            self.yinpin.setVolume(max(0, min(100, int(zhi))))
+            self.yinpin.setVolume(zhi)
         self._shuaxin_jingyin_tubiao()
+        # 记住音量：下次开软件还是这个。静音（0）不记 —— 那是按了静音键的
+        # 临时状态，记下来下次一开就没声，容易以为坏了
+        if zhi > 0:
+            try:
+                self._weizhi_peizhi.setValue(JIEMIAN_YINLIANG, zhi)
+            except Exception:      # noqa
+                pass
 
     def _shuaxin_jingyin_tubiao(self):
         jing = self.yinliang_tiao.value() == 0
@@ -21323,6 +21451,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._bolanghao_gouzi = None
         self._zidong_jishi.stop()
         self._cun_jiemian_buju()          # 记下窗口位置 / 标签页 / 分栏 / 缩放
+        try:                              # 当场落盘：音量这类改动不能等进程退出
+            self._weizhi_peizhi.sync()
+        except Exception:      # noqa
+            pass
         self._huanyuan_zhujiemian_kuangjie()
         self._guanbi_video()
         # 先松开 mpv 的渲染上下文，再把内核整个关掉（顺序反了会崩）
