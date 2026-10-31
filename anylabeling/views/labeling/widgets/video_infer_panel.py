@@ -454,6 +454,11 @@ def _zidonghua_mo_ren():
         # {\fnGen Jyuu Gothic Monospace Bold}、右边写 {\r}
         "kuohao_zuo": "「",
         "kuohao_you": "」",
+        # 套在哪儿：zhengwen = 正文开头（开头的标签块原样留在前面）
+        #           hangtou  = 行最开头（套的东西排在标签块**前面**）
+        # 行首有渐变/发光那串代码时，套的 {\fn..}「{\r} 里的 \r 会把它重置掉，
+        # 这时候就得用 hangtou，让 \r 先重置、标签块后生效
+        "kuohao_weizhi": "zhengwen",
         # 打字机（逐字淡入）的参数：跟 AEG 那个 Lua 脚本问的一样
         "daziji": {
             "fanwei": "zixuan",     # zixuan = 只作用于选中的行 / quanbu = 全部行
@@ -518,6 +523,13 @@ def du_zidonghua_peizhi():
             "paichu_fuhao": _chai_yi_hang(pei.value("zidonghua/paichu_fuhao", None), mo["paichu_fuhao"]),
             "kuohao_zuo": str(pei.value("zidonghua/kuohao_zuo", mo["kuohao_zuo"]) or ""),
             "kuohao_you": str(pei.value("zidonghua/kuohao_you", mo["kuohao_you"]) or ""),
+            "kuohao_weizhi": (
+                "hangtou"
+                if str(pei.value(
+                    "zidonghua/kuohao_weizhi", mo["kuohao_weizhi"]
+                )) == "hangtou"
+                else "zhengwen"
+            ),
             "daziji": _du_daziji(pei, mo["daziji"]),
         }
     except Exception:  # noqa
@@ -544,6 +556,10 @@ def xie_zidonghua_peizhi(pei):
         )
         q.setValue("zidonghua/kuohao_zuo", str(pei.get("kuohao_zuo") or ""))
         q.setValue("zidonghua/kuohao_you", str(pei.get("kuohao_you") or ""))
+        q.setValue(
+            "zidonghua/kuohao_weizhi",
+            "hangtou" if pei.get("kuohao_weizhi") == "hangtou" else "zhengwen",
+        )
         zi = dict((pei.get("daziji") or _zidonghua_mo_ren()["daziji"]))
         q.setValue("zidonghua/daziji_fanwei", str(zi.get("fanwei") or "zixuan"))
         q.setValue("zidonghua/daziji_kongge", "1" if zi.get("kongge", True) else "0")
@@ -2511,6 +2527,10 @@ class ZimuMianban(QtWidgets.QWidget):
         bu.addWidget(self.liebiao, 1)
 
         self._zimu = []
+        # 数据版本号：字幕动过一次就 +1。播放时外面每帧都要整份字幕，
+        # 靠它判断要不要重新拷（版本没变就直接用上一份，几百条时每帧全表
+        # 拷贝白等）
+        self._ban = 0
         # 每条的字段（样式 / 说话人 / 层 / 边距 / 特效 / 注释）：键是那条文字时间
         # 三元组。整份列表换来换去（排序 / 删除 / 合并）时按内容跟着搬，见 _fu_ban。
         self._fu = {}
@@ -2529,6 +2549,7 @@ class ZimuMianban(QtWidgets.QWidget):
 
     def qingkong(self):
         self._zimu = []
+        self._ban += 1
         self._fu = {}
         self.liebiao.clear()
         self.zhou.qingkong()
@@ -2545,6 +2566,7 @@ class ZimuMianban(QtWidgets.QWidget):
         tiao = (int(qi_ms), int(zhi_ms), str(wenben or ""))
         wei = zimu_charu_weizhi(self._zimu, tiao[0], tiao[1])
         self._zimu.insert(wei, tiao)
+        self._ban += 1
         self._shuaxin()
         if jiu is not None:
             try:
@@ -2553,15 +2575,22 @@ class ZimuMianban(QtWidgets.QWidget):
                 pass
         return wei
 
-    def charu_zimu(self, wei, qi_ms, zhi_ms, wenben):
+    def charu_zimu(self, wei, qi_ms, zhi_ms, wenben, shuaxin=True):
         """按指定行号插一条（遮盖矢量图要插在它盖的那条前面 —— 同层靠先后压住）
 
         跟 tianjia_zimu 一个做法，只是位置不由时间算，是外面指定的。
+        shuaxin=False：只动数据、不重建左侧列表。批量插（几百条一起设发光）
+        时每条都重建一次整表，窗口会直接卡死；批量收尾时外面统一刷一次。
         """
         wei = max(0, min(int(wei), len(self._zimu)))
+        if not shuaxin:
+            self._zimu.insert(wei, (int(qi_ms), int(zhi_ms), str(wenben or "")))
+            self._ban += 1
+            return wei
         hang = self.liebiao.currentRow()
         jiu = self._zimu[hang] if 0 <= hang < len(self._zimu) else None
         self._zimu.insert(wei, (int(qi_ms), int(zhi_ms), str(wenben or "")))
+        self._ban += 1
         self._shuaxin()
         if jiu is not None:
             try:
@@ -2574,10 +2603,15 @@ class ZimuMianban(QtWidgets.QWidget):
         xin = [tuple(x) for x in (zimu or [])]
         self._fu_ban(xin)
         self._zimu = xin
+        self._ban += 1
         self._shuaxin()
 
     def zimu_shu(self):
         return len(self._zimu)
+
+    def zimu_ban(self):
+        """字幕数据版本号（动过一次 +1）：外面缓存整份字幕时靠它判断要不要重拷"""
+        return self._ban
 
     def zimu_liebiao(self):
         """整份字幕（外面拿去做同步用）"""
@@ -2619,10 +2653,14 @@ class ZimuMianban(QtWidgets.QWidget):
         self._fu_ban_dan(jiu, self._zimu[xu])
         self._shuaxin()
 
-    def gai_zimu_wenben(self, xu, wenben):
+    def gai_zimu_wenben(self, xu, wenben, hua=True):
         """只改文字，不重建列表
 
         字幕编辑区每敲一个字都走这儿，重建整个列表太费（几十上百条会卡）。
+        hua=False：只改数据（文字 + 字段跟着键走），不碰列表项和小时间轴 ——
+        批量改（几百条一起设发光）时每条都去 setText / setToolTip 一遍，收尾
+        反正要整表重建，纯白等；而且批量时中间插过条，列表项跟下标已经错位，
+        逐条刷反而刷错行。最后外面统一刷一次（shezhi_zimu）就好。
         """
         xu = int(xu)
         if not (0 <= xu < len(self._zimu)):
@@ -2633,7 +2671,10 @@ class ZimuMianban(QtWidgets.QWidget):
             return
         lao = self._zimu[xu]
         self._zimu[xu] = (qi, zhi, wenben)
+        self._ban += 1
         self._fu_ban_dan(lao, self._zimu[xu])
+        if not hua:
+            return
         xiang = self.liebiao.item(xu)
         if xiang is not None:
             xiang.setText(f"[{_shi_jian_wenben(qi)}]  {wenben}")
@@ -3593,6 +3634,7 @@ class _ZimuGongjulan(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._tian = False      # 正往里填值：这会儿控件自己发的信号不算用户改
+        self._shuo_yifa = ""    # 说话人上次发出去的值（同一次改动别发两遍，见 _shuo_gaile）
         self._zi_anniu = {}
         self._yanse_anniu = {}
         self._qi_ms = 0
@@ -3660,13 +3702,25 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         y1.addWidget(self.an_yang)
 
         self.xia_shuo = QtWidgets.QComboBox()
+        # 照 AEG 的 actor 框：能下拉选，也能直接打字（Ctrl+C 复制、右键菜单）
+        self.xia_shuo.setEditable(True)
         # 跟样式下拉一样按份数伸缩（照 AEG 的 actor_box，那份也是 2）
         self.xia_shuo.setMinimumWidth(100)
         self.xia_shuo.setSizeAdjustPolicy(
             QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
         )
         self.xia_shuo.setMinimumContentsLength(4)
-        self.xia_shuo.setToolTip("作为标记备注用的")
+        self.xia_shuo.setToolTip("这一行的说话人：下拉挑已有的，也能直接打一个新名字")
+        # 弹出列表往"大而长"上做：跟样式下拉一个待遇
+        bang = self.xia_shuo.view()
+        bang.setMinimumWidth(240)
+        bang.setStyleSheet(
+            "QAbstractItemView::item { min-height: 26px; padding-left: 4px; }"
+        )
+        self.xia_shuo.setMaxVisibleItems(20)
+        # 焦点离开时兜一次"打完了"（editingFinished 在只按上下键换项、没动字
+        # 的时候不一定发）；放行不拦，见 eventFilter
+        self.xia_shuo.lineEdit().installEventFilter(self)
         y1.addWidget(self.xia_shuo, 2)
 
         # 最长一行字数：我们没有特效框，它就直接跟在说话人后面，也拿框装起来
@@ -3830,9 +3884,11 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         self.xia_yang.currentTextChanged.connect(
             lambda ming: self._fa("yang", str(ming or "").strip())
         )
-        self.xia_shuo.currentTextChanged.connect(
-            lambda ming: self._fa("shuo", str(ming or "").strip())
-        )
+        # 说话人：下拉挑中 / 在框里打完（回车、焦点离开）才算改完，见 _shuo_gaile。
+        # 不能一敲字就发 —— 每发一次外面就重写一遍字幕文件，逐字发会卡，而且
+        # 候选表重建会把正打着的字清掉、光标蹦到末尾
+        self.xia_shuo.activated.connect(self._shuo_gaile)
+        self.xia_shuo.lineEdit().editingFinished.connect(self._shuo_gaile)
         self.an_yang.clicked.connect(lambda: self._fa("bianji", "yang"))
         self.an_xiayihang.clicked.connect(lambda: self._fa("xiayihang", True))
         self.shuzi_ceng.valueChanged.connect(lambda v: self._fa("ceng", int(v)))
@@ -3922,11 +3978,29 @@ class _ZimuGongjulan(QtWidgets.QWidget):
             return
         self.gongju_gaile.emit(jian, zhi)
 
+    def _shuo_gaile(self):
+        """说话人改完了（下拉挑的 / 打完了）：发给外面
+
+        去重：同一次改动可能从两条路进来（下拉挑中 + 焦点离开，或者
+        editingFinished + 焦点离开），值没变就不再发。
+        """
+        if self._tian:
+            return
+        ming = str(self.xia_shuo.currentText() or "").strip()
+        if ming == self._shuo_yifa:
+            return
+        self._shuo_yifa = ming
+        self._fa("shuo", ming)
+
     def eventFilter(self, duixiang, shijian):
         """样式下拉上滚轮：往上滚一格 = 上一个样式，往下滚 = 下一个
 
         换了之后走的是 currentTextChanged 那条老路，跟鼠标点选完全一样。
         事件吃掉，别让滚轮冒出去把外面的列表 / 时间轴滚走。
+
+        说话人框（能打字那个）：焦点一离开就算"打完了"。照旧放行 ——
+        LineEdit 自己的 focusOutEvent 还得跑，它可能也会发一次
+        editingFinished，_shuo_gaile 里去重，不会发两遍。
         """
         if duixiang is self.xia_yang and shijian.type() == QtCore.QEvent.Wheel:
             bu = shijian.angleDelta().y()
@@ -3935,6 +4009,9 @@ class _ZimuGongjulan(QtWidgets.QWidget):
                 xin = self.xia_yang.currentIndex() + (-1 if bu > 0 else 1)
                 self.xia_yang.setCurrentIndex(max(0, min(ge - 1, xin)))
             return True
+        if duixiang is self.xia_shuo.lineEdit():
+            if shijian.type() == QtCore.QEvent.FocusOut:
+                self._shuo_gaile()
         return super().eventFilter(duixiang, shijian)
 
     def _kaishi_wangou(self):
@@ -4189,13 +4266,27 @@ class _ZimuGongjulan(QtWidgets.QWidget):
         self._tian = False
 
     def shezhi_shuo_ming(self, ming_liebiao):
-        """说话人下拉的候选"""
-        jiu = self.xia_shuo.currentText()
+        """说话人下拉的候选
+
+        ming_liebiao 是宿主给的那份（打开字幕里出现过的说话人）；手打进来、
+        候选表里还没有的名字接着留 —— 宿主那份是打开时认的，不会把刚打的
+        收进去，一重建就没了，下次想选还得重打。
+        """
+        jiu = str(self.xia_shuo.currentText() or "")
+        bao = [
+            str(self.xia_shuo.itemText(i) or "")
+            for i in range(self.xia_shuo.count())
+        ]
+        xin = [str(x) for x in (ming_liebiao or [])]
+        for zi in bao + ([jiu] if jiu else []):
+            if zi and zi not in xin:
+                xin.append(zi)
         self._tian = True
         self.xia_shuo.clear()
-        self.xia_shuo.addItems([""] + [str(x) for x in (ming_liebiao or [])])
+        self.xia_shuo.addItems([""] + xin)
         if jiu:
             self.xia_shuo.setCurrentText(jiu)
+        self._shuo_yifa = jiu.strip()
         self._tian = False
 
     def shezhi_gongju(self, fu, gs=None, wenben=None):
@@ -4224,6 +4315,7 @@ class _ZimuGongjulan(QtWidgets.QWidget):
                 return
             self._tian_ming(self.xia_yang, fu.get("yang"), "Default")
             self._tian_ming(self.xia_shuo, fu.get("shuo"), "")
+            self._shuo_yifa = str(fu.get("shuo") or "").strip()
             self.gou_zhushi.setChecked(bool(fu.get("zhushi")))
             self.lian_zishu.setText(str(_zuiduo_zishu(wenben)))
             self.shuzi_ceng.setValue(int(fu.get("ceng") or 0))
@@ -4855,6 +4947,24 @@ class KuohaoPaichuDialog(QtWidgets.QDialog):
         zhu.setStyleSheet(_ys_biao_ti())
         wai.addWidget(zhu)
 
+        # 套在哪儿：行首要是已经有渐变 / 发光那串代码，插在它们后面会被串里的
+        # \r 重置掉（发光就没了），这时候得选「行最开头」，让 \r 先重置、
+        # 后面那串标签再生效
+        wei = QtWidgets.QHBoxLayout()
+        wei.setSpacing(6)
+        wei.addWidget(QtWidgets.QLabel("套在哪儿："))
+        self.wei_zhengwen = QtWidgets.QRadioButton("正文开头（已有标签块之后）")
+        self.wei_hangtou = QtWidgets.QRadioButton("行最开头（已有标签块之前）")
+        dang = str((pei or {}).get("kuohao_weizhi") or "zhengwen")
+        self.wei_hangtou.setChecked(dang == "hangtou")
+        self.wei_zhengwen.setChecked(dang != "hangtou")
+        zi_qun = QtWidgets.QButtonGroup(self)
+        for x in (self.wei_zhengwen, self.wei_hangtou):
+            zi_qun.addButton(x)
+            wei.addWidget(x)
+        wei.addStretch(1)
+        wai.addLayout(wei)
+
         wang = QtWidgets.QGridLayout()
         wang.setHorizontalSpacing(6)
         wang.setVerticalSpacing(3)
@@ -4916,6 +5026,9 @@ class KuohaoPaichuDialog(QtWidgets.QDialog):
             ],
             "kuohao_zuo": self.shuru_zuo.text(),
             "kuohao_you": self.shuru_you.text(),
+            "kuohao_weizhi": (
+                "hangtou" if self.wei_hangtou.isChecked() else "zhengwen"
+            ),
         }
 
 
@@ -7033,10 +7146,25 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
             fu["shuo"] = str(fu.get("shuo") or "")
             self._fujia.append(fu)
         self.biao.blockSignals(True)
+        # 建表期间把视图刷新也关掉：1300 行 × 7 列近一万个 item，每 setItem
+        # 都让视图重算一遍布局/重绘，整表建完要等好几秒（界面直接无响应）。
+        # 关掉之后只在最后开闸时统一刷一次。
+        self.biao.setUpdatesEnabled(False)
         self.biao.clearContents()
         self.biao.setRowCount(len(self._zimu))
         for i, (qi, zhi, wenben) in enumerate(self._zimu):
-            self._xie_hang(i, qi, zhi, wenben)
+            # she_di=False：新格子本来就没底色，普通行的空刷子不设（省 1300×6
+            # 次 setBackground）；注释行的橘底在下面单独补，不丢
+            self._xie_hang(i, qi, zhi, wenben, she_di=False)
+        # 注释行的橘底单独补一遍：只有注释行设，普通行仍是空刷子（不设）
+        for i, fu in enumerate(self._fujia):
+            if fu.get("zhushi") and i != self._bofang_hang:
+                di = self._hang_dise(i)
+                for lie in range(1, self.biao.columnCount()):
+                    xiang = self.biao.item(i, lie)
+                    if xiang is not None:
+                        xiang.setBackground(di)
+        self.biao.setUpdatesEnabled(True)
         self.biao.blockSignals(False)
         self.shu_wenben.setText(f"{len(self._zimu)} 条")
         self._xu = -1
@@ -7183,8 +7311,14 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         qi, zhi, wenben = self._zimu[xu]
         self._xie_hang(xu, qi, zhi, wenben)
 
-    def shezhi_xuan_zhong(self, xu):
-        """选中第几条：列表跟着选，编辑区换成它的文字"""
+    def shezhi_xuan_zhong(self, xu, chongjian=True):
+        """选中第几条：列表跟着选，编辑区换成它的文字
+
+        chongjian=False：不重建补全候选。播放中播放头选中每跨一条字幕都会
+        走到这儿，而重建一次候选要把整份字幕逐行去标签、拆句、去重（几百行
+        时一次几十毫秒）—— 播放时用户不会去点候选，跳过它，暂停 / 手动点
+        选的时候照旧重建（那时 chongjian 是默认的 True）。
+        """
         xu = int(xu)
         if xu < 0 or xu >= len(self._zimu):
             xu = -1
@@ -7207,6 +7341,14 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
         # 换到这一条：候选池当场重建一遍（把刚才在上一条里敲进去的句子收进来，
         # 同时把这一条自己排除掉）。只有换条时才重建，打字过程中不重建 ——
         # 打到一半候选池跟着变，弹出来的东西会跳。
+        # 一条都没选上（载入整份字幕 / 清空选择）时不建：没有当前条，补全根本
+        # 弹不出来，而 1300 多条时建一次要把整份字幕逐行去标签、拆句、去重，
+        # 白等几百毫秒（用户随后点中任何一条都会照常重建，xu >= 0 那条路）
+        if chongjian and xu >= 0:
+            self._bc_chi_jian()
+
+    def chong_jian_houxuan(self):
+        """补一次补全候选（播放暂停后外面喊这个：播放中跳过了重建）"""
         self._bc_chi_jian()
 
     def _tian_dangqian(self, xu, duo=0):
@@ -7286,8 +7428,13 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
             return QtGui.QBrush(QtGui.QColor(YANSE_ZHUSHI_HANG))
         return QtGui.QBrush()
 
-    def _xie_hang(self, i, qi, zhi, wenben):
-        """把第 i 行那几格填上（格子还没有就新建）"""
+    def _xie_hang(self, i, qi, zhi, wenben, she_di=True):
+        """把第 i 行那几格填上（格子还没有就新建）
+
+        she_di=False：不碰底色。建新表时用（格子全是新的，本来就没底色，
+        普通行再设一遍空刷子是 1300 行 × 6 列白设，建表时纯等）；改字段后
+        重刷的老路子照旧 True（那儿要靠它把注释橘底清掉）。
+        """
         fu = self._fujia[i] if i < len(self._fujia) else {}
         yang = str(fu.get("yang") or "Default")
         shuo = str(fu.get("shuo") or "")
@@ -7332,9 +7479,9 @@ class ZimuBianjiMianban(QtWidgets.QSplitter):
                 xiang.setText(t)
         # 注释行整行涂暗一档，一眼看出哪几条是藏起来的
         # （正在播的那一行归 shezhi_bofang_ms 管，别抢它的蓝底）
-        if i != self._bofang_hang:
+        # 从第 1 列起：第 0 列是序号列，它有自己那套黑底白字，别覆盖掉
+        if she_di and i != self._bofang_hang:
             di = self._hang_dise(i)
-            # 从第 1 列起：第 0 列是序号列，它有自己那套黑底白字，别覆盖掉
             for lie in range(1, self.biao.columnCount()):
                 xiang = self.biao.item(i, lie)
                 if xiang is not None:

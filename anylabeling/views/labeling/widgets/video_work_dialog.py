@@ -441,7 +441,6 @@ def _yangshi_quanju():
     }}
     QComboBox:focus {{
         border: 1px solid {c['zhuse']};
-        background-color: {c['mian_hover']};
     }}
     QLineEdit {{
         background-color: {c['beijing2']};
@@ -3744,6 +3743,22 @@ def _jia_biaoqian(wen, biao):
     return "{" + biao + "}" + wen
 
 
+def _qu_biaoqian_li(wen, *zhengs):
+    """只从行首那对花括号里摘掉匹配的标签
+
+    不能直接对整行做 re.sub：行里还有 {\bord0}某几个字{\bord5} 这种分段写法，
+    全局替换会把人家自己写的描边一起抹了。行首那个块是工作台自己拼的，只动它。
+    """
+    s = str(wen or "")
+    pi = re.match(r"^\{([^{}]*)\}", s)
+    if not pi:
+        return s
+    nei = pi.group(1)
+    for zheng in zhengs:
+        nei = re.sub(zheng, "", nei)
+    return "{" + nei + "}" + s[pi.end():]
+
+
 def _wei_yiduan(wen, xuan, qian, hou):
     """在选中的那一段两头插标签：头上插 qian，尾巴插 hou
 
@@ -6478,6 +6493,19 @@ def _hua_ziti(gs, bi):
 _ZI_LU_JI = {}      # 一段字在原点画出来的路径（同样的字 / 字体 / 倍数只建一次）
 
 
+def _lu_jian(ziti, wen, ming, fangda):
+    """一段字「画出来长什么样」的指纹：字 + 字体 + 放大倍数
+
+    只说字本身、不含位置 —— 字幕上下挪一下、时间轴拖来拖去，缓存照样命中。
+    下标 8 是竖排标志，_ziyuan_lu 里要看它决定走哪条路。
+    """
+    return (
+        str(wen), ziti.family(), ziti.pixelSize(), ziti.bold(), ziti.italic(),
+        ziti.underline(), ziti.strikeOut(), round(ziti.letterSpacing(), 3),
+        _shi_shu(str(ming or "").strip()), round(float(fangda), 4),
+    )
+
+
 def _ziyuan_lu(ziti, wen, ming, fangda):
     """一段字在原点画出来的路径
 
@@ -6485,11 +6513,7 @@ def _ziyuan_lu(ziti, wen, ming, fangda):
     这儿按「字 + 字体 + 放大倍数」缓存路径，用的时候再 translate 到位置上。
     竖排（@字体那种）也走同一条路，只是 0,0 起排。
     """
-    jian = (
-        str(wen), ziti.family(), ziti.pixelSize(), ziti.bold(), ziti.italic(),
-        ziti.underline(), ziti.strikeOut(), round(ziti.letterSpacing(), 3),
-        _shi_shu(str(ming or "").strip()), round(float(fangda), 4),
-    )
+    jian = _lu_jian(ziti, wen, ming, fangda)
     jiu = _ZI_LU_JI.get(jian)
     if jiu is not None:
         return jiu
@@ -6514,12 +6538,7 @@ def _wai_lu(ziti, wen, ming, fangda, bord):
     fill 的这块就是 libass 的 \\bord 该有的样子：字形往外扩 bord 像素，字肚子里
     一点都不占。路径布尔运算很贵，所以按「字 + 字体 + 放大倍数 + 描边宽度」存一份。
     """
-    jian = (
-        str(wen), ziti.family(), ziti.pixelSize(), ziti.bold(), ziti.italic(),
-        ziti.underline(), ziti.strikeOut(), round(ziti.letterSpacing(), 3),
-        _shi_shu(str(ming or "").strip()), round(float(fangda), 4),
-        round(float(bord), 2),
-    )
+    jian = _lu_jian(ziti, wen, ming, fangda) + (round(float(bord), 2),)
     jiu = _WAI_LU_JI.get(jian)
     if jiu is not None:
         return jiu
@@ -6528,11 +6547,147 @@ def _wai_lu(ziti, wen, ming, fangda, bord):
     cuo.setJoinStyle(Qt.RoundJoin)
     cuo.setCapStyle(Qt.RoundCap)
     lu = _ziyuan_lu(ziti, wen, ming, fangda)
-    wai = cuo.createStroke(lu).subtracted(lu)
+    if len(str(wen)) > 6:
+        # 一大串字整行做 subtracted，顶点数一多就是指数级往上翻。退一步只描边
+        # 不掏空：字身半透明时内圈会白一点，但绝不会把界面挂死
+        wai = cuo.createStroke(lu)
+    else:
+        wai = cuo.createStroke(lu).subtracted(lu)
     if len(_WAI_LU_JI) > 600:
         _WAI_LU_JI.clear()
     _WAI_LU_JI[jian] = wai
     return wai
+
+
+# ---- 外发光（\1fg(宽, 模糊, 浓度)）---------------------------------------------
+#
+# 以前的画法：在 _hua_ass_tiao 里把这一段复制一份「\bord 宽 + \blur 大 + 填充
+# 全透明」塞回绘制队列，让它跟普通 \blur 段一起走位图那条路。可是填充全透明
+# 正好会掉进 _wai_lu 分支 —— 那是对**整行**字形路径做
+#     QPainterPathStroker(宽度 = bord × 2 × 16).createStroke().subtracted(原路径)
+# 字数一多，顶点数一涨，布尔运算是指数级往上翻的：一个字（标点）几毫秒，
+# 一整行二十几个字能跑几十秒，主线程卡在那儿，外面看到的就是「画面卡死、
+# Python 假死」。再加上数据里还另插了一条光晕 Dialogue，同一份发光被算两遍。
+#
+# 现在独立的画法：
+#   1. 发光只要字**外面**那圈白。里面那半圈反正会被本体（后画）盖住，
+#      所以完全不需要 subtracted()，直接 strokePath 描一圈就够 —— 最贵的那
+#      一步整个去掉；
+#   2. 照 Aegisub 的量级，一块字建一张独立小位图，按 1/k 降采样再糊
+#      （k 跟着 sigma 走），计算量按 k² 往下掉；
+#   3. 只糊 alpha 一个通道（发光是纯白，预乘 ARGB 里就是 (a,a,a,a)），
+#      内存和运算再降 4 倍；
+#   4. 缓存键只说「这段字长什么样 + 发光参数」，不含坐标 —— 拖动、跳帧、
+#      播放每帧透明度变化全都命中，不会像以前那样一帧糊一次。
+
+_FG_TU_JI = {}          # 键 -> (位图, 相对包围盒, 降采样倍数, 宽, 高)
+_FG_TU_ZIJIE = [0]
+FG_JIANGCAI_ZUIDA = 4   # 糊发光时位图最多缩到 1/4 再糊
+
+
+def _fg_jiangcai(sigma):
+    """模糊降采样倍数：sigma 越大，糊在小图上肉眼完全看不出来"""
+    if sigma <= 1.2:
+        return 1
+    return max(1, min(FG_JIANGCAI_ZUIDA, int(round(sigma / 3.0))))
+
+
+def _fang_kuang_kua(a, ban):
+    """方框模糊一遍（OpenCV 的），float32 单通道 / 多通道都能吃
+
+    以前 _fang_kuang 拿 numpy 的累加和沿 axis=0 走，一步跳一行、缓存全废：
+    700k 像素一次 16 ms，六次就 100 ms —— 一条字幕一张图，整屏就是几百毫秒。
+    同样是一遍方框模糊，OpenCV 的 7×7 只要 3.9 ms，快四倍还多。
+    """
+    k = 2 * int(ban) + 1
+    return cv2.blur(
+        np.ascontiguousarray(a), (k, k), borderType=cv2.BORDER_REPLICATE
+    )
+
+
+def _fg_hu_tu(tu, sigma):
+    """把发光位图糊一遍：只动 alpha 通道
+
+    预乘 ARGB 里「白色、不透明度 a」就是 (a,a,a,a)，所以三个颜色通道跟着
+    alpha 一起写回去就行，不用各自糊一遍 —— 计算量直接剩 1/4。
+    """
+    W, H = tu.width(), tu.height()
+    if W < 2 or H < 2 or sigma <= 0.15:
+        return
+    ban = max(1, int(round(sigma * 0.85)))
+    ptr = tu.bits()
+    ptr.setsize(tu.bytesPerLine() * H)
+    quan = np.frombuffer(ptr, dtype=np.uint8).reshape(
+        H, tu.bytesPerLine() // 4, 4
+    )[:, :W, :]
+    a = np.ascontiguousarray(quan[:, :, 3]).astype(np.float32)
+    for _ in range(3):
+        a = _fang_kuang_kua(a, ban)
+    a = np.clip(a, 0.0, 255.0).astype(np.uint8)
+    quan[:, :, :] = np.dstack([a, a, a, a])
+
+
+def _fg_tu(lu, kuan, mo):
+    """拿一段字的路径做一张发光位图，原点记成「相对路径包围盒左上角」
+
+    存相对位置是为了让缓存跟坐标无关：同一段字挪到画面别处，位图照样能用。
+    """
+    kb = lu.boundingRect()
+    sigma = max(0.3, float(mo) * 0.7)
+    bian = max(0.0, float(kuan)) + sigma * 3.0 + 2.0
+    kuan_w = max(1.0, kb.width() + bian * 2.0)
+    kuan_h = max(1.0, kb.height() + bian * 2.0)
+    k = _fg_jiangcai(sigma)
+    W = max(1, int(kuan_w / k) + 1)
+    H = max(1, int(kuan_h / k) + 1)
+    tu = QtGui.QImage(W, H, QtGui.QImage.Format_ARGB32_Premultiplied)
+    tu.fill(Qt.transparent)
+    tb = QtGui.QPainter(tu)
+    tb.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    tb.scale(1.0 / k, 1.0 / k)
+    tb.translate(-(kb.left() - bian), -(kb.top() - bian))
+    bi_bi = QtGui.QPen(QtGui.QColor("#FFFFFF"))
+    bi_bi.setWidthF(max(0.01, float(kuan)) * 2.0)
+    bi_bi.setJoinStyle(Qt.RoundJoin)
+    bi_bi.setCapStyle(Qt.RoundCap)
+    tb.strokePath(lu, bi_bi)
+    tb.end()
+    _fg_hu_tu(tu, sigma / k)
+    return tu, (-bian, -bian, kuan_w, kuan_h), k, W, H
+
+
+def _hua_faguang(huabi, lu, lu_jian, kuan, mo, nong, bei=1.0):
+    """铺一层外发光：有缓存就贴，没有才现做一张
+
+    nong（浓度）跟原来的算法一致：ASS 的 alpha 是「透明多少」，所以不透明度
+    = (255 - 浓度) / 255。bei 是这一刻 \\fad 压下来的倍数。
+    """
+    tou = (255 - max(0, min(255, int(nong)))) / 255.0
+    tou *= max(0.0, min(1.0, float(bei)))
+    if tou <= 0.004:
+        return
+    jian = (lu_jian, round(float(kuan), 2), round(float(mo), 2))
+    dong = _FG_TU_JI.get(jian)
+    if dong is None:
+        dong = _fg_tu(lu, kuan, mo)
+        if len(_FG_TU_JI) > 400 or _FG_TU_ZIJIE[0] > 96 * 1024 * 1024:
+            _FG_TU_JI.clear()
+            _FG_TU_ZIJIE[0] = 0
+        _FG_TU_JI[jian] = dong
+        try:
+            _FG_TU_ZIJIE[0] += dong[0].sizeInBytes()
+        except AttributeError:
+            _FG_TU_ZIJIE[0] += dong[0].width() * dong[0].height() * 4
+    tu, xiang, _k, W, H = dong
+    kb = lu.boundingRect()
+    mubiao = QtCore.QRectF(
+        kb.left() + xiang[0], kb.top() + xiang[1], xiang[2], xiang[3]
+    )
+    baoqian = huabi.opacity()
+    huabi.setOpacity(baoqian * tou)
+    huabi.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+    huabi.drawImage(mubiao, tu, QtCore.QRectF(0.0, 0.0, float(W), float(H)))
+    huabi.setOpacity(baoqian)
 
 
 def _zhe_hang(fm, wen, kuan):
@@ -6732,13 +6887,40 @@ def _mo_tu(tu, sigma):
     quan = np.frombuffer(ptr, dtype=np.uint8)
     # 这块就是图自己的内存，最后要往它上面写回去（不能只改副本）
     shi = quan.reshape(H, tu.bytesPerLine() // 4, 4)[:, :W, :]
-    b = shi.astype(np.float32)
+    b = np.ascontiguousarray(shi).astype(np.float32)
     for _ in range(3):
-        b = _fang_kuang(b, ban, 0)
-        b = _fang_kuang(b, ban, 1)
+        b = _fang_kuang_kua(b, ban)
     # BGRA：前三个是颜色，第四个是不透明度；预乘的规矩是颜色不能超过不透明度
     b[:, :, :3] = np.minimum(b[:, :, :3], b[:, :, 3:4])
     shi[:, :, :] = np.clip(b, 0.0, 255.0).astype(np.uint8)
+
+
+# 发光条模糊位图缓存。同一条发光播放中每帧都要重画（写了 \fad 渐变的母字幕
+# 每帧透明度都变，整层每帧重画），而建 QImage + 三次方框模糊一次就要几十
+# 毫秒：几百条发光轮着糊，界面追不上帧率，表现就是"播放卡死、Python 无响应"。
+# 键 = 这一组的内容 + 糊多少 + 位图多大。位图里存的是**全不透明版**，渐变
+# 透明度在贴回画面时才乘（存进去了每帧 bei 都变，缓存永远命不中）。
+# 位图都不小（几百 KB 一张），按张数 + 总字节双上限，超了整体清一回。
+_MO_TU_HUANCUN = {}
+_MO_TU_ZIJIE = [0]
+
+
+def _duan_jian(wen, gs, x_dang, di, zhong_x, ju, lu_huamian):
+    """一段文字内容的稳定指纹（模糊位图缓存靠它认"这段跟上帧一模一样"）
+
+    路径对象每帧都是新 translate 出来的，不能拿它当键；格式 dict 里可能挂着
+    路径（_lu_bian 外框），也得摘掉。文字 + 位置 + 格式就够了：同一段字、同
+    一个地方、同一份格式，画出来一个像素都不差。\t 动画按时刻算出来的格式
+    每帧都变，指纹跟着变，缓存自然命不中（内容确实在变）。
+    """
+    return (
+        str(wen),
+        round(float(x_dang), 3),
+        round(float(di), 3),
+        round(float(zhong_x), 3),
+        repr({k: v for k, v in (gs or {}).items() if k != "_lu_bian"}),
+        ju is lu_huamian,
+    )
 
 
 def _yi_hang_kuang(lu, gs, bi, fscx, zhong_x, mo=0.0):
@@ -6982,7 +7164,8 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
     # 后一段的白描边会把前一段字的黑色底部糊掉（竖排里 \fn 换字体的省略号
     # 把"奈"盖住就是这个病）。
     hui_duan = []      # 矢量绘图段：(路径, 格式, 裁剪)
-    wen_duan = []      # 文字段：(路径, 格式, 裁剪, fscx 锚点)
+    wen_duan = []      # 文字段：(路径, 格式, 裁剪, fscx 锚点, 内容键)
+    guang_duan = []    # 外发光段：(路径, 字形指纹, (宽, 模糊, 浓度), 裁剪)
     for i, duan in enumerate(xing):
         # 行宽 = 各段宽度之和；对齐照这一行的总宽算
         kuan_duan = []
@@ -7063,7 +7246,11 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
             # 拖越白，到底才突然变镂空，中间没有过渡。字身全不透明的段直接描，
             # 那半圈会被字身盖住，快。路径按字缓存，不是每帧现算。
             bd = max(0.0, _ass_shuzi(gs_hua.get("bord"), 0.0))
-            if bd > 0.05 and int(_ass_shuzi(gs_hua.get("a1"), 255)) < 255:
+            # 填充全透明的那一段（外发光条 \1a&HFF& 就是）内圈根本看不见，描边
+            # 直接描进字肚子里也无所谓 —— 本体后画一定盖住。这种段就别去碰
+            # _wai_lu 的布尔运算了，那才是整条字幕卡死的根源
+            a1_dang = int(_ass_shuzi(gs_hua.get("a1"), 255))
+            if bd > 0.05 and 0 < a1_dang < 255:
                 wai = _wai_lu(ziti_d, wen_d, ming_d, fangda, bd).translated(
                     x_dang * fangda, di * fangda
                 )
@@ -7076,71 +7263,122 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
                 )
             fg = gs_hua.get("fg")
             if fg:
-                # 外发光：同一条字先垫一层"粗白边 + 模糊 + 填充全透明"。排在本体
-                # 前面就是画在下面，本体再盖上去 —— 光晕在字外圈，字本身不糊。
-                gs_g = dict(gs_hua)
-                gs_g["bord"] = float(fg[0])
-                gs_g["blur"] = float(fg[1])
-                gs_g["c3"] = "#FFFFFF"
-                gs_g["a3"] = 255 - int(fg[2])   # 浓度 -> alpha（ASS 的 alpha 反着来）
-                gs_g["a1"] = 0
-                gs_g["shad"] = 0.0
-                gs_g.pop("vc1", None)
-                wen_duan.append((lu, gs_g, ju_dang, zhong_x))
-            wen_duan.append((lu, gs_hua, ju_dang, zhong_x))
+                # 外发光单独走一条快路（_hua_faguang），不再往 wen_duan 里塞副本。
+                # 以前那份副本填充全透明，会掉进上面 _wai_lu 那个分支 —— 对整行
+                # 字形做 stroker + subtracted 的布尔运算，字数越多越爆炸，一整条
+                # 字幕就是"画面卡死、Python 假死"的元凶。
+                guang_duan.append(
+                    (
+                        lu,
+                        _lu_jian(ziti_d, wen_d, ming_d, fangda),
+                        fg,
+                        ju_dang,
+                    )
+                )
+            wen_duan.append(
+                (lu, gs_hua, ju_dang, zhong_x, _duan_jian(wen_d, gs_hua, x_dang, di, zhong_x, ju_dang, lu_huamian))
+            )
             x_dang += kuan_d
 
     # 整条文字的包围盒：\1vc 四角渐变按它算（整块一块渐变，不是每个字各来一遍）
     vc_kuang = None
-    if any((g.get("vc1") for _l, g, _j, _z in wen_duan)):
-        for lu_k, _g, _j, _z in wen_duan:
+    if any((g.get("vc1") for _l, g, _j, _z, _dj in wen_duan)):
+        for lu_k, _g, _j, _z, _dj in wen_duan:
             k_k = lu_k.boundingRect()
             vc_kuang = k_k if vc_kuang is None else vc_kuang.united(k_k)
 
+    # 第零遍：外发光铺最底下。一段一张小位图（位置无关、只糊 alpha），
+    # 跟字数无关，所以一条字幕多长都是同一份开销
+    for lu_g, jian_g, fg, ju_lu in guang_duan:
+        if ju_lu is lu_huamian:
+            huabi.setClipPath(lu_huamian)
+        else:
+            huabi.setClipPath(ju_lu)
+        _hua_faguang(huabi, lu_g, jian_g, fg[0], fg[1], fg[2], bei)
     # 第一遍：写了 \blur 的段，按糊的量分组，每组的"阴影+描边"合进一张位图
     # 糊一次再贴回（VSFilter 的 PaintFromBluredOverlay 就是整层糊一次；
     # 一段一段各糊各的话，光晕会互相叠、整块比它黑一大截）
     mo_qun = {}
-    for lu, gs_hua, ju_lu, zhong_x in wen_duan:
+    for lu, gs_hua, ju_lu, zhong_x, duan_jian in wen_duan:
         mo = max(0.0, _ass_shuzi(gs_hua.get("blur"), 0.0))
         if mo > 0.05:
-            mo_qun.setdefault(round(mo, 2), []).append((lu, gs_hua, ju_lu, zhong_x))
+            mo_qun.setdefault(round(mo, 2), []).append(
+                (lu, gs_hua, ju_lu, zhong_x, duan_jian)
+            )
     for mo, zu in mo_qun.items():
         sigma = max(0.3, mo * 0.7)
         kb = None
-        for lu, gs_hua, ju_lu, zhong_x in zu:
+        for lu, gs_hua, ju_lu, zhong_x, _dj in zu:
             k = _yi_hang_kuang(lu, gs_hua, 1.0, fscx, zhong_x, mo)
             kb = k if kb is None else kb.united(k)
         bian = sigma * 3.0 + 2.0
         kb = kb.adjusted(-bian, -bian, bian, bian)
-        W = max(1, int(kb.width()) + 1)
-        H = max(1, int(kb.height()) + 1)
-        tu = QtGui.QImage(W, H, QtGui.QImage.Format_ARGB32_Premultiplied)
-        tu.fill(QtCore.Qt.transparent)
-        tb = QtGui.QPainter(tu)
-        tb.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        tb.translate(-kb.left(), -kb.top())
-        for lu, gs_hua, ju_lu, zhong_x in zu:
-            you_bian = (
-                max(0.0, _ass_shuzi(gs_hua.get("bord"), 0.0)) > 0.05
-                or max(0.0, _ass_shuzi(gs_hua.get("shad"), 0.0)) > 0.05
+        # 降采样再糊：糊出去的东西本来就是低频的，缩到 1/k 糊完再放大，肉眼看
+        # 不出差别，而建图和三次方框模糊的成本按 k² 往下掉（整屏字幕才不卡）
+        jc = _fg_jiangcai(sigma)
+        W = max(1, int(kb.width() / jc) + 1)
+        H = max(1, int(kb.height() / jc) + 1)
+        # 整块裁剪（没写 \clip）的组才走缓存：写了 \clip 的路径内容进不了键，
+        # 不缓存，照老路现画现糊
+        ke_huancun = all(ju_lu is lu_huamian for _l, _g, ju_lu, _z, _dj in zu)
+        jian = None
+        tu = None
+        if ke_huancun:
+            jian = (
+                tuple(sorted(_dj for _l, _g, _j, _z, _dj in zu)),
+                sigma,
+                jc,
+                W,
+                H,
             )
-            if ju_lu is lu_huamian:
-                tb.setClipRect(kb)
-            else:
-                tb.setClipPath(ju_lu)
-            # 有描边/阴影：图里只放描边和阴影，字身等会儿清清楚楚压上去；
-            # 描边阴影全没有的（\bord0\shad0），照 VSFilter 整字一起糊
-            _hua_yi_hang_nei(
-                tb, lu, gs_hua, 1.0, fscx, zhong_x, bei,
-                "kuang" if you_bian else "quan", vc_kuang,
-            )
-        tb.end()
-        _mo_tu(tu, sigma)
-        # 贴回画面：目标框给脚本坐标，画布的缩放 / 整块旋转由画笔自己带上
+            tu = _MO_TU_HUANCUN.get(jian)
+        if tu is None:
+            tu = QtGui.QImage(W, H, QtGui.QImage.Format_ARGB32_Premultiplied)
+            tu.fill(QtCore.Qt.transparent)
+            tb = QtGui.QPainter(tu)
+            tb.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            tb.scale(1.0 / jc, 1.0 / jc)
+            tb.translate(-kb.left(), -kb.top())
+            for lu, gs_hua, ju_lu, zhong_x, _dj in zu:
+                you_bian = (
+                    max(0.0, _ass_shuzi(gs_hua.get("bord"), 0.0)) > 0.05
+                    or max(0.0, _ass_shuzi(gs_hua.get("shad"), 0.0)) > 0.05
+                )
+                if ju_lu is lu_huamian:
+                    tb.setClipRect(kb)
+                else:
+                    tb.setClipPath(ju_lu)
+                # 有描边/阴影：图里只放描边和阴影，字身等会儿清清楚楚压上去；
+                # 描边阴影全没有的（\bord0\shad0），照 VSFilter 整字一起糊。
+                # bei 传 1.0：位图里存全不透明版，渐变透明度贴回时再乘
+                # （\fad 每帧都变，存进位图缓存就永远命不中）
+                _hua_yi_hang_nei(
+                    tb, lu, gs_hua, 1.0, fscx, zhong_x, 1.0,
+                    "kuang" if you_bian else "quan", vc_kuang,
+                )
+            tb.end()
+            _mo_tu(tu, sigma / jc)
+            if ke_huancun:
+                _MO_TU_HUANCUN[jian] = tu
+                try:
+                    _MO_TU_ZIJIE[0] += tu.sizeInBytes()
+                except AttributeError:
+                    _MO_TU_ZIJIE[0] += tu.width() * tu.height() * 4
+                if (
+                    len(_MO_TU_HUANCUN) > 600
+                    or _MO_TU_ZIJIE[0] > 200 * 1024 * 1024
+                ):
+                    _MO_TU_HUANCUN.clear()
+                    _MO_TU_ZIJIE[0] = 0
+        # 贴回画面：目标框给脚本坐标，画布的缩放 / 整块旋转由画笔自己带上。
+        # 这一刻的透明度（\fad 渐变）在贴的时候乘，位图本身全程复用
+        baoqian = huabi.opacity()
+        huabi.setOpacity(baoqian * bei)
+        huabi.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
         huabi.drawImage(kb, tu, QtCore.QRectF(0.0, 0.0, float(W), float(H)))
+        huabi.setOpacity(baoqian)
     # 第二遍：不糊的那些段，阴影 + 描边直接画
-    for lu, gs_hua, ju_lu, zhong_x in wen_duan:
+    for lu, gs_hua, ju_lu, zhong_x, _dj in wen_duan:
         if max(0.0, _ass_shuzi(gs_hua.get("blur"), 0.0)) > 0.05:
             continue
         if ju_lu is lu_huamian:
@@ -7149,7 +7387,7 @@ def _hua_ass_tiao(huabi, qu, tiao, jizhun):
             huabi.setClipPath(ju_lu)
         _hua_yi_hang_nei(huabi, lu, gs_hua, 1.0, fscx, zhong_x, bei, "kuang")
     # 第三遍：所有段的字身（填充）清清楚楚压在最上面 —— 到这儿描边再也咬不到字
-    for lu, gs_hua, ju_lu, zhong_x in wen_duan:
+    for lu, gs_hua, ju_lu, zhong_x, _dj in wen_duan:
         mo = max(0.0, _ass_shuzi(gs_hua.get("blur"), 0.0))
         you_bian = (
             max(0.0, _ass_shuzi(gs_hua.get("bord"), 0.0)) > 0.05
@@ -7946,11 +8184,13 @@ class ShijianZhou(QtWidgets.QWidget):
         self.update()
         return wei
 
-    def charu_zimu(self, wei, qi_ms, zhi_ms, wenben):
+    def charu_zimu(self, wei, qi_ms, zhi_ms, wenben, hua=True):
         """按指定行号插一块（照 tianjia_zimu 那一套账，位置由外面指定）
 
         遮盖矢量图就走这儿：要插在它盖的那条字幕**前面** —— 同一层里先画的在
         下头，白块才盖得住原文、又不挡字幕。
+        hua=False：只改数据、不重画。批量插（几百条一起设发光）时每条都重画，
+        窗口会直接卡死；批量收尾时外面统一刷一次。
         """
         wei = max(0, min(int(wei), len(self._zimu)))
         self._zimu.insert(wei, (int(qi_ms), int(zhi_ms), str(wenben or "")))
@@ -7962,14 +8202,16 @@ class ShijianZhou(QtWidgets.QWidget):
             self._xuan_zhong += 1
         self._xuan_duo = [x + 1 if x >= wei else x for x in self._xuan_duo]
         self._zai_kuai = None       # 块变了，播放头压着哪几块重新认
-        self.update()
+        if hua:
+            self.update()
         return wei
 
-    def gai_zimu_wenben(self, xu, wenben):
+    def gai_zimu_wenben(self, xu, wenben, hua=True):
         """只改这一块的文字，别的都不动
 
         字幕编辑区每敲一个字就走这儿：整份重塞一遍（shezhi_zimu）会把行号也
         重算一遍，敲字的时候没必要，也卡。
+        hua=False：只改数据、不重画（批量改完外面统一刷一次）。
         """
         xu = int(xu)
         if not (0 <= xu < len(self._zimu)):
@@ -7980,7 +8222,8 @@ class ShijianZhou(QtWidgets.QWidget):
             return
         self._zimu[xu] = (qi, zhi, wenben)
         self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
-        self.update()
+        if hua:
+            self.update()
 
     def qingkong_zimu(self):
         self.shezhi_jinxing(None)
@@ -8690,6 +8933,7 @@ class ShijianZhou(QtWidgets.QWidget):
         huabi.setClipRect(qu)
         self._hua_jinxing(huabi, qu)
         self._hua_kuai_zai(huabi, qu)
+        self._hua_xuan_lv(huabi, qu)
         self._hua_xuanfu_zimu(huabi, qu)
         huabi.restore()
         self._hua_bofangtou(huabi, qu)
@@ -8887,8 +9131,10 @@ class ShijianZhou(QtWidgets.QWidget):
             self._hang_gun,                 # 竖向滚到第几行
             tuple(sorted(self._yin_hang)),  # 哪几条轨道被关掉了
             self._guidao_shu,               # 手动加的空轨数
-            self._xuan_zhong,
-            tuple(self._xuan_duo),
+            # 选中（_xuan_zhong / _xuan_duo）故意不进 key：选中是鼠标每一动
+            # 都在变的，画在静层里就是每改一次选择整条轨道重画一遍（800 块时
+            # 一次一百多毫秒，「选中播放头之前所有字幕块」一下选几百块能点到
+            # 卡死）。选中那圈绿框挪到实时层画，见 _hua_xuan_lv。
             self._bo_shou_liang,
             ZHUTI,                          # 换主题了整张都得重画
             # 切片点预览：开关 + 设置（切点位置的算法全看设置，设置一改要重画）
@@ -9174,14 +9420,27 @@ class ShijianZhou(QtWidgets.QWidget):
         xu = int(xu)
         return tao[xu] if 0 <= xu < len(tao) else 0
 
-    def shezhi_hang(self, dui):
+    def zimu_hang_quan(self):
+        """整份行号表，一次拿齐
+
+        外面别一条一条地问 zimu_hang(i)：那条每条都把整表拷一遍再 clamp，
+        存文件时几百行就是几百次全表拷贝（几百毫秒白等）。
+        """
+        return self._zimu_hang()
+
+    def shezhi_hang(self, dui, hua=True):
         """按 [(第几条, 第几行), ...] 把行号摆上去
 
         整份 shezhi_zimu 是按"内容"认行号的，重复出来的块跟原件内容一模一样，
         认不到旧行号会落到第一行；所以重复完得再喊这一声，把副本沉到原件下面。
+        hua=False：只改数据、不重画（批量摆完外面统一刷一次）。
         """
-        tao = self._zimu_hang()
         n = len(self._zimu)
+        tao = self._zimu_tao
+        # 长度不齐才走补齐 + 夹紧那条老路；平时直接用现成的（以前每次调用都把
+        # 整表拷一遍再逐项 clamp，批量设发光时几百条 × 几百行，纯白等）
+        if len(tao) < n:
+            tao = self._zimu_hang()
         gai = False
         for xu, hang in dui or ():
             xu = int(xu)
@@ -9192,7 +9451,9 @@ class ShijianZhou(QtWidgets.QWidget):
         if gai:
             self._zimu_tao = tao
             self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
-            self.update()
+            self._zai_kuai = None       # 块变了，播放头压着哪几块重新认
+            if hua:
+                self.update()
         return gai
 
     def kong_hang_gei(self, xu, tiaoguo=None):
@@ -9203,14 +9464,16 @@ class ShijianZhou(QtWidgets.QWidget):
         会把新行开出来（字幕带就是个能摞好几层的轨道）。
         tiaoguo = 不算进去的那一条（新插进来的光晕条自己，不然它就算占位了）。
         """
-        tao = self._zimu_hang()
+        # 长度齐了就直读现成的（只读不改）；以前每次先把整表拷一遍再逐项
+        # clamp，批量设发光时几百条 × 几百行，光这儿就白等一百多毫秒
+        tao = self._zimu_tao if len(self._zimu_tao) >= len(self._zimu) else self._zimu_hang()
         n = min(len(self._zimu), len(tao))
         xu = int(xu)
         if not (0 <= xu < n):
             return 0
         qi = int(self._zimu[xu][0])
         zhi = int(self._zimu[xu][1])
-        ben = int(tao[xu])
+        ben = max(0, min(int(tao[xu]), self.ZIMU_HANG_ZUIDA - 1))
         for k in range(1, 10):
             hang = ben + k
             zhan = False
@@ -9473,24 +9736,17 @@ class ShijianZhou(QtWidgets.QWidget):
                 yanse = self._kuai_yanse[xu]
             if yin:
                 yanse = guan_di        # 关掉的轨道：不管原来是蓝是白，一律灰底
-            xuan = xu in self._xuan_duo
-            if xuan:
-                # 选中：只在块内部描一圈绿框，底色和文字都保持原样（跟别人
-                # 软件一样，选中只是"圈一下"，内容一个像素都不动）。
-                # 绿框 5 像素，比普通块那圈 2 像素的描边粗，一眼看得出选中。
-                bian = QtGui.QColor(YANSE_ZIMU_XUAN)
-                kuan_bi = 5
-            else:
-                # 紧挨着的块靠描边分个数：奇数块、偶数块交替用两种深色描边，
-                # 交界处永远是"这块的深蓝边 | 那块的深棕边"，一眼数得清几块。
-                # （播放头正压着的那块的红边不画在这儿 —— 那是跟着播放头每帧
-                # 在变的，画在这儿会让整条轨道静层反复作废，见 _hua_kuai_zai）
-                bian = QtGui.QColor(
-                    YANSE_ZIMU_BIAN_A if xu % 2 == 0 else YANSE_ZIMU_BIAN_B
-                )
-                if yin:
-                    bian = guan_bian
-                kuan_bi = self.ZIMU_BIAN_KUAN_DU
+            # 紧挨着的块靠描边分个数：奇数块、偶数块交替用两种深色描边，
+            # 交界处永远是"这块的深蓝边 | 那块的深棕边"，一眼数得清几块。
+            # （播放头正压着的那块的红边不画在这儿 —— 那是跟着播放头每帧
+            # 在变的，画在这儿会让整条轨道静层反复作废，见 _hua_kuai_zai。
+            # 选中那圈绿框同理，见 _hua_xuan_lv）
+            bian = QtGui.QColor(
+                YANSE_ZIMU_BIAN_A if xu % 2 == 0 else YANSE_ZIMU_BIAN_B
+            )
+            if yin:
+                bian = guan_bian
+            kuan_bi = self.ZIMU_BIAN_KUAN_DU
             # 底色直接铺在时间轴背景上（半透明），再沿块的四条内边刷一圈描边色。
             # 描边全刷在自己块里，不糊到隔壁块上——两块紧挨着时交界就是
             # "这块的描边 | 那块的描边"，一眼数得清块数。
@@ -10144,6 +10400,65 @@ class ShijianZhou(QtWidgets.QWidget):
         huabi.setBrush(Qt.NoBrush)
         huabi.drawRect(kuang.adjusted(1, 1, -1, -1))
 
+    def _hua_xuan_lv(self, huabi, qu):
+        """选中的字幕块：块内部描一圈绿框
+
+        这一圈不能画进静层（见 _jing_tu）：选择是鼠标每一动都在变的
+        （Ctrl 点选 / 框选 /「选中播放头之前所有字幕块」一下选几百块），
+        塞进静层就是每改一次选择整条轨道重画一遍 —— 800 块时一次一百多
+        毫秒，点一下右键菜单就卡死。所以挪到实时层：静层那张图一动不动，
+        只把选中那几块描个框。
+        底色和文字都保持原样（选中只是"圈一下"，内容一个像素都不动）。
+        """
+        if not self._xuan_duo:
+            return
+        tiao = self._zimu_qu(qu)
+        hang = self._zimu_hang()
+        hangshu = self._zimu_hang_shu()
+        bian = QtGui.QColor(YANSE_ZIMU_XUAN)
+        huabi.setPen(Qt.NoPen)
+        for xu in self._xuan_duo:
+            if not (0 <= xu < len(self._zimu)):
+                continue
+            qi, zhi, _w = self._zimu[xu]
+            x1 = self._ms_to_x(qi)
+            x2 = self._ms_to_x(zhi)
+            if x2 < x1:
+                x1, x2 = x2, x1
+            if x2 - x1 < 3:
+                x2 = x1 + 3
+            if x2 < qu.left() or x1 > qu.right():
+                continue
+            hang_qu = self._zimu_hang_kuang(tiao, hang[xu], hangshu)
+            kuai = QtCore.QRect(
+                x1, hang_qu.top(), max(1, x2 - x1), hang_qu.height()
+            )
+            kuai = kuai.intersected(tiao)
+            if kuai.width() <= 0:
+                continue
+            kuan_bi = 5     # 选中那圈绿 5 像素（跟播放头压着的红一样粗）
+            if kuan_bi * 2 + 1 > kuai.width():
+                huabi.fillRect(kuai, bian)
+            else:
+                huabi.fillRect(
+                    QtCore.QRect(kuai.left(), kuai.top(), kuai.width(), kuan_bi), bian
+                )
+                huabi.fillRect(
+                    QtCore.QRect(
+                        kuai.left(), kuai.bottom() - kuan_bi + 1, kuai.width(), kuan_bi
+                    ),
+                    bian,
+                )
+                huabi.fillRect(
+                    QtCore.QRect(kuai.left(), kuai.top(), kuan_bi, kuai.height()), bian
+                )
+                huabi.fillRect(
+                    QtCore.QRect(
+                        kuai.right() - kuan_bi + 1, kuai.top(), kuan_bi, kuai.height()
+                    ),
+                    bian,
+                )
+
     def _hua_xifu(self, huabi, qu):
         """拖着字幕块吸到别的块边上时，在那条边上画一根实线
 
@@ -10741,8 +11056,9 @@ class ShijianZhou(QtWidgets.QWidget):
             )
             a_zhi_hou.setEnabled(bool(mu_hou))
             logger.info(
-                f"视频工作台：右键前后块 —— 播放头 {int(self.bofangtou_qu() if callable(self.bofangtou_qu) else self._bofangtou)} ms，"
-                f"选中 {xuan}，轨 {sorted({hang[x] for x in xuan})}，"
+                f"视频工作台：右键前后块 —— 播放头 "
+                f"{int(self.bofangtou_qu() if callable(self.bofangtou_qu) else self._bofangtou)} ms，"
+                f"选中 {len(xuan)} 块，轨 {sorted({hang[x] for x in xuan})}，"
                 f"之前 {len(mu_qian)} 块，之后 {len(mu_hou)} 块"
             )
             cai.addSeparator()
@@ -13113,6 +13429,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._zimu_fu_ji = []         # 每条的字段表（原 ASS 的 + 编辑区上方改过的）
         self._fu_wai = {}             # 外面直接指定字段的行（粘贴进来的那种）
                                       # 键 = tuple(起, 止, 文字)
+        # 播放时每帧都要整份字幕 + 逐条解析 ASS 标签，两样都缓存着：
+        # 字幕没动（版本号没变）就直接用上一份；同一条文字 + 同样式解析结果
+        # 不变，不用每帧重解（几百条时每帧全表拷贝 + 重解析就卡）
+        self._huamian_ban = -1        # 字幕面板数据版本（整表缓存用）
+        self._huamian_zimu = []       # 缓存的那份整表
+        self._jie_ji = ({}, None)     # ({(文字, 样式, 边距): 解析结果}, 样式表)
+        # 画面字幕上一帧发下去的签名：一模一样就不重发（见 _shuaxin_huamian_zimu）
+        self._huamian_zimu_qian = None
+        self._jie_ji_shii = 0       # 解析缓存重建世代（样式表换了就 +1，进签名）
         # 画面列宽度：左边那一列按画面比例贴着来，左右不留黑边（省出来的给右栏）。
         # 改分栏这个动作一律延到下一轮事件循环，不在 resize 里直接动（会打架）。
         self._he_dai = None          # 待改成的画面列宽度
@@ -13217,6 +13542,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 上下方向键换样式（滚轮也能换，见工具排自己的 eventFilter）。
         # 它拿了焦点也不影响空格播放 —— 下面那个窗口级空格快捷键压在它前面。
         self.bianji_mianban.gongjulan.xia_yang.setFocusPolicy(Qt.StrongFocus)
+        # 说话人下拉同理：照 AEG 的 actor 框，能直接打字，拿不到焦点打不进去
+        self.bianji_mianban.gongjulan.xia_shuo.setFocusPolicy(Qt.StrongFocus)
         # 滑块（音量、时间轴缩放）同理：焦点落在上面，方向键会被它拿去
         # 调滑块，轮不到微调帧。鼠标拖它照样好使。
         for w in self.findChildren(QtWidgets.QAbstractSlider):
@@ -16046,6 +16373,16 @@ class VideoWorkDialog(QtWidgets.QDialog):
         zhou = getattr(self, "shijianzhou", None)
         if zhou is not None:
             zhou.shezhi_zai_bofang(bool(zai))
+        # 刚停下：播放中跳过的那两样（补全候选池、工具排）补刷一次，
+        # 暂停后上面那排和候选都跟当前这条对得上
+        if not zai:
+            ban = getattr(self, "bianji_mianban", None)
+            if ban is not None and hasattr(ban, "chong_jian_houxuan"):
+                try:
+                    ban.chong_jian_houxuan()
+                except Exception:      # noqa
+                    pass
+            self._shuaxin_gongju()
 
     def _bofang(self):
         if self.duqu is None:
@@ -16905,7 +17242,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if shu is None:
             shu = self.zimu_mianban.zimu_shu()
         shu = int(shu or 0)
-        return [int(self.shijianzhou.zimu_hang(i)) for i in range(shu)]
+        # 一次拿整份：以前一条一条问（每条都把整表拷一遍再 clamp），几百行
+        # 就是几百次全表拷贝，每回写文件都白等几百毫秒
+        tao = self.shijianzhou.zimu_hang_quan()
+        return [int(tao[i]) if i < len(tao) else 0 for i in range(shu)]
 
     def _zimu_fujia(self, zimu):
         """每条的字段（样式 / 说话人 / 层 / 边距 / 特效 / 注释）
@@ -16919,11 +17259,30 @@ class VideoWorkDialog(QtWidgets.QDialog):
         pei = self._zimu_pipei(zimu)
         self._zimu_pei_ji = pei
         wai = getattr(self, "_fu_wai", None) or {}
+        # 同一段起止时间里那条「本体」是哪个（不带 \1fg(hui) 的那条）。
+        # 光晕条的样式兜底要用它：光晕条是加发光时插进来的，样式本该跟本体
+        # 一模一样，但那份记录是按「起止 + 文字」存的，文字一改（加方括号、
+        # 打字机、批量替换）就找不回来，只能回退成 Default + 空说话人。
+        ti = {}
+        for i, (qi, zhi, wen) in enumerate(zimu):
+            if "\\1fg(hui)" not in str(wen or ""):
+                ti.setdefault((int(qi), int(zhi)), i)
         fu_men = []
         for i in range(len(zimu)):
             ge = {"yang": "Default", "shuo": ""}
             ge.update(wai.get(tuple(zimu[i])) or {})
             ge.update(self.zimu_mianban.hang_fu(i))
+            if (
+                "\\1fg(hui)" in str(zimu[i][2] or "")
+                and not str(ge.get("shuo") or "").strip()
+            ):
+                # 这条光晕条没拿到说话人（说明按文字那份记录失配了）：直接照
+                # 抄同一时刻本体那条的字段，文字怎么改都不会丢样式
+                j = ti.get((int(zimu[i][0]), int(zimu[i][1])))
+                if j is not None and j != i:
+                    fu_j = self.zimu_mianban.hang_fu(j)
+                    if fu_j:
+                        ge.update(fu_j)
             if not str(ge.get("yang") or "").strip():
                 ge["yang"] = "Default"
             ge["shuo"] = str(ge.get("shuo") or "")
@@ -17184,7 +17543,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 遮块的框 + 拖放模式的黄方块先跟着这一刻走：播放头压着它才摆，滑出去就收
         # （_shuaxin_dingwei_kuai 内部顺带会刷遮块那个框，一次两样都校准）
         self._shuaxin_dingwei_kuai()
-        zimu = self.zimu_mianban.zimu_liebiao()
+        # 整份字幕按版本号缓存：字幕没动过就直接用上一份，不每帧全表拷一遍
+        # （几百条时播放中每帧都拷，白等）
+        ban = self.zimu_mianban.zimu_ban()
+        if self._huamian_ban != ban:
+            self._huamian_ban = ban
+            self._huamian_zimu = self.zimu_mianban.zimu_liebiao()
+        zimu = self._huamian_zimu
         if not zimu:
             hua.shezhi_zimu([])
             return
@@ -17196,7 +17561,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
             pei = self._zimu_pipei(zimu)
         jizhun, biao = self._ass_geshi_biao()
         ms = int(self._huamian_ms() if ms is None else ms)
+        # ASS 标签解析结果缓存：同一条文字 + 同样式 + 同边距，解析出来一模一样，
+        # 播放中每帧都重解一遍纯属白费（几百条发光时每帧重解就卡）
+        jie_ji, jie_biao = self._jie_ji
+        if jie_biao is not biao:
+            jie_ji = {}
+            self._jie_ji = (jie_ji, biao)
+            self._jie_ji_shii += 1      # 样式表换了：解析缓存重建，签名跟着变
         xuan = []
+        jian_xin = []      # 这一帧可见集的签名（跟上一帧一样就不发下去）
         for i, (qi, zhi, wenben) in enumerate(zimu):
             # 时间判定：块头起、块尾**不含**（照 libass）。只在一种情况下把
             # 块尾那一刻也算进来 —— 「播放当前行」正好停在块尾，那一停如果不算
@@ -17233,7 +17606,22 @@ class VideoWorkDialog(QtWidgets.QDialog):
             # 列表里这份是空的（编辑框被清空）就画空的，不能拿原文顶上 ——
             # 不然清空文字以后画面上还挂着原来的台词，怎么删都删不掉
             wen = str(wenben or "")
-            hang, gs = _jie_ass_tiao(wen, ge, biao)
+            # 解析结果按（文字, 样式, 边距）缓存：播放中同一条每帧都来一遍，
+            # 重解纯属白费；缓存里 hang / gs 只读，不会被人改
+            jian_jie = (
+                wen,
+                yang.strip().lower(),
+                ge.get("ml", 0),
+                ge.get("mr", 0),
+                ge.get("mv", 0),
+            )
+            jie = jie_ji.get(jian_jie)
+            if jie is None:
+                jie = _jie_ass_tiao(wen, ge, biao)
+                if len(jie_ji) > 3000:
+                    jie_ji.clear()
+                jie_ji[jian_jie] = jie
+            hang, gs = jie
             # qi / zhi / ms 是给 \fad 渐入渐出算这一刻透明度用的
             xuan.append(
                 {
@@ -17246,8 +17634,26 @@ class VideoWorkDialog(QtWidgets.QDialog):
                     "ceng": int(fu.get("ceng") or 0),
                 }
             )
+            # 签名顺手攒：这一帧看得见的有谁、各自长什么样。写了 \fad / \t 的
+            # 条目才把 ms 攒进去 —— 别的条目带上它签名每帧都变（ms 是播放
+            # 时刻，只要在播它每帧都变），而无动画条目的 ms 对渲染一个像素
+            # 都不影响（_fad_bei 没 fad 给 1.0、_dong_jia 没 dong 原样返回）
+            jian_xin.append((
+                i, int(qi), int(zhi), int(fu.get("ceng") or 0), jian_jie,
+                int(ms) if (gs.get("dong") or gs.get("fad")) else 0,
+            ))
         # 层大的盖在上面（跟 libass 一个规矩）
         xuan.sort(key=lambda x: x["ceng"])
+        # 跟上帧一模一样就不发下去：画面字幕层每帧全量重画（折行、量宽、发光
+        # 还要建大模糊图再贴）几十毫秒，400 条设了发光以后每帧都跑就是"播放
+        # 卡死"。以前那版早退（shezhi_zimu 里 tiao == self._zimu）命不中，是
+        # 因为每条 dict 里带着 ms —— 播放中它每帧都变，列表永远"不一样"。
+        # 世代号并进签名：样式表一换解析缓存就重建（_jie_ji_shii +1），这时
+        # 内容 / 时间可能一个都没变，光看 jian_xin 会以为"没变"不刷，画面挂旧样式
+        jian_xin = (tuple(jian_xin), self._jie_ji_shii)
+        if jian_xin == self._huamian_zimu_qian:
+            return
+        self._huamian_zimu_qian = jian_xin
         hua.shezhi_zimu(xuan, jizhun)
 
     def _shezhi_bianji_zimu(self, zimu, xuan=None):
@@ -17381,21 +17787,42 @@ class VideoWorkDialog(QtWidgets.QDialog):
             for xu in xuan:
                 maodian[xu] = self._zimu_maodian(xu, zimu)
         try:
-            fu_quan = self._zimu_fujia(zimu)
+            # 有现成且条数对得上就直接用：改一条时这也是白算一遍的全表重解析
+            # （把原 ASS 每一行都过一遍正则）+ 界面回写；对不上才重算
+            fu_quan = self._zimu_fu_ji
+            if len(fu_quan) != len(zimu):
+                fu_quan = self._zimu_fujia(zimu)
         except (TypeError, AttributeError):
             fu_quan = []
+        # 已经配好的光晕条先建个索引：(起, 止, 纯文字) -> 第几条。
+        # 不然每设一条都要扫一遍全表（400 条 × 900 行 × 正则），窗口会卡死
+        guang_jian = {}
+        for i, t in enumerate(zimu):
+            w = str(t[2] or "")
+            if "\\1fg(hui)" in w:
+                guang_jian.setdefault(
+                    (int(t[0]), int(t[1]), _ass_chun_wen(w)), i
+                )
         jian = 0
         # 从后往前处理：每条发光都要往列表里插一条，正着走后面的索引全错位
         for xu in sorted(xuan, reverse=True):
-            zi = self.zimu_mianban.zimu_liebiao()
-            if not (0 <= xu < len(zi)):
+            # 用循环前拍下的那份快照取时间 / 文字：插进来的光晕条都在本体的
+            # 右边（下标更大），从后往前办，前面的下标一直对得上。
+            # （以前这里每条都重新拷一份整表，400 条就是 400 次全表拷贝）
+            if not (0 <= xu < len(zimu)):
                 continue
-            qi, zhi = int(zi[xu][0]), int(zi[xu][1])
+            qi, zhi = int(zimu[xu][0]), int(zimu[xu][1])
             fu_yuan = dict(fu_quan[xu] or {}) if xu < len(fu_quan) else {}
-            wen = str(zi[xu][2] or "")
-            # 上一次设过的 \1vc / \1fg 先摘掉，免得越叠越多（以刚选的为准）
-            wen = re.sub(r"\\1vc\([^)]*\)", "", wen)
-            wen = re.sub(r"\\1fg\([^)]*\)", "", wen)
+            wen = str(zimu[xu][2] or "")
+            # 只摘掉这次要重设的那几样。以前是 \1vc 和 \1fg 无条件一起删，
+            # 结果先设渐变再设发光（或者反过来）时，第二次一定把第一次的抹掉 ——
+            # 两个功能各自能设、也能一起设，就是不能一前一后设。
+            qing = [r"\\bord-?\d+(?:\.\d+)?", r"\\3c&?H?[0-9A-Fa-f]{6,8}&?"]
+            if kuang.you_jianbian.isChecked():
+                qing.append(r"\\1vc\([^)]*\)")
+            if yao_fg:
+                qing.append(r"\\1fg\([^)]*\)")
+            wen = _qu_biaoqian_li(wen, *qing)
             if yao_fg:
                 # 本体的锚点先落到它自己的文字里：光晕那条整串抄过去，两条才标
                 # 同一个点。不写 \pos 的话，一条描边 5、一条描边 5+发光 22，字框
@@ -17405,29 +17832,34 @@ class VideoWorkDialog(QtWidgets.QDialog):
                     wen = _pos_xie_ru(wen, jd[0], jd[1])
             ben = _jia_biaoqian(wen, biao)
             # 这一步只改数据，界面和文件等整批改完再统一刷一次（多选才不卡）
-            self.zimu_mianban.gai_zimu_wenben(xu, ben)
-            self.shijianzhou.gai_zimu_wenben(xu, ben)
+            # hua=False：列表项不逐条刷（收尾反正整表重建；批量时中间插过条，
+            # 逐条刷还会刷错行）；时间轴同理，逐条重画几百次窗口直接卡死
+            self.zimu_mianban.gai_zimu_wenben(xu, ben, hua=False)
+            self.shijianzhou.gai_zimu_wenben(xu, ben, hua=False)
             jian += 1
             if not yao_fg:
                 continue
             # 发光那条照 Aegisub 的写法真生成一条：粗白边 + 大模糊 + 字身全透明。
             # 已经配好的（以前设过）就改它，没有才新建，不会越设越多。
             guang = _faguang_wenben(ben, fk, fm, fn)
-            pei = self._zhao_faguang_peidui(xu)
+            pei = guang_jian.get((qi, zhi, _ass_chun_wen(ben)))
             if pei is not None:
-                self.zimu_mianban.gai_zimu_wenben(pei, guang)
-                self.shijianzhou.gai_zimu_wenben(pei, guang)
+                self.zimu_mianban.gai_zimu_wenben(pei, guang, hua=False)
+                self.shijianzhou.gai_zimu_wenben(pei, guang, hua=False)
                 continue
             # 发光那条插在本体**前面**：画面是按列表顺序画的，排在前面就先画，
             # 本体后画压在上面 —— 跟 Aegisub 里光晕写在前、本体写在后一个道理。
-            xin = self.zimu_mianban.charu_zimu(xu, qi, zhi, guang)
-            self.shijianzhou.charu_zimu(xin, qi, zhi, guang)
+            # shuaxin=False：左边列表别每插一条就整表重建一次（几百条会卡死）
+            xin = self.zimu_mianban.charu_zimu(xu, qi, zhi, guang, shuaxin=False)
+            self.shijianzhou.charu_zimu(xin, qi, zhi, guang, hua=False)
             if fu_yuan:
                 # 认领本体的样式 / 说话人 / 边距，字体和位置才一致
                 self._fu_wai[(qi, zhi, guang)] = dict(fu_yuan)
             hang = self.shijianzhou.kong_hang_gei(xu + 1, tiaoguo=xin)
-            self.shijianzhou.shezhi_hang([(xin, hang)])
+            self.shijianzhou.shezhi_hang([(xin, hang)], hua=False)
         # 整批改完：界面列表刷一次、字幕条重画一次、SRT / ASS 写一次
+        # （时间轴攒了整批的改动，统一重画一次就够）
+        self.shijianzhou.update()
         self._shezhi_bianji_zimu(self.zimu_mianban.zimu_liebiao())
         self._zimu_hang_ji = None
         self._zimu_tiao_wen = None
@@ -17630,8 +18062,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._bofangtou_xuanzhong_zimu = xu
         self.shijianzhou.shezhi_xuan_zhong(xu)
         self.zimu_mianban.shezhi_xuan_zhong(xu)
-        self.bianji_mianban.shezhi_xuan_zhong(xu)
-        self._shuaxin_gongju()
+        # 播放中每跨一条字幕都走到这儿。右键「选中播放头之前 / 之后所有字幕
+        # 块」选上几百块之后，下面这两样每跨条都要把整份字幕过一遍（候选池
+        # 逐行拆句去重、工具排全表重算）—— 几百行时一次几十毫秒，一秒跨几条
+        # 就是持续卡顿。播放时用户不会去点候选，这两样都跳过；暂停 / 手动点
+        # 选的时候照旧重建（见 _shezhi_zai_bofang 里补的那一次）。
+        zai_bo = bool(self.zhengzai_bofang)
+        self.bianji_mianban.shezhi_xuan_zhong(xu, chongjian=not zai_bo)
+        if not zai_bo:
+            self._shuaxin_gongju()
 
     def _shoudao_xuan_zhong_duo(self, hang):
         """字幕列表里多选 / 全选：时间轴整批跟着高亮（不动播放头）"""
@@ -18221,6 +18660,12 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 外面套什么：配置里那两栏（默认就是「 和 」），可以写代码
         zuo = str(pei.get("kuohao_zuo") or "「")
         you = str(pei.get("kuohao_you") or "」")
+        # 套在哪儿：zhengwen = 正文开头（标签块之后，老行为）
+        #           hangtou  = 行最开头（标签块之前）
+        # 行首那串渐变 / 发光代码里带 \r 的话，插在它后面会被 \r 重置掉，
+        # 这种情况就得用 hangtou
+        fang = "hangtou" if str(pei.get("kuohao_weizhi") or "") == "hangtou" \
+            else "zhengwen"
         fu_men = self._zimu_fu_ji
         if len(fu_men) != len(zimu):
             fu_men = self._zimu_fujia(zimu)
@@ -18251,9 +18696,28 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 for h in fuhao
             ):
                 continue
-            xin = biaoqian + zuo + zhengwen + you
+            if fang == "hangtou":
+                # 套的东西排在最前：{\fn..}「{\r} 里的 \r 先重置，后面那串
+                # 渐变 / 发光标签再生效 —— 不然 \r 会把它们全打回样式默认值
+                xin = zuo + biaoqian + zhengwen + you
+            else:
+                xin = biaoqian + zuo + zhengwen + you
+            # 文字一改，_fu_wai 里按「起止 + 文字」记的那份样式就再也找不回来
+            # 了（加发光插进来的光晕条是这么记的，一加括号就掉回 Default、说话
+            # 人也空）。所以改字之前先抓一份字段，改完显式写回面板，旧键也搬到
+            # 新文字上。
+            fu_dang = fu_men[i] if i < len(fu_men) else {}
+            jiu_yao = tuple(zimu[i])
             self.zimu_mianban.gai_zimu_wenben(i, xin)
             self.shijianzhou.gai_zimu_wenben(i, xin)
+            if fu_dang:
+                wai = getattr(self, "_fu_wai", None)
+                if wai and jiu_yao in wai:
+                    wai[(int(jiu_yao[0]), int(jiu_yao[1]), xin)] = wai.pop(jiu_yao)
+                try:
+                    self.zimu_mianban.gai_hang_fu(i, dict(fu_dang))
+                except AttributeError:
+                    pass
             gai += 1
 
         if not gai:
@@ -19864,9 +20328,15 @@ class VideoWorkDialog(QtWidgets.QDialog):
 
         ass_lu = osp.join(osp.dirname(shuchu), f"{ming}.ass")
         self._zidong_beifen(ass_lu)     # 同上
+        # 字段表复用刚算好的那份（前脚 _shezhi_bianji_zimu 才重算过，存进了
+        # self._zimu_fu_ji）：以前这儿再全量算一遍（顺带把界面列表那两列也
+        # 回写一次），几百行每回写文件都白等几百毫秒
+        fu_men = self._zimu_fu_ji
+        if len(fu_men) != len(zimu):
+            fu_men = self._zimu_fujia(zimu)
         try:
             _xie_zimu_dao_wenjian(
-                ass_lu, zimu, self._ass_yuan, self._zimu_fujia(zimu),
+                ass_lu, zimu, self._ass_yuan, fu_men,
                 self._ass_jilu_dangqian(), self._zimu_gui_liebiao(len(zimu)),
             )
             xie.append(ass_lu)
