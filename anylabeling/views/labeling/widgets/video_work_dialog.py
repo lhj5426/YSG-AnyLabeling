@@ -8303,76 +8303,88 @@ class ShijianZhou(QtWidgets.QWidget):
     def shezhi_kuai_bian(self, qi_ms=None, zhi_ms=None):
         """把选中的那一条字幕块的开始 / 结束时间设成指定毫秒（帧级夹住）
 
-        只认单选。给 qi_ms 就改开始，给 zhi_ms 就改结束；至少留一帧的宽度。
-        播放头落在够不着的地方（给开始时间时人已经在块尾后面，或给结束时间时
-        人还在块头前面）会做出一块倒挂的块，这种直接不认，原样不动。
-        直接改本地块时间，再喊外面同步右侧列表 / SRT。
+        选中的每一块都改（多选就是一批）。给 qi_ms 就改开始，给 zhi_ms 就改
+        结束；至少留一帧的宽度。播放头落在够不着的地方（给开始时间时人已经在
+        块尾后面，或给结束时间时人还在块头前面）会做出一块倒挂的块，这种那一
+        块跳过，别的照改。直接改本地块时间，再喊外面同步右侧列表 / SRT。
         """
         xuan = self.xuan_zhong_liebiao()
-        if len(xuan) != 1 or self._shichang <= 0:
+        if not xuan or self._shichang <= 0:
             return False
         fps = float(self._fps or 0)
         if fps <= 0:
             return False
-        xu = xuan[0]
-        qi, zhi, wen = self._zimu[xu]
         jian = max(1, int(round(1000.0 / fps)))
-        if qi_ms is not None:
-            xin = max(0, min(int(round(qi_ms)), self._shichang))
-            if xin > zhi - jian:
-                return False
-            qi = xin
-        if zhi_ms is not None:
-            xin = max(0, min(int(round(zhi_ms)), self._shichang))
-            if xin < qi + jian:
-                return False
-            zhi = xin
-        if (qi, zhi) == self._zimu[xu][:2]:
+        gai = []
+        for xu in xuan:
+            if not (0 <= xu < len(self._zimu)):
+                continue
+            qi, zhi, wen = self._zimu[xu]
+            if qi_ms is not None:
+                xin = max(0, min(int(round(qi_ms)), self._shichang))
+                if xin > zhi - jian:
+                    continue        # 这一块倒挂了：跳过，别的照改
+                qi = xin
+            if zhi_ms is not None:
+                xin = max(0, min(int(round(zhi_ms)), self._shichang))
+                if xin < qi + jian:
+                    continue
+                zhi = xin
+            if (qi, zhi) == self._zimu[xu][:2]:
+                continue
+            self._zimu[xu] = (qi, zhi, wen)
+            gai.append((xu, qi, zhi))
+        if not gai:
             return False
-        self._zimu[xu] = (qi, zhi, wen)
         self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
         self.update()
-        self.zimu_nuo.emit([(xu, qi, zhi)])
+        self.zimu_nuo.emit(gai)
         return True
 
     def jin_tie(self, fangxiang):
         """把选中的那一条字幕块的边紧贴到相邻块的边上
 
         fangxiang=+1：块尾贴到下一块的块头；fangxiang=-1：块头贴到上一块的块尾。
-        只认单选。邻块按开始时间认（内部列表顺序不一定排好），贴完会倒挂或者
-        不够一帧宽就不认，原样不动。
+        多选时每一块各贴各的（选中几块就贴几块）。邻块按开始时间认（内部列表
+        顺序不一定排好），贴完会倒挂或者不够一帧宽的那一块跳过，别的照贴。
         """
         xuan = self.xuan_zhong_liebiao()
-        if len(xuan) != 1 or self._shichang <= 0:
+        if not xuan or self._shichang <= 0:
             return False
         fps = float(self._fps or 0)
         if fps <= 0:
             return False
-        xu = xuan[0]
         paixu = sorted(
             range(len(self._zimu)),
             key=lambda i: (self._zimu[i][0], self._zimu[i][1]),
         )
-        wei = paixu.index(xu) + fangxiang
-        if not 0 <= wei < len(paixu):
-            return False
-        lin = paixu[wei]
-        qi, zhi, wen = self._zimu[xu]
         jian = max(1, int(round(1000.0 / fps)))
-        if fangxiang > 0:
-            zhi = int(self._zimu[lin][0])
-            if zhi < qi + jian:
-                return False
-        else:
-            qi = int(self._zimu[lin][1])
-            if qi > zhi - jian:
-                return False
-        if (qi, zhi) == self._zimu[xu][:2]:
+        gai = []
+        for xu in xuan:
+            if not (0 <= xu < len(self._zimu)):
+                continue
+            wei = paixu.index(xu) + fangxiang
+            if not 0 <= wei < len(paixu):
+                continue
+            lin = paixu[wei]
+            qi, zhi, wen = self._zimu[xu]
+            if fangxiang > 0:
+                zhi = int(self._zimu[lin][0])
+                if zhi < qi + jian:
+                    continue
+            else:
+                qi = int(self._zimu[lin][1])
+                if qi > zhi - jian:
+                    continue
+            if (qi, zhi) == self._zimu[xu][:2]:
+                continue
+            self._zimu[xu] = (qi, zhi, wen)
+            gai.append((xu, qi, zhi))
+        if not gai:
             return False
-        self._zimu[xu] = (qi, zhi, wen)
         self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
         self.update()
-        self.zimu_nuo.emit([(xu, qi, zhi)])
+        self.zimu_nuo.emit(gai)
         return True
 
     def tie_xiayikuai_tou(self):
@@ -8380,36 +8392,42 @@ class ShijianZhou(QtWidgets.QWidget):
 
         A：当前块尾 <- 下一块头（当前块变长 / 变短）
         T：下一块头 <- 当前块尾（下一块往前挪 / 往后挪）
-        只认单选。邻块按开始时间找（内部列表顺序不一定排好）；拉完下一块不够
-        一帧宽、或者头跑到自己尾巴后面去了，就不认，原样不动。
+        多选时每一块各管各的下一块。邻块按开始时间找（内部列表顺序不一定排
+        好）；拉完下一块不够一帧宽、或者头跑到自己尾巴后面去了，那一块跳过。
         """
         xuan = self.xuan_zhong_liebiao()
-        if len(xuan) != 1 or self._shichang <= 0:
+        if not xuan or self._shichang <= 0:
             return False
         fps = float(self._fps or 0)
         if fps <= 0:
             return False
-        xu = xuan[0]
         paixu = sorted(
             range(len(self._zimu)),
             key=lambda i: (self._zimu[i][0], self._zimu[i][1]),
         )
-        wei = paixu.index(xu) + 1
-        if not 0 <= wei < len(paixu):
-            return False
-        lin = paixu[wei]
         jian = max(1, int(round(1000.0 / fps)))
-        _qi, zhi_ben, _w = self._zimu[xu]
-        qi_lin, zhi_lin, wen_lin = self._zimu[lin]
-        xin_qi = int(zhi_ben)
-        if xin_qi > zhi_lin - jian:
-            return False        # 拉过来以后下一块还不够一帧宽（或者倒挂了）
-        if xin_qi == int(qi_lin):
+        gai = []
+        for xu in xuan:
+            if not (0 <= xu < len(self._zimu)):
+                continue
+            wei = paixu.index(xu) + 1
+            if not 0 <= wei < len(paixu):
+                continue
+            lin = paixu[wei]
+            _qi, zhi_ben, _w = self._zimu[xu]
+            qi_lin, zhi_lin, wen_lin = self._zimu[lin]
+            xin_qi = int(zhi_ben)
+            if xin_qi > zhi_lin - jian:
+                continue        # 拉过来以后下一块还不够一帧宽（或者倒挂了）
+            if xin_qi == int(qi_lin):
+                continue
+            self._zimu[lin] = (xin_qi, zhi_lin, wen_lin)
+            gai.append((lin, xin_qi, zhi_lin))
+        if not gai:
             return False
-        self._zimu[lin] = (xin_qi, zhi_lin, wen_lin)
         self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
         self.update()
-        self.zimu_nuo.emit([(lin, xin_qi, zhi_lin)])
+        self.zimu_nuo.emit(gai)
         return True
 
     # ---- 选中（单选 / 多选）----
@@ -8488,16 +8506,18 @@ class ShijianZhou(QtWidgets.QWidget):
         self._xuan_duo = [] if xu < 0 else [xu]
         self._miao_dian = xu if xu >= 0 else None
 
-    def _jia_jian_xuan(self, xu):
+    def _jia_jian_xuan(self, xu, kua_gui=False):
         """Ctrl 点击：这条没选中就加上，已选中就去掉
 
-        多选只在一条轨里进行：现在选中的是另一条轨的块时，这一下先把选中
+        多选默认只在一条轨里进行：现在选中的是另一条轨的块时，这一下先把选中
         换成这一条（不把别的轨的块混进同一批）—— 时间轴上选中的一批永远
         是一条轨的，Shift 连选、框选、Ctrl+A 都守这个规矩。
+        kua_gui=True（按住 Alt 点）：上面那条轨的限制不管，几条轨的块也能混成
+        一批（对轴时经常要把上下两轨的同一句一起挪）。
         """
         xu = int(xu)
         dang = self.zimu_hang(xu)
-        if self._xuan_duo:
+        if self._xuan_duo and not kua_gui:
             zhuan = self._xuan_zhong
             if not (0 <= zhuan < len(self._zimu)):
                 zhuan = self._xuan_duo[0]
@@ -10789,6 +10809,11 @@ class ShijianZhou(QtWidgets.QWidget):
             xu, buwei = self._zimu_zai_dian(x, y)
             xiu = event.modifiers()
             # Ctrl / Shift 点击只改选择：不拖动，也不跳转
+            # Alt 点击 = 跨轨加选（Ctrl 那个只在一条轨里选）
+            if xu >= 0 and (xiu & Qt.AltModifier):
+                self._jia_jian_xuan(xu, kua_gui=True)
+                event.accept()
+                return
             if xu >= 0 and (xiu & Qt.ControlModifier):
                 self._jia_jian_xuan(xu)
                 event.accept()
@@ -10836,6 +10861,11 @@ class ShijianZhou(QtWidgets.QWidget):
             self._kuang = {
                 "x0": x, "y0": y, "x1": x, "y1": y, "dong": False,
                 "hang": self._hang_zai_dian(y),
+                # 按住 Alt 起手 = 加选：框到的并进原来那批，不清掉已选的
+                "bao": (
+                    list(self._xuan_duo)
+                    if (event.modifiers() & Qt.AltModifier) else None
+                ),
             }
             self._xuanfu_zimu = None
             event.accept()
@@ -10996,6 +11026,9 @@ class ShijianZhou(QtWidgets.QWidget):
             self.setCursor(Qt.CrossCursor)
         if k["dong"]:
             ming = self._kuang_ming_zhong()
+            if k.get("bao"):
+                # Alt 起手的框选 = 加选：框里的并进起手前那批，往回缩也只减框里的
+                ming = sorted(set(k["bao"]) | set(ming))
             if ming != self._xuan_duo:
                 # 只有"框到的块变了"才重设选中并通知外面：每挪一个像素都
                 # 去刷一遍字幕列表没必要，那一批本来就是同一次选择
@@ -11054,10 +11087,13 @@ class ShijianZhou(QtWidgets.QWidget):
         if self._kuang is None:
             return
         dong = self._kuang["dong"]
+        bao = bool(self._kuang.get("bao"))
         self._kuang = None
         self.setCursor(Qt.PointingHandCursor)
-        if dong:
-            return          # 选谁在拖动中已经实时选好了，这儿不再动
+        if dong or bao:
+            # 拖过：选谁在拖动中已经实时选好了
+            # Alt 起手的：这一下只是"想加选但没框到东西"，原来那批留着
+            return
         # 没拖（就是点了一下空白）：清空选中
         if self._xuan_duo or self._xuan_zhong >= 0:
             self._xuan_ze_dan(-1)
@@ -13847,8 +13883,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self.you_fangxiang_jian.activated.connect(
             lambda: self._fangxiangjian_tiaobu(1)
         )
+        # Shift + 左右 = 一次 5 帧。走应用级按键过滤（见 eventFilter），不走
+        # QShortcut —— 焦点在字幕编辑框里时那儿 Shift+方向键是选文字，会把
+        # 快捷键吃掉，而调轴时人往往正停在编辑框里。
 
-        # Q/W/E/R + A/D/T = 打轴（只认单选的字幕块），Aegisub 那套：
+        # Q/W/E/R + A/D/T = 打轴（对选中的块生效，多选就是一批），Aegisub 那套：
         # Q 播放头跳到块开头、W 跳到块结尾、E 把块开头设到播放头、R 把块结尾设到播放头，
         # A 把块尾紧贴下一块的块头、D 把块头紧贴上一块的块尾，
         # T 反过来把下一块的开头拉到本块的结尾。
@@ -16762,30 +16801,34 @@ class VideoWorkDialog(QtWidgets.QDialog):
         return self._zhen_kuang(zhen, wei=True)
 
     def _dazhou_an(self, dongzuo):
-        """Q / W / E / R / A / D / T 打轴：只认选中的那一条字幕块（单选）
+        """Q / W / E / R / A / D / T 打轴：对选中的字幕块生效（多选就是一批）
 
-        Q 播放头 -> 块开始帧；W 播放头 -> 块结束帧；
+        Q 播放头 -> 块开始帧（多条时按最早那个块头）；W 播放头 -> 块结束帧
+        （多条时按最晚那个块尾）；
         E 块开始 <- 播放头；R 块结束 <- 播放头；
         A 块尾贴下一块块头；D 块头贴上一块块尾；
         T 下一块块头贴到本块块尾（A 的镜像：A 挪本块的尾巴，T 挪下一块的头）。
         """
         if self.duqu is None or self.fps <= 0:
             return
-        xuan = self.shijianzhou.xuan_zhong_liebiao()
-        if len(xuan) != 1:
-            return
-        xu = xuan[0]
         zimu = self.shijianzhou.zimu_liebiao()
-        if not (0 <= xu < len(zimu)):
+        xuan = [
+            x for x in self.shijianzhou.xuan_zhong_liebiao()
+            if 0 <= x < len(zimu)
+        ]
+        if not xuan:
             return
-        qi, zhi, _w = zimu[xu]
         if dongzuo == "Q":
             self._zanting()
             # 块里的时间是按 AEG 那套"帧的中点"写的，反查帧号也得按那套认
-            self._tiaozheng_zhen(ms_tou_zhen(qi, self.fps, wei=False))
+            self._tiaozheng_zhen(
+                ms_tou_zhen(min(int(zimu[x][0]) for x in xuan), self.fps, wei=False)
+            )
         elif dongzuo == "W":
             self._zanting()
-            self._tiaozheng_zhen(ms_tou_zhen(zhi, self.fps, wei=True))
+            self._tiaozheng_zhen(
+                ms_tou_zhen(max(int(zimu[x][1]) for x in xuan), self.fps, wei=True)
+            )
         elif dongzuo == "E":
             self.shijianzhou.shezhi_kuai_bian(qi_ms=self._tou_ms())
         elif dongzuo == "R":
@@ -16820,7 +16863,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
         if not (0 <= xu < len(self.zimu_mianban.zimu_liebiao())):
             return
         if self.shijianzhou.xuan_zhong_liebiao() != [xu]:
-            self._shoudao_xuan_zhong_zimu(xu)
+            # 列表这条已经在时间轴的多选里：保住那一批，别打回单选
+            if xu not in self.shijianzhou.xuan_zhong_liebiao():
+                self._shoudao_xuan_zhong_zimu(xu)
         self._dazhou_an(dongzuo)
 
     def _tiaobu(self, ms):
@@ -16830,6 +16875,12 @@ class VideoWorkDialog(QtWidgets.QDialog):
         mubiao_ms = max(0, min(self.shichang_ms, self._dangqian_ms() + ms))
         zhen = _ms_zhen(mubiao_ms, self.fps)
         self._tiaozheng_zhen(max(0, min(self.zong_zhen - 1, zhen)))
+
+    def _tiaobu_kuai(self, fangxiang):
+        """Shift+左 / 右：一次走 5 帧（跟旋钮一格对齐，长距离挪不用按几十下）"""
+        if self.fps <= 0:
+            return
+        self._tiaobu(fangxiang * 5 * (1000.0 / self.fps))
 
     def _tiaozheng_zhen(self, zhen_hao, yinpin=True, jingque=None):
         """定位到第 zhen_hao 帧；返回吸附到该帧后的毫秒数
@@ -17681,15 +17732,24 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 样式编辑器还开着的话让它重读：左侧「全部样式」要跟着长出新的，
         # 正编那条的字体 / 颜色也要换成刚写进去的 —— 不然框里还是旧值，
         # 一点确定就把旧值又覆盖回去
-        chuang = getattr(self, "_yangshi_chuang", None)
-        if chuang is not None:
-            try:
-                chuang.chong_du([
-                    (m, self.ym_jiao_du(m)) for m in self._zimu_yangshi_ming()
-                ])
-            except (RuntimeError, AttributeError):
-                pass        # 窗口已经关了 / 老版本没有这个方法
+        self._yangshi_chuang_chong_du()
         return True
+
+    def _yangshi_chuang_chong_du(self):
+        """样式编辑器还开着就让它重读一遍样式表
+
+        新建 / 复制进来 / 删除之后都得调：不然左侧「全部样式」还是旧的那几条，
+        要等点一下别的样式才刷出来。
+        """
+        chuang = getattr(self, "_yangshi_chuang", None)
+        if chuang is None:
+            return
+        try:
+            chuang.chong_du([
+                (m, self.ym_jiao_du(m)) for m in self._zimu_yangshi_ming()
+            ])
+        except (RuntimeError, AttributeError):
+            pass        # 窗口已经关了 / 老版本没有这个方法
 
     def ym_jiao_shan(self, ming_men):
         """从当前字幕的样式表里删掉这几条（照 AEG 的 OnCurrentDelete）
@@ -17713,6 +17773,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 h["Style"] = "Default"
         self._zimu_hua_ji = None
         self._ass_qing_jilu = None      # 行解析缓存重来，不然还是旧样式名
+        self._yangshi_chuang_chong_du()
         return True
 
     def ym_jiao_pai(self, ming_men):
@@ -21609,7 +21670,7 @@ class VideoWorkDialog(QtWidgets.QDialog):
 
     def eventFilter(self, duixiang, shijian):
         """视频工作台的全局按键：Tab / ` / ~ / Alt+Ins / Ctrl+Z / Ctrl+Y
-        / Alt+←→ / Alt+Q/W/E/R/A/D/T / J
+        / Alt+←→ / Shift+←→ / Alt+Q/W/E/R/A/D/T / J
 
         这几个键在视频工作台里哪儿按都好使（焦点在字幕编辑框里照样），而且
         Tab、波浪号不许落进输入框变成缩进 / 字符。J 是"按住拉范围建块"，
@@ -21684,6 +21745,14 @@ class VideoWorkDialog(QtWidgets.QDialog):
             and shijian.modifiers() == Qt.AltModifier
         ):
             self._shoudao_xiayitiao()
+            return True
+        # Shift+←/→：一次走 5 帧。焦点在字幕编辑框里也照走 —— 那儿 Shift+方向键
+        # 本来是"选文字"，调轴时人往往正停在框里，只能抢掉。
+        if (
+            shijian.modifiers() == Qt.ShiftModifier
+            and shijian.key() in (Qt.Key_Left, Qt.Key_Right)
+        ):
+            self._tiaobu_kuai(-1 if shijian.key() == Qt.Key_Left else 1)
             return True
         if shijian.modifiers() & (
             Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier

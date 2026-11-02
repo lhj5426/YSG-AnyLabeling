@@ -5847,8 +5847,9 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
             zi = dict(xin[zhao])
             zi["name"] = zhao
             self._tian_quanbu(zi)
-        else:
-            self._chong_liebiao()
+        # 列表无论正编那条在不在都要重铺：_tian_quanbu 只填控件不碰左侧列表，
+        # 只调它的话新复制进来的那条要等点一下别的样式才冒出来
+        self._chong_liebiao()
 
     def _xin_jian_yangshi(self):
         """「新建样式」：控件换成一份干净默认（照 AEG 的 New）"""
