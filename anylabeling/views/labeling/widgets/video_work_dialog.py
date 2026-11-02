@@ -3734,9 +3734,38 @@ def _touming_biaoqian(wei, a):
     return "\\%s&H%02X&" % (_YANSE_TOUMING.get(str(wei), "1a"), a)
 
 
+# 行首「重置样式」那一块的定位：{\r} 或 {\rStyleName}。加了 \r 的那一串块是
+# 给人看的整体（{\fnX}「{\r}），不能拆开往里塞东西。
+_ASS_HANGTOU_R = re.compile(r"\{[^{}]*\\r(?:[A-Za-z0-9_\- ]*)?[^{}]*\}")
+
+
+def _hangtou_r_wei(s):
+    """行首那一串块里 {\r} 的位置 (起点, 终点)；没有给 None
+
+    行首常写成 {\fnX}「{\r}：{\r} 会把前面所有标签打回样式默认值，所以新加的
+    标签必须落在它后面，否则等于没写（发光、渐变就是这么被清掉的）。
+
+    只认真正在行首的那个 \r：它前面除了标签块，最多只允许一两个字（「 （ 这种
+    包在正文外面的符号）。正文中间手写的 {\bord0}某几个字{\bord5} 不碰。
+    """
+    m = _ASS_HANGTOU_R.search(s)
+    if m is None:
+        return None
+    if len(re.sub(r"\{[^{}]*\}", "", s[:m.start()])) > 2:
+        return None
+    return m.start(), m.end()
+
+
 def _jia_biaoqian(wen, biao):
-    """往开头那对花括号里加一个行内标签（没有就新建一对）"""
+    """往行首加一段行内标签（没有就新建一块）
+
+    行首要是写了 {\r}（{fnX}「{\r} 这种），新标签单独成块插在它**后面** ——
+    塞进 \r 前面那一块里等于被重置掉。没有 \r 就照老样子塞进第一块。
+    """
     wen = str(wen or "")
+    r_wei = _hangtou_r_wei(wen)
+    if r_wei is not None:
+        return wen[:r_wei[1]] + "{" + biao + "}" + wen[r_wei[1]:]
     pi = re.match(r"^\{([^{}]*)\}", wen)
     if pi:
         return "{" + pi.group(1) + biao + "}" + wen[pi.end():]
@@ -3744,19 +3773,32 @@ def _jia_biaoqian(wen, biao):
 
 
 def _qu_biaoqian_li(wen, *zhengs):
-    """只从行首那对花括号里摘掉匹配的标签
+    """只从行首那一块里摘掉匹配的标签
 
     不能直接对整行做 re.sub：行里还有 {\bord0}某几个字{\bord5} 这种分段写法，
-    全局替换会把人家自己写的描边一起抹了。行首那个块是工作台自己拼的，只动它。
+    全局替换会把人家自己写的描边一起抹了。要清的那块跟 _jia_biaoqian 加的是
+    同一块：行首写了 {\r} 就是它后面那块，否则是行首第一块。
     """
     s = str(wen or "")
-    pi = re.match(r"^\{([^{}]*)\}", s)
-    if not pi:
-        return s
-    nei = pi.group(1)
+    r_wei = _hangtou_r_wei(s)
+    if r_wei is not None:
+        qi = r_wei[1]
+        pi = re.match(r"\{[^{}]*\}", s[qi:])
+        if not pi:
+            return s
+        zhi = qi + pi.end()
+    else:
+        pi = re.match(r"^\{[^{}]*\}", s)
+        if not pi:
+            return s
+        qi, zhi = 0, pi.end()
+    nei = s[qi:zhi]
     for zheng in zhengs:
         nei = re.sub(zheng, "", nei)
-    return "{" + nei + "}" + s[pi.end():]
+    nei = nei.strip()
+    if nei in ("", "{}"):
+        return s[:qi] + s[zhi:]      # 整块清空了就删掉，别留一对空花括号
+    return s[:qi] + nei + s[zhi:]
 
 
 def _wei_yiduan(wen, xuan, qian, hou):
@@ -4240,20 +4282,16 @@ def _zhemo_chun_wen(wenben):
 
 
 def _suoding_chun_wen(wenben):
-    """「锁定代码」开着时该显示的写法：第一个 { 到最后一个 } 那一整段不画
+    """「锁定代码」开着时该显示的写法：行里的 {…} 标签块全部不画，只留台词
 
-    规矩就一条 —— 最开始的 { 到最结尾的 }，中间夹着的东西（两块代码之间夹的
-    字，比如 {\\fn..}—{\\r}{\\c..&} 里那个 —）一起算进去；} 之后剩下的才是台词。
-    数据一个字节都不动，纯粹是画的时候少画一段。
+    以前是"第一个 { 到最后一个 }"整段不画。遇上
+    {\\fnX}「{\\r}正文{\\fnX}」{\\r} 这种两头都有标签的写法，第一个 { 在最前、
+    最后一个 } 在最后，整行就被当成代码了，台词一个字都不剩。
+    现在改成逐块摘：每个花括号包起来的块都不画，块与块之间夹的字（引号、
+    破折号这些）照常显示 —— 上面那行显示出来就是「正文」。
+    数据一个字节都不动，纯粹是画的时候少画几段。
     """
-    wen = str(wenben or "")
-    qi = wen.find("{")
-    if qi < 0:
-        return wen
-    zhi = wen.rfind("}")
-    if zhi < qi:
-        return wen
-    return wen[:qi] + wen[zhi + 1:]
+    return re.sub(r"\{[^{}]*\}", "", str(wenben or ""))
 
 
 def _zhemo_jia_yanse(wenben, se, bai_bian=False, bian_se=None, bian_kuan=5,
@@ -4690,16 +4728,18 @@ def _pos_du(wenben):
 
 
 def _pos_xie_ru(wenben, x, y):
-    """把 \\pos(x,y) 写进这一行：已经有 \\pos 的就地换，没有就塞进开头那对花括号"""
+    """把 \\pos(x,y) 写进这一行：已经有 \\pos 的就地换，没有就交给 _jia_biaoqian
+
+    没有的话不能再往开头第一个 {…} 里塞 —— 行首常是 {\fnX}「{\r}，塞进去就变成
+    {\fnX\pos(..)}，跟后面的 {\r} 隔着，看着就是一坨；_jia_biaoqian 会插在 \r
+    后面单独成块。
+    """
     jia = "\\pos(%d,%d)" % (int(round(x)), int(round(y)))
     wen = str(wenben or "")
     xin, ci = re.subn(r"\\pos\([^)]*\)", lambda m: jia, wen, count=1)
     if ci:
         return xin
-    pi = re.match(r"^(\{[^}]*\})", wen)
-    if pi:
-        return "{" + pi.group(1)[1:-1] + jia + "}" + wen[pi.end():]
-    return "{" + jia + "}" + wen
+    return _jia_biaoqian(wen, jia)
 
 
 def _pos_luo_dao(wenben, x, y):
@@ -7707,10 +7747,13 @@ def _faguang_wenben(wen, kuan, mo, nong):
     找回配对，不再多插一条），Aegisub 里当未知标签原样留着，不影响显示。
     """
     s = str(wen or "")
-    pi = re.match(r"^\{([^{}]*)\}", s)
-    nei = pi.group(1) if pi else ""
-    wei = s[pi.end():] if pi else s
-    for zheng in (
+    # 上一次留在最前面那块光晕（管 {\fnX}「 里那个「）先摘掉，不然每设一次多一块
+    s = re.sub(r"^\{(?=[^{}]*\\1fg\(hui\))[^{}]*\}", "", s)
+    # 再把工作台自己加的那块摘干净（行首有 {\r} 就是它后面那块，否则是第一块）：
+    # 本体的 \bord5 留在光晕条里会把 \bord10\blur22 盖掉，发光就没了。
+    # 清完这一步，行首只剩 {\fnX}「{\r} 这类给人看的块，一个字都不动。
+    s = _qu_biaoqian_li(
+        s,
         r"\\1vc\([^)]*\)",              # 渐变色：光晕不要
         r"\\1fg\([^)]*\)",              # 上一次的发光参数 / 记号
         r"\\bord-?\d+(?:\.\d+)?",
@@ -7720,14 +7763,25 @@ def _faguang_wenben(wen, kuan, mo, nong):
         r"\\1c&?H?[0-9A-Fa-f]{6,8}&?",
         r"\\1a&?H?[0-9A-Fa-f]{2,8}&?",
         r"\\3a&?H?[0-9A-Fa-f]{2,8}&?",
-    ):
-        nei = re.sub(zheng, "", nei)
+    )
     jia = "\\bord%g\\blur%g\\3c&HFFFFFF&\\3a&H%02X&\\1a&HFF&\\shad0\\1fg(hui)" % (
         max(0.0, float(kuan)),
         max(0.0, float(mo)),
         255 - max(0, min(255, int(nong))),
     )
-    return "{%s%s}%s" % (nei, jia, wei)
+    # 清完可能剩个 {\pos(x,y)} 的空壳：锚点是有用的（光晕跟本体要标同一个点），
+    # 但没必要留一串碎块，并进光晕那块里
+    m = re.search(r"\{\\pos\([^)]*\)\}", s)
+    if m is not None:
+        s = s[:m.start()] + s[m.end():]
+        jia = m.group(0)[1:-1] + jia
+    # 行首写了 {\fnX}「{\r} 的话要加两块：
+    #   最前面一块管 {\fnX}「 里那个「（\r 之前），不加的话引号不带光；
+    #   \r 后面一块管正文（\r 会把前面全重置，所以得再写一遍）。
+    # 没有 \r 就是普通一行，_jia_biaoqian 会塞进第一块。
+    if _hangtou_r_wei(s) is not None:
+        s = "{" + jia + "}" + s
+    return _jia_biaoqian(s, jia)
 
 
 def _du_jianbian_wenzi(wen):
@@ -7945,6 +7999,7 @@ class ShijianZhou(QtWidgets.QWidget):
     yanse_quan = pyqtSignal()               # 空白处右键「批量提取字幕颜色」-> 走⑨全量那路
     shuohua_fenpei = pyqtSignal()           # 空白处右键「用颜色设置样式和说话人」-> 外面弹预览框
     shuohua_fen_gui = pyqtSignal()          # 空白处右键「按说话人分轨道」-> 外面重排行号
+    yangshi_kuai_yanse = pyqtSignal()       # 空白处右键「用样式设置字幕块颜色」-> 按每条字幕的 Style 取色
     hebing_gui = pyqtSignal()               # 空白处右键「合并到一条轨道」-> 外面收回第 1 轨
     jianbian_zi = pyqtSignal(object)        # 选中块右键「设置渐变发光」-> 外面弹设置框
     qingkong_wenben = pyqtSignal(object)    # 选中块右键「清空文本」-> 外面把这几块的文字清空
@@ -8318,6 +8373,43 @@ class ShijianZhou(QtWidgets.QWidget):
         self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
         self.update()
         self.zimu_nuo.emit([(xu, qi, zhi)])
+        return True
+
+    def tie_xiayikuai_tou(self):
+        """把**下一块的开头**拉到当前块的结尾（A 是反过来：挪当前块的尾巴）
+
+        A：当前块尾 <- 下一块头（当前块变长 / 变短）
+        T：下一块头 <- 当前块尾（下一块往前挪 / 往后挪）
+        只认单选。邻块按开始时间找（内部列表顺序不一定排好）；拉完下一块不够
+        一帧宽、或者头跑到自己尾巴后面去了，就不认，原样不动。
+        """
+        xuan = self.xuan_zhong_liebiao()
+        if len(xuan) != 1 or self._shichang <= 0:
+            return False
+        fps = float(self._fps or 0)
+        if fps <= 0:
+            return False
+        xu = xuan[0]
+        paixu = sorted(
+            range(len(self._zimu)),
+            key=lambda i: (self._zimu[i][0], self._zimu[i][1]),
+        )
+        wei = paixu.index(xu) + 1
+        if not 0 <= wei < len(paixu):
+            return False
+        lin = paixu[wei]
+        jian = max(1, int(round(1000.0 / fps)))
+        _qi, zhi_ben, _w = self._zimu[xu]
+        qi_lin, zhi_lin, wen_lin = self._zimu[lin]
+        xin_qi = int(zhi_ben)
+        if xin_qi > zhi_lin - jian:
+            return False        # 拉过来以后下一块还不够一帧宽（或者倒挂了）
+        if xin_qi == int(qi_lin):
+            return False
+        self._zimu[lin] = (xin_qi, zhi_lin, wen_lin)
+        self._jing_ban += 1     # 字幕数据变了，静层缓存作废（见 _jing_tu）
+        self.update()
+        self.zimu_nuo.emit([(lin, xin_qi, zhi_lin)])
         return True
 
     # ---- 选中（单选 / 多选）----
@@ -11015,6 +11107,7 @@ class ShijianZhou(QtWidgets.QWidget):
         a_hebing_gui = None
         a_xinjian_xuan = None
         a_qingwen = None
+        a_yangshi_yanse = None
         a_yin_gui = a_jia_gui = a_xian_gui = None
         a_zhi_qian = a_zhi_hou = None
         mu_qian, mu_hou = [], []
@@ -11095,6 +11188,10 @@ class ShijianZhou(QtWidgets.QWidget):
             a_yanse_quan = cai.addAction("批量提取字幕颜色")
             a_shuohua_fenpei = cai.addAction("用颜色设置样式和说话人")
             a_shuohua_fenpei.setEnabled(bool(self._zimu))
+            # 投稿的字幕常没有说话人（大佬们只用样式区分角色），按说话人取色
+            # 会整屏一片默认蓝。这一下不看说话人，直接按每条自己的 Style 取色。
+            a_yangshi_yanse = cai.addAction("用样式设置字幕块颜色")
+            a_yangshi_yanse.setEnabled(bool(self._zimu))
             # 每个说话人一条轨道：同一人说的全排到同一行，认轨 / 改样式都方便
             a_shuohua_fen_gui = cai.addAction("按说话人分轨道")
             a_shuohua_fen_gui.setEnabled(bool(self._zimu))
@@ -11158,6 +11255,8 @@ class ShijianZhou(QtWidgets.QWidget):
             self.yanse_quan.emit()
         elif dian_xuan is a_shuohua_fenpei:
             self.shuohua_fenpei.emit()
+        elif dian_xuan is a_yangshi_yanse:
+            self.yangshi_kuai_yanse.emit()
         elif dian_xuan is a_shuohua_fen_gui:
             self.shuohua_fen_gui.emit()
         elif dian_xuan is a_hebing_gui:
@@ -11416,12 +11515,24 @@ def _qiepian_wei_tiao(ms, moshi, shu, fps):
     return max(0, int(ms))
 
 
-def _ys_ge_zi_anniu():
+def _ys_ge_zi_anniu(xuan=False):
     """预览框展开区里那种行号小格子（鼠标移上去变主色）
 
     直角、不留边 —— 跟表里那些格子一个规矩，别搞成圆角。
+    xuan=True：这一条被 Ctrl / Shift 选中了（准备挪到别的组），换成主色
     """
     c = _ys()
+    if xuan:
+        return f"""
+    QPushButton {{
+        background-color: {c['zhuse']};
+        color: #ffffff;
+        border: 1px solid {c['zhuse']};
+        border-radius: 0;
+        font-size: 11px;
+        padding: 0;
+    }}
+    """
     return f"""
     QPushButton {{
         background-color: {c['mian']};
@@ -11905,6 +12016,9 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         self._jieguo = []
         self._zhankai = set()       # 展开了哪几组（组下标）
         self._biao_hang = {}        # 组下标 -> 它在表里的行号（展开行不算）
+        self._tiao_xuan = set()     # 展开区里选中的条目（字幕下标），准备挪组
+        self._tiao_mao = None       # 上次点的那一条（Shift 连选从这儿算起）
+        self._gezi_an = {}          # 字幕下标 -> 展开区那个行号按钮（刷样式用）
 
         zong = QtWidgets.QVBoxLayout(self)
         zong.setContentsMargins(14, 12, 14, 12)
@@ -12115,6 +12229,7 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
         """
         self.biao.setRowCount(0)
         self._biao_hang = {}
+        self._gezi_an = {}
         ming = self._yang_ming()
         for i, h in enumerate(self._hang):
             r = self.biao.rowCount()
@@ -12350,13 +12465,136 @@ class ShuohuaFenpeiDialog(QtWidgets.QDialog):
             an = QtWidgets.QPushButton(str(xu + 1))
             an.setFixedSize(48, SHUOHUA_GE_ZI_GAO)
             an.setCursor(Qt.PointingHandCursor)
-            an.setStyleSheet(_ys_ge_zi_anniu())
-            an.setToolTip(f"跳到第 {xu + 1} 条")
-            an.clicked.connect(lambda _=False, x=xu: self.tiao_dao.emit(x))
+            an.setStyleSheet(_ys_ge_zi_anniu(xu in self._tiao_xuan))
+            an.setToolTip(f"第 {xu + 1} 条（Ctrl 加选 / Shift 连选，右键可并入别的组）")
+            self._gezi_an[xu] = an
+            an.clicked.connect(
+                lambda _=False, x=xu, z=i, b=an: self._dian_tiao(x, z, b)
+            )
+            an.setContextMenuPolicy(Qt.CustomContextMenu)
+            an.customContextMenuRequested.connect(
+                lambda p, x=xu, z=i, b=an: self._tiao_you_jian(x, z, b, p)
+            )
             bu.addWidget(an)
         qu.setWidget(nei)
         self.biao.setCellWidget(r, 0, qu)
         return r
+
+    def _shua_gezi(self):
+        """按当前选中状态把展开区那排行号格子重刷一遍（Shift 一次要刷一片）"""
+        for xu, an in self._gezi_an.items():
+            try:
+                an.setStyleSheet(_ys_ge_zi_anniu(xu in self._tiao_xuan))
+            except RuntimeError:        # 格子已经被重建掉了
+                pass
+
+    def _dian_tiao(self, xu, zu, an):
+        """点了行号格子
+
+        · Ctrl：选中 / 取消这一条，可以连着挑
+        · Shift：从上次点的那条连到这条，中间全选上
+        · 不带修饰键：清空选中，只跳过去看
+        三种情况画面都跟着跳到点到的这一条 —— 加选时也得看着画面才知道这条
+        该不该归到这个组里。
+        """
+        zhu = QtWidgets.QApplication.keyboardModifiers()
+        if zhu & Qt.ShiftModifier and self._tiao_mao is not None:
+            lie = (
+                [int(x) for x in self._hang[zu]["xu"]]
+                if 0 <= zu < len(self._hang) else []
+            )
+            if xu in lie and self._tiao_mao in lie:
+                a, b = lie.index(self._tiao_mao), lie.index(xu)
+                if a > b:
+                    a, b = b, a
+                self._tiao_xuan.update(lie[a:b + 1])
+            else:
+                self._tiao_xuan.add(xu)
+                self._tiao_mao = xu
+            self._shua_gezi()
+        elif zhu & Qt.ControlModifier:
+            if xu in self._tiao_xuan:
+                self._tiao_xuan.discard(xu)
+            else:
+                self._tiao_xuan.add(xu)
+            self._tiao_mao = xu
+            an.setStyleSheet(_ys_ge_zi_anniu(xu in self._tiao_xuan))
+        else:
+            self._tiao_xuan.clear()
+            self._tiao_mao = xu
+            self._shua_gezi()
+        self.tiao_dao.emit(xu)
+
+    def _tiao_you_jian(self, xu, zu, an, dian):
+        """行号格子上点右键：把选中的这几个条目并入别的组
+
+        只处理跟右键这一条**同一组**的选中项（跨组挑的不动，免得把别的组也
+        端走）。右键压在没选中的格子上就只挪它自己。
+        """
+        if not (0 <= zu < len(self._hang)):
+            return
+        ben_zu = {int(x) for x in self._hang[zu]["xu"]}
+        mu = sorted(x for x in self._tiao_xuan if x in ben_zu)
+        if xu not in mu:
+            mu = [xu]
+        cai = QtWidgets.QMenu(self)
+        if len(mu) == 1:
+            biaoti = cai.addAction(f"第 {mu[0] + 1} 条（在第 {zu + 1} 组里）")
+        else:
+            hao = "、".join(str(x + 1) for x in mu[:10])
+            if len(mu) > 10:
+                hao += "…"
+            biaoti = cai.addAction(f"这 {len(mu)} 条：第 {hao} 条")
+        biaoti.setEnabled(False)
+        cai.addSeparator()
+        zi = cai.addMenu("并入到…")
+        for i, h in enumerate(self._hang):
+            if i == zu:
+                continue
+            dong = zi.addAction(
+                f"第 {i + 1} 组 · {h['ming']} · {h['shu']} 条"
+            )
+            dong.triggered.connect(
+                lambda _=False, a=list(mu), c=zu, b=i:
+                self._ba_tiao_bing_ru(a, c, b)
+            )
+        if not zi.actions():
+            zi.setEnabled(False)
+        cai.exec_(an.mapToGlobal(dian))
+
+    def _ba_tiao_bing_ru(self, xu_men, cong, dao):
+        """把第 cong 组里的这几个条目挪到第 dao 组
+
+        只挪条目的归属：颜色表、旁白 / 对话的判定一个都不动。原来那组挪空了
+        就整行删掉，展开状态跟着往前挪一格。
+        """
+        if cong == dao:
+            return
+        if not (0 <= cong < len(self._hang)) or not (0 <= dao < len(self._hang)):
+            return
+        self._cun_biao()        # 表里刚改过的名字先收回来
+        yuan = {int(x) for x in self._hang[cong]["xu"]}
+        pao = {int(x) for x in (xu_men or [])} & yuan
+        if not pao:
+            return
+        cong_xu = [int(x) for x in self._hang[cong]["xu"] if int(x) not in pao]
+        dao_xu = sorted({int(x) for x in self._hang[dao]["xu"]} | pao)
+        self._hang[cong]["xu"] = cong_xu
+        self._hang[cong]["shu"] = len(cong_xu)
+        self._hang[dao]["xu"] = dao_xu
+        self._hang[dao]["shu"] = len(dao_xu)
+        self._tiao_xuan.clear()
+        if not cong_xu:
+            xin = set()
+            for i in self._zhankai:
+                if i == cong:
+                    continue
+                xin.add(i - 1 if i > cong else i)
+            self._zhankai = xin
+            del self._hang[cong]
+        self._chong_bian_hao()
+        self._tian_biao()
+        self._shua_tishi()
 
     def _zhan_gai_gao(self, i):
         """重算某个展开行要多高（表宽一变，一行摆几个格子就跟着变）
@@ -13434,6 +13672,10 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 不变，不用每帧重解（几百条时每帧全表拷贝 + 重解析就卡）
         self._huamian_ban = -1        # 字幕面板数据版本（整表缓存用）
         self._huamian_zimu = []       # 缓存的那份整表
+        # 时间轴块底色按哪套规矩取：False = 照说话人（老规矩）；
+        # True = 只照每条自己的样式（右键「用样式设置字幕块颜色」之后一直用它，
+        # 不然改一个字就整屏刷回默认蓝）
+        self._yanse_an_yangshi = False
         self._jie_ji = ({}, None)     # ({(文字, 样式, 边距): 解析结果}, 样式表)
         # 画面字幕上一帧发下去的签名：一模一样就不重发（见 _shuaxin_huamian_zimu）
         self._huamian_zimu_qian = None
@@ -13606,15 +13848,17 @@ class VideoWorkDialog(QtWidgets.QDialog):
             lambda: self._fangxiangjian_tiaobu(1)
         )
 
-        # Q/W/E/R + A/D = 打轴（只认单选的字幕块），Aegisub 那套：
+        # Q/W/E/R + A/D/T = 打轴（只认单选的字幕块），Aegisub 那套：
         # Q 播放头跳到块开头、W 跳到块结尾、E 把块开头设到播放头、R 把块结尾设到播放头，
-        # A 把块尾紧贴下一块的块头、D 把块头紧贴上一块的块尾。
+        # A 把块尾紧贴下一块的块头、D 把块头紧贴上一块的块尾，
+        # T 反过来把下一块的开头拉到本块的结尾。
         # 同样做成本窗口的快捷键（打开本窗口时主界面那批应用级快捷键已被降级，抢不走）。
         self.dazhou_jian = {}
         for jian_ming, dongzuo in (
             (Qt.Key_Q, "Q"), (Qt.Key_W, "W"),
             (Qt.Key_E, "E"), (Qt.Key_R, "R"),
             (Qt.Key_A, "A"), (Qt.Key_D, "D"),
+            (Qt.Key_T, "T"),
         ):
             jian = QtWidgets.QShortcut(QtGui.QKeySequence(jian_ming), self)
             jian.setContext(Qt.WindowShortcut)
@@ -15877,6 +16121,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
         )
         # 空白处右键「用颜色设置样式和说话人」-> 跟面板⑨那个按钮同一条路
         self.shijianzhou.shuohua_fenpei.connect(self._kaishi_shuohua_fenpei)
+        self.shijianzhou.yangshi_kuai_yanse.connect(
+            self._yong_yangshi_she_kuai_yanse
+        )
         # 上次勾的「预览切片点」状态从 ini 里捡回来（重启后不用重勾）
         _qiepian_jiu = self._qiepian_du_peizhi()
         self.shijianzhou.qiepian_yulan_shezhi(
@@ -16515,11 +16762,12 @@ class VideoWorkDialog(QtWidgets.QDialog):
         return self._zhen_kuang(zhen, wei=True)
 
     def _dazhou_an(self, dongzuo):
-        """Q / W / E / R / A / D 打轴：只认选中的那一条字幕块（单选）
+        """Q / W / E / R / A / D / T 打轴：只认选中的那一条字幕块（单选）
 
         Q 播放头 -> 块开始帧；W 播放头 -> 块结束帧；
         E 块开始 <- 播放头；R 块结束 <- 播放头；
-        A 块尾贴下一块块头；D 块头贴上一块块尾。
+        A 块尾贴下一块块头；D 块头贴上一块块尾；
+        T 下一块块头贴到本块块尾（A 的镜像：A 挪本块的尾巴，T 挪下一块的头）。
         """
         if self.duqu is None or self.fps <= 0:
             return
@@ -16546,6 +16794,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self.shijianzhou.jin_tie(1)
         elif dongzuo == "D":
             self.shijianzhou.jin_tie(-1)
+        elif dongzuo == "T":
+            # 跟 A 相反：A 是把当前块的尾巴挪过去，T 是把下一块的头拉过来
+            self.shijianzhou.tie_xiayikuai_tou()
 
     def _zai_zimu_liebiao(self, duixiang):
         """这一下按键是不是发生在「字幕列表」（下块那个深色列表）里"""
@@ -17427,6 +17678,17 @@ class VideoWorkDialog(QtWidgets.QDialog):
             return False
         self._ass_yuan["tou"] = tou
         self._zimu_hua_ji = None
+        # 样式编辑器还开着的话让它重读：左侧「全部样式」要跟着长出新的，
+        # 正编那条的字体 / 颜色也要换成刚写进去的 —— 不然框里还是旧值，
+        # 一点确定就把旧值又覆盖回去
+        chuang = getattr(self, "_yangshi_chuang", None)
+        if chuang is not None:
+            try:
+                chuang.chong_du([
+                    (m, self.ym_jiao_du(m)) for m in self._zimu_yangshi_ming()
+                ])
+            except (RuntimeError, AttributeError):
+                pass        # 窗口已经关了 / 老版本没有这个方法
         return True
 
     def ym_jiao_shan(self, ming_men):
@@ -17674,10 +17936,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._shuaxin_dingwei_kuai()   # 拖放模式：选中换了，锚点方块跟着挪
 
     def _shuaxin_kuai_yanse(self, zimu=None, fu_men=None):
-        """给时间轴上每块字幕算底色：说话人非空 -> 用它那个样式的主文字色
+        """给时间轴上每块字幕算底色
 
-        说话人为空 / 样式名在样式表里查不到 -> None，时间轴那边用默认蓝。
-        说话人和样式是一起套的（槽位），所以按说话人认就等于按样式认。
+        两套规矩，看 _yanse_an_yangshi：
+          False（默认）= 照说话人 —— 说话人非空才用他那个样式的颜色，空就用
+                默认蓝。说话人和样式是一起套的（槽位），按人认就等于按样式认。
+          True  = 只照样式 —— 点过右键「用样式设置字幕块颜色」之后一直用这套，
+                投稿字幕没有说话人也能分色，改字 / 改时间刷新时不会刷回默认蓝。
         """
         if zimu is None:
             zimu = self.zimu_mianban.zimu_liebiao()
@@ -17686,10 +17951,11 @@ class VideoWorkDialog(QtWidgets.QDialog):
             if len(fu_men) != len(zimu):
                 fu_men = self._zimu_fujia(zimu)
         _jizhun, biao = self._ass_geshi_biao()
+        qu = self._yangshi_yise if self._yanse_an_yangshi else self._kuai_yanse_yise
         men = []
         for i in range(len(zimu)):
             fu = fu_men[i] if i < len(fu_men) else {}
-            men.append(self._kuai_yanse_yise(fu, biao))
+            men.append(qu(fu, biao))
         self.shijianzhou.shezhi_kuai_yanse(men)
 
     def _shoudao_shuohua_fen_gui(self):
@@ -17817,20 +18083,29 @@ class VideoWorkDialog(QtWidgets.QDialog):
             # 只摘掉这次要重设的那几样。以前是 \1vc 和 \1fg 无条件一起删，
             # 结果先设渐变再设发光（或者反过来）时，第二次一定把第一次的抹掉 ——
             # 两个功能各自能设、也能一起设，就是不能一前一后设。
-            qing = [r"\\bord-?\d+(?:\.\d+)?", r"\\3c&?H?[0-9A-Fa-f]{6,8}&?"]
+            qing = [
+                r"\\bord-?\d+(?:\.\d+)?",
+                r"\\3c&?H?[0-9A-Fa-f]{6,8}&?",
+                # 发光的参数：这次不勾就是要取消它，所以无条件清
+                r"\\1fg\([^)]*\)",
+            ]
             if kuang.you_jianbian.isChecked():
                 qing.append(r"\\1vc\([^)]*\)")
             if yao_fg:
-                qing.append(r"\\1fg\([^)]*\)")
+                qing.append(r"\\pos\([^)]*\)")     # 锚点下面跟这次的标签一起重写
             wen = _qu_biaoqian_li(wen, *qing)
+            jia = biao
             if yao_fg:
-                # 本体的锚点先落到它自己的文字里：光晕那条整串抄过去，两条才标
-                # 同一个点。不写 \pos 的话，一条描边 5、一条描边 5+发光 22，字框
-                # 一胖一瘦，AEG 按样式 + 边距摆出来就"分家"了。
+                # 本体的锚点跟这次的标签拼成同一块：光晕那条整串抄过去，两条才标
+                # 同一个点（不写 \pos 的话，一条描边 5、一条 5+发光 22，字框一胖
+                # 一瘦，AEG 按样式 + 边距摆出来就"分家"）。单独占一块也行，但行首
+                # 已经是一串块了，能并就并。
                 jd = maodian.get(xu)
                 if jd is not None:
-                    wen = _pos_xie_ru(wen, jd[0], jd[1])
-            ben = _jia_biaoqian(wen, biao)
+                    jia = "\\pos(%d,%d)%s" % (
+                        int(round(jd[0])), int(round(jd[1])), biao
+                    )
+            ben = _jia_biaoqian(wen, jia)
             # 这一步只改数据，界面和文件等整批改完再统一刷一次（多选才不卡）
             # hua=False：列表项不逐条刷（收尾反正整表重建；批量时中间插过条，
             # 逐条刷还会刷错行）；时间轴同理，逐条重画几百次窗口直接卡死
@@ -17891,6 +18166,22 @@ class VideoWorkDialog(QtWidgets.QDialog):
                 return i
         return None
 
+    def _yangshi_yise(self, fu, biao):
+        """按这一条自己的样式取块底色（不看说话人）
+
+        取哪个色跟 ⑨ 上那个「提取文字颜色 / 描边颜色」的开关走：默认 c3 描边色
+        （那一组真正的代表色），切成文字色就取 c1。样式查不到 / 颜色不是
+        #RRGGBB 的给 None（时间轴那边用默认色）。
+        """
+        ge = biao.get(str(fu.get("yang") or "Default").strip().lower())
+        jian = "c3" if self._yanse_qu_bian() else "c1"
+        se = str((ge or {}).get(jian) or "").strip()
+        if len(se) != 7 or not se.startswith("#"):
+            return None
+        yanse = QtGui.QColor(se)
+        yanse.setAlpha(ZIMU_TOUMING_DU)
+        return yanse
+
     def _kuai_yanse_yise(self, fu, biao):
         """一条字幕该用什么底色：没说话人 / 样式查不到 -> None（用默认蓝）
 
@@ -17901,16 +18192,29 @@ class VideoWorkDialog(QtWidgets.QDialog):
         """
         if not str(fu.get("shuo") or "").strip():
             return None
-        ge = biao.get(str(fu.get("yang") or "Default").strip().lower())
-        if not ge:
-            return None
+        return self._yangshi_yise(fu, biao)
+
+    def _yong_yangshi_she_kuai_yanse(self):
+        """空白处右键「用样式设置字幕块颜色」：只看样式，不看说话人
+
+        网上投稿的字幕经常没有说话人（大佬们只用样式区分角色），按说话人取色
+        会整屏一片默认蓝。这一下直接按每条自己的 Style 查颜色表，并且把
+        _yanse_an_yangshi 打开 —— 之后改字、改时间刷新块底色时照样按样式取，
+        不会被"按说话人"那套刷回默认色。
+        只改块底色，文字 / 时间 / 样式 / 说话人一个都不动。
+        """
+        zimu = self.zimu_mianban.zimu_liebiao()
+        if not zimu:
+            self.shezhi_mianban.zhuangtai_shezhi("还没有字幕")
+            return
+        self._yanse_an_yangshi = True
+        self._shuaxin_kuai_yanse(zimu)
         jian = "c3" if self._yanse_qu_bian() else "c1"
-        se = str(ge.get(jian) or "").strip()
-        if len(se) != 7 or not se.startswith("#"):
-            return None
-        yanse = QtGui.QColor(se)
-        yanse.setAlpha(ZIMU_TOUMING_DU)
-        return yanse
+        self.shezhi_mianban.zhuangtai_shezhi(
+            "已按样式给字幕块上色（取的是"
+            + ("描边色" if jian == "c3" else "文字色")
+            + "，想换就动 ⑨ 上那个开关再点一次）"
+        )
 
     def _shuaxin_gongju(self, zimu=None, fu_men=None):
         """把当前这条的字段 + 实际生效的样式填进编辑区上方那排"""
@@ -18381,6 +18685,9 @@ class VideoWorkDialog(QtWidgets.QDialog):
         样式共用。
         分组先在预览框里过目，点确定才写进去。
         """
+        # 走这条路就是"我要按说话人上色"：把「用样式设置字幕块颜色」那个
+        # 标记关掉，之后刷新块底色恢复成按说话人取（不然切不回去，得重开程序）
+        self._yanse_an_yangshi = False
         zimu = self.zimu_mianban.zimu_liebiao()
         if not zimu:
             QtWidgets.QMessageBox.warning(
@@ -21301,7 +21608,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         self._beiping_kuangjie = []
 
     def eventFilter(self, duixiang, shijian):
-        """视频工作台的全局按键：Tab / ` / ~ / Ctrl+Z / Ctrl+Y / J
+        """视频工作台的全局按键：Tab / ` / ~ / Alt+Ins / Ctrl+Z / Ctrl+Y
+        / Alt+←→ / Alt+Q/W/E/R/A/D/T / J
 
         这几个键在视频工作台里哪儿按都好使（焦点在字幕编辑框里照样），而且
         Tab、波浪号不许落进输入框变成缩进 / 字符。J 是"按住拉范围建块"，
@@ -21344,6 +21652,39 @@ class VideoWorkDialog(QtWidgets.QDialog):
                     -1 if shijian.key() == Qt.Key_Up else 1
                 )
                 return True
+        # Alt+←/→：全局上一帧 / 下一帧。以前能按出来是时间轴那段按键处理漏了
+        # 判断修饰键（Key_Left/Right 那两行没排除 Alt），纯属巧合、而且只在焦点
+        # 落在时间轴上时有效。这里正式注册成全局的：焦点在时间轴 / 字幕列表 /
+        # 编辑框里都一样，跟 Ctrl+←/→ 一个道理。
+        if (
+            shijian.modifiers() == Qt.AltModifier
+            and shijian.key() in (Qt.Key_Left, Qt.Key_Right)
+        ):
+            self._fangxiangjian_tiaobu(
+                -1 if shijian.key() == Qt.Key_Left else 1
+            )
+            return True
+        # Alt+Q/W/E/R/A/D/T：打轴那几个键的全局版。不带 Alt 的字母在字幕编辑框
+        # 里就是正文，写台词的时候按不了；带 Alt 的不影响打字，焦点在时间轴 /
+        # 列表 / 编辑框里都一样，走的是同一套 _dazhou_an。
+        if (
+            shijian.modifiers() == Qt.AltModifier
+            and shijian.key() in (
+                Qt.Key_Q, Qt.Key_W, Qt.Key_E, Qt.Key_R, Qt.Key_A, Qt.Key_D,
+                Qt.Key_T,
+            )
+        ):
+            self._dazhou_an(chr(shijian.key()))
+            return True
+        # Alt+Ins：全局换到下一条字幕。原来的 Ins 不动 —— 焦点在时间轴上由它
+        # 自己那份 keyPressEvent 接，编辑框里还是它自己的"插入 / 覆盖模式"。
+        # 这颗加出来专门给"写完淡入淡出、焦点还在编辑框里"的时候用。
+        if (
+            shijian.key() == Qt.Key_Insert
+            and shijian.modifiers() == Qt.AltModifier
+        ):
+            self._shoudao_xiayitiao()
+            return True
         if shijian.modifiers() & (
             Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
         ):
@@ -21387,7 +21728,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
         # 列表里选中的那一条。QListWidget 会把这些字母当成它自己的"键盘
         # 搜索"抢先吃掉，窗口级那份打轴快捷键根本收不到，所以在应用级拦。
         if jian in (
-            Qt.Key_Q, Qt.Key_W, Qt.Key_E, Qt.Key_R, Qt.Key_A, Qt.Key_D
+            Qt.Key_Q, Qt.Key_W, Qt.Key_E, Qt.Key_R, Qt.Key_A, Qt.Key_D,
+            Qt.Key_T,
         ) and self._zai_zimu_liebiao(duixiang):
             self._dazhou_liebiao_an(chr(jian))
             return True

@@ -2695,6 +2695,10 @@ class ZimuMianban(QtWidgets.QWidget):
             qi_ms, zhi_ms = zhi_ms, qi_ms
         lao = self._zimu[xu]
         self._zimu[xu] = (qi_ms, zhi_ms, wenben)
+        # 版本号必须跟着涨：画面那层按 zimu_ban() 判断要不要重取列表，漏了这一行
+        # 就还在用改之前那份时间算"这一帧该不该显示"，表现是拖完时间轴的头几帧
+        # 字幕不出现（走到旧起点的位置才冒出来）
+        self._ban += 1
         self._fu_ban_dan(lao, self._zimu[xu])
         self._shuaxin()
 
@@ -2987,20 +2991,37 @@ def _kuang_chu(wen):
 
 
 def _suoding_chun_wen(wenben):
-    """「锁定代码」开着时该显示的写法：第一个 { 到最后一个 } 那一整段不摆
+    """「锁定代码」开着时该显示的写法：行里的 {…} 标签块全部不摆，只留台词
 
-    规矩就一条 —— 最开始的 { 到最结尾的 }，中间夹着的东西（两块代码之间夹的
-    字，比如 {\\fn..}—{\\r}{\\c..&} 里那个 —）一起算进去；} 之后剩下的才是台词。
+    以前是"第一个 { 到最后一个 }"整段不摆。遇上
+    {\\fnX}「{\\r}正文{\\fnX}」{\\r} 这种两头都有标签的写法，第一个 { 在最前、
+    最后一个 } 在最后，整行就被当成代码了，台词一个字都不剩。
+    现在改成逐块摘：每个花括号包起来的块都不摆，块与块之间夹的字（引号、
+    破折号这些）照常显示 —— 上面那行显示出来就是「正文」。
     跟字幕编辑框、时间轴块一个规矩。
     """
-    wen = str(wenben or "")
-    qi = wen.find("{")
-    if qi < 0:
-        return wen
-    zhi = wen.rfind("}")
-    if zhi < qi:
-        return wen
-    return wen[:qi] + wen[zhi + 1:]
+    return re.sub(r"\{[^{}]*\}", "", str(wenben or ""))
+
+
+def _qu_wen_liu_kuai(s):
+    """只留花括号块，块外面的文字全丢掉
+
+    「锁定代码」回写用：前缀 / 后缀都"只带标签不带字"，用户新打的台词才不会
+    跟旧文字缠在一起。
+    """
+    chu = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "{":
+            j = s.find("}", i)
+            if j < 0:
+                break
+            chu.append(s[i:j + 1])
+            i = j + 1
+        else:
+            i += 1
+    return "".join(chu)
 
 
 def _xuanzhong_shuzi_ma(shi):
@@ -3485,12 +3506,32 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
         wen = str(wen or "")
         if self._suoding:
             self._suoding_yuan = wen
-            qi = wen.find("{")
-            zhi = wen.rfind("}") if qi >= 0 else -1
-            if qi >= 0 and zhi >= qi:
-                self._suoding_qian = wen[:qi]
-                self._suoding_hide = wen[qi:zhi + 1]
-                wen_xian = self._suoding_qian + wen[zhi + 1:]
+            chun = _suoding_chun_wen(wen)
+            if chun != wen:
+                # 新台词以后整段放在**最后一个文字**那个位置：它前面的标签块
+                # 收进 _suoding_qian、后面的收进 _suoding_hide，中间那些文字段
+                # 丢掉（用户改字时看到的就是 chun，自己会重打）。
+                # 这样 {\r} 之后那块正文标签照样罩得住，不会因为把字挪到前面
+                # 就不发光了。
+                wei_hou = -1
+                i = 0
+                while i < len(wen):
+                    if wen[i] == "{":
+                        j = wen.find("}", i)
+                        if j < 0:
+                            break
+                        i = j + 1
+                        continue
+                    if not wen[i].isspace():
+                        wei_hou = i
+                    i += 1
+                if wei_hou >= 0:
+                    self._suoding_qian = _qu_wen_liu_kuai(wen[:wei_hou])
+                    self._suoding_hide = wen[wei_hou + 1:]
+                else:
+                    self._suoding_qian = ""
+                    self._suoding_hide = ""
+                wen_xian = chun
             else:
                 self._suoding_qian = ""
                 self._suoding_hide = ""
@@ -3515,7 +3556,7 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
             return xian
         if xian == self._suoding_chun:      # 一个字没动过：整行照搬，标签一个不丢
             return self._suoding_yuan
-        return self._suoding_qian + self._suoding_hide + xian
+        return self._suoding_qian + xian + self._suoding_hide
 
     def gengxin_wenben(self, wen):
         """边调边看用：换掉框里的文字，但不往外发 textChanged（这不算用户改字）
@@ -3558,20 +3599,14 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
     def _kuang_wei(self, wei):
         """字幕文本里的位置 -> 框里的位置
 
-        「锁定代码」开着时藏着的那段不在框里，位置得把它刨掉。
+        「锁定代码」开着时行内每个 {…} 块都不在框里，位置得把它们刨掉。
         """
         wen = self.wenben()
         wei = max(0, min(int(wei), len(wen)))
         jian = wen[:wei]
-        if self._suoding and self._suoding_hide:
-            qi = len(self._suoding_qian)
-            zhi = qi + len(self._suoding_hide)
-            if wei <= qi:
-                jian = wen[:wei]
-            elif wei >= zhi:
-                jian = wen[:qi] + wen[zhi:wei]
-            else:
-                jian = wen[:qi]        # 落在藏起来那段上的，就认框里的开头
+        if self._suoding:
+            # 位置之前有几个字符属于标签块就减掉几个（落在块中间就贴到块前）
+            jian = re.sub(r"\{[^{}]*\}", "", jian)
         return len(jian) + jian.count("\\N")    # 每个 \N 在框里多带一个真换行
 
     def shuju_wei(self, wei):
@@ -3579,9 +3614,17 @@ class _ZimuWenbenKuang(QtWidgets.QPlainTextEdit):
         kuang = self.toPlainText()
         wei = max(0, min(int(wei), len(kuang)))
         jian = wei - kuang[:wei].count("\n")
-        if self._suoding and self._suoding_hide:
-            if jian > len(self._suoding_qian):
-                jian += len(self._suoding_hide)
+        if self._suoding:
+            # 往回找：数到第 jian 个「不在块里」的字符，就是它在字幕文本里的位置
+            wen = self.wenben()
+            kan = 0
+            for m in re.finditer(r"\{[^{}]*\}|.", wen):
+                if m.group(0).startswith("{"):
+                    continue
+                if kan >= jian:
+                    return m.start()
+                kan += 1
+            return len(wen)
         return jian
 
     def dingwei_shuju(self, qi, zhi):
@@ -5779,6 +5822,33 @@ class YangshiBianjiDialog(QtWidgets.QDialog):
             self._tian = False
         self._tian_kongjian()       # 颜色 / 对齐 / 预览（它自己管 _tian）
         self._bian_le()
+
+    def chong_du(self, yang_biao):
+        """外面改了当前字幕的样式表（从样式库复制过来 / 删了样式）：重读一遍
+
+        左侧「全部样式」按新表重铺，正编的那条（按名字认）字段也换成最新的 ——
+        不然框里还显示旧的字体 / 颜色，一点「确定」就把旧值又写回 ASS 了，
+        看着就像"替换了个寂寞"。
+        """
+        xin = {}
+        for xiang in (yang_biao or []):
+            if isinstance(xiang, (list, tuple)) and len(xiang) == 2:
+                ming = str(xiang[0] or "").strip()
+                if ming:
+                    xin[ming] = dict(xiang[1] or {})
+        if not xin:
+            return
+        self._yang_biao = xin
+        zhao = next(
+            (k for k in xin if k.lower() == self._yuan_ming.strip().lower()),
+            None,
+        )
+        if zhao is not None:
+            zi = dict(xin[zhao])
+            zi["name"] = zhao
+            self._tian_quanbu(zi)
+        else:
+            self._chong_liebiao()
 
     def _xin_jian_yangshi(self):
         """「新建样式」：控件换成一份干净默认（照 AEG 的 New）"""
