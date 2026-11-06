@@ -2683,8 +2683,12 @@ class ZimuMianban(QtWidgets.QWidget):
             )
         self.zhou.update()
 
-    def gai_zimu_shijian(self, xu, qi_ms, zhi_ms):
-        """就地改第 xu 条的起止时间（列表里的时间、小时间轴的块一起刷）"""
+    def gai_zimu_shijian(self, xu, qi_ms, zhi_ms, shuaxin=True):
+        """就地改第 xu 条的起止时间（列表里的时间、小时间轴的块一起刷）
+
+        shuaxin=False：只改数据，不重建左侧列表。批量改几十块时每条都重建一次
+        整表（几百行）会卡很久，调用方循环完自己刷一次就行。
+        """
         xu = int(xu)
         if not (0 <= xu < len(self._zimu)):
             return
@@ -2700,7 +2704,8 @@ class ZimuMianban(QtWidgets.QWidget):
         # 字幕不出现（走到旧起点的位置才冒出来）
         self._ban += 1
         self._fu_ban_dan(lao, self._zimu[xu])
-        self._shuaxin()
+        if shuaxin:
+            self._shuaxin()
 
     # ---- 每条的字段（样式 / 说话人 / 层 / 边距 / 特效 / 注释）----
     def hang_fu(self, xu):

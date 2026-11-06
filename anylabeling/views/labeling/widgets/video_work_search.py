@@ -31,6 +31,7 @@ Ctrl+R 选择、Ctrl+F 查找、Ctrl+H 替换。三个都是非模态窗口：�
 """
 
 import re
+import time
 
 from PyQt5 import QtGui, QtWidgets
 from PyQt5.QtCore import Qt
@@ -884,9 +885,51 @@ class XuanZeDialog(QtWidgets.QDialog):
         base = _du_zhi(self._x + PEI_LAN, 0)
         self.setStyleSheet(_ys_kuang())
 
-        wai = QtWidgets.QVBoxLayout(self)
+        wai = QtWidgets.QHBoxLayout(self)      # 左：说话人 / 样式清单；右：原来那些
         wai.setContentsMargins(12, 12, 12, 12)
-        wai.setSpacing(8)
+        wai.setSpacing(10)
+
+        # ---- 左边两列：点名字就按它挑（不用每次去输入框里敲）----
+        # 说话人那列还带勾：勾着 = 显示，去掉勾 = 把这个人说的字幕全藏起来
+        zuo = QtWidgets.QVBoxLayout()
+        zuo.setSpacing(4)
+        biao_shuo = QtWidgets.QLabel("说话人")
+        biao_shuo.setStyleSheet(_ys_xuan_tishi())
+        zuo.addWidget(biao_shuo)
+        self.lie_shuo = QtWidgets.QListWidget()
+        self.lie_shuo.setToolTip(
+            "点名字 = 按这个说话人挑字幕\n把勾去掉 = 隐藏这个人说的字幕（时间轴不画、画面也不画）"
+        )
+        self.lie_shuo.setMinimumWidth(118)
+        self.lie_shuo.setMaximumWidth(190)
+        # 可多选（Ctrl 加选 / Shift 连选）：选了谁就直接把谁的字幕挑出来，
+        # 右边那些输入框、模式、动作一个字都不动
+        self.lie_shuo.setSelectionMode(
+            QtWidgets.QAbstractItemView.ExtendedSelection
+        )
+        self.lie_shuo.itemSelectionChanged.connect(self._an_ming_xuan)
+        self.lie_shuo.itemChanged.connect(self._gou_shuo)
+        zuo.addWidget(self.lie_shuo, 1)
+        zuo.addLayout(self._lie_anniu(self.lie_shuo))
+        biao_yang = QtWidgets.QLabel("样式")
+        biao_yang.setStyleSheet(_ys_xuan_tishi())
+        zuo.addWidget(biao_yang)
+        self.lie_yang = QtWidgets.QListWidget()
+        self.lie_yang.setToolTip("点名字 = 按这个样式挑字幕")
+        self.lie_yang.setMinimumWidth(118)
+        self.lie_yang.setMaximumWidth(190)
+        self.lie_yang.setSelectionMode(
+            QtWidgets.QAbstractItemView.ExtendedSelection
+        )
+        self.lie_yang.itemSelectionChanged.connect(self._an_ming_xuan)
+        self.lie_yang.itemChanged.connect(self._gou_yang)
+        zuo.addWidget(self.lie_yang, 1)
+        zuo.addLayout(self._lie_anniu(self.lie_yang))
+        wai.addLayout(zuo)
+
+        # ---- 右边：原来那一套 ----
+        you = QtWidgets.QVBoxLayout()
+        you.setSpacing(8)
 
         # ---- 匹配 ----
         he_pipei = QtWidgets.QGroupBox("匹配")
@@ -910,28 +953,28 @@ class XuanZeDialog(QtWidgets.QDialog):
         self.shuru_wen.setStyleSheet(_ys_shuru())
         self.shuru_wen.setPlaceholderText("要挑什么样的字幕？")
         wang.addWidget(self.shuru_wen)
-        wai.addWidget(he_pipei)
+        you.addWidget(he_pipei)
 
         # ---- 模式 / 栏 / 对话注释 / 动作 ----
         self.he_moshi = _danxuan_zu(
             "模式", ("精确匹配", "包含", "正则表达式匹配"), pai=1
         )
-        wai.addWidget(self.he_moshi)
+        you.addWidget(self.he_moshi)
         self.he_lan = _danxuan_zu("在下列栏中搜索", LAN_MING, pai=3)
-        wai.addWidget(self.he_lan)
+        you.addWidget(self.he_lan)
         self.he_leixing = _gou_zu("匹配对话 / 注释", ("对话", "注释"))
-        wai.addWidget(self.he_leixing)
+        you.addWidget(self.he_leixing)
         self.he_dongzuo = _danxuan_zu(
             "动作",
             ("设为所选", "加入所选", "移出所选", "选中与所选之交集"),
             pai=1,
         )
-        wai.addWidget(self.he_dongzuo)
+        you.addWidget(self.he_dongzuo)
 
         # ---- 提示行（按钮上面）：现在选中了几行 ----
         self.ti_shi = QtWidgets.QLabel("")
         self.ti_shi.setStyleSheet(_ys_xuan_tishi())
-        wai.addWidget(self.ti_shi)
+        you.addWidget(self.ti_shi)
 
         # ---- 按钮 ----
         an = QtWidgets.QHBoxLayout()
@@ -949,7 +992,8 @@ class XuanZeDialog(QtWidgets.QDialog):
         an.addWidget(self.an_yingyong)
         an.addWidget(self.an_queding)
         an.addWidget(self.an_guan)
-        wai.addLayout(an)
+        you.addLayout(an)
+        wai.addLayout(you)
 
         # ---- 还原上次那一套 ----
         self.an_bu_pipei.setChecked(bool(int(_du_zhi(self._x + PEI_XUAN_PIPEI, 0) or 0)))
@@ -980,13 +1024,170 @@ class XuanZeDialog(QtWidgets.QDialog):
             lambda: self._zhixing(guan=False)
         )
 
+        self._tian_ming_liebiao()   # 说话人 / 样式清单
         self._shuaxin_tishi()
         _gua_chexiao(self)      # 焦点在这个窗口里也能 Ctrl+Z 撤工作台的字幕
+
+    def showEvent(self, event):
+        """每次打开都把两列清单重新填一遍（字幕增删过的话名字会变）"""
+        super().showEvent(event)
+        if getattr(self, "lie_shuo", None) is not None:
+            self._tian_ming_liebiao()
 
     def closeEvent(self, event):
         """关窗口时也把这一套存下来（只改了勾选、没按按钮也不丢）"""
         self._ji_peizhi(self._qu_peizhi())
         super().closeEvent(event)
+
+    def _tian_ming_liebiao(self):
+        """把说话人 / 样式两列填上（说话人那列按主窗口记着的"藏了谁"打勾）"""
+        self._zai_tian = True       # 填的时候 itemChanged 别当成用户点的
+        self._gang_gou = 0.0        # 刚勾过（那一下别再当成"点名字挑字幕"）
+        try:
+            try:
+                yin = set(self._zhuren.ss_yin_shuo())
+            except Exception:       # noqa
+                yin = set()
+            self.lie_shuo.clear()
+            for ming in (self._zhuren.ss_shuo_ming() or []):
+                xiang = QtWidgets.QListWidgetItem(str(ming))
+                xiang.setData(Qt.UserRole, str(ming))
+                xiang.setFlags(xiang.flags() | Qt.ItemIsUserCheckable)
+                xiang.setCheckState(
+                    Qt.Unchecked if ming in yin else Qt.Checked
+                )
+                self.lie_shuo.addItem(xiang)
+            try:
+                yin_yang = set(self._zhuren.ss_yin_yang())
+            except Exception:       # noqa
+                yin_yang = set()
+            self.lie_yang.clear()
+            for ming in (self._zhuren.ss_yang_ming() or []):
+                xiang = QtWidgets.QListWidgetItem(str(ming))
+                xiang.setData(Qt.UserRole, str(ming))
+                xiang.setFlags(xiang.flags() | Qt.ItemIsUserCheckable)
+                xiang.setCheckState(
+                    Qt.Unchecked if ming in yin_yang else Qt.Checked
+                )
+                self.lie_yang.addItem(xiang)
+        finally:
+            self._zai_tian = False
+
+    def _lie_anniu(self, lie):
+        """每列下面那排按钮：全选 / 反选 / 取消 —— 动的都是前面那个勾
+
+        勾 = 显示这一批，去掉勾 = 藏起来。全选 = 全打勾，反选 = 打上的去掉、
+        没打的打上，取消 = 全部去掉勾。
+        """
+        hang = QtWidgets.QHBoxLayout()
+        hang.setSpacing(4)
+        for wenzi, fangshi in (("全选", "quan"), ("反选", "fan"), ("取消", "kong")):
+            an = QtWidgets.QPushButton(wenzi)
+            an.setStyleSheet(_ys_ci_anniu())
+            an.clicked.connect(
+                lambda _=False, l=lie, f=fangshi: self._lie_gou(l, f)
+            )
+            hang.addWidget(an)
+        return hang
+
+    def _lie_gou(self, lie, fangshi):
+        """整列的勾一起改，改完一次算完（不逐项去重算字幕隐藏）"""
+        lie.blockSignals(True)
+        try:
+            for i in range(lie.count()):
+                xiang = lie.item(i)
+                if fangshi == "quan":
+                    xiang.setCheckState(Qt.Checked)
+                elif fangshi == "kong":
+                    xiang.setCheckState(Qt.Unchecked)
+                else:
+                    xiang.setCheckState(
+                        Qt.Unchecked
+                        if xiang.checkState() == Qt.Checked
+                        else Qt.Checked
+                    )
+        finally:
+            lie.blockSignals(False)
+        self._ying_yong_gou()
+
+    def _gou_yang(self, xiang):
+        """样式那一列单个勾变了：勾 = 显示，去掉 = 把这个样式的字幕藏起来"""
+        if getattr(self, "_zai_tian", False) or xiang is None:
+            return
+        ming = str(xiang.data(Qt.UserRole) or "")
+        if not ming:
+            return
+        yin = xiang.checkState() != Qt.Checked
+        self._gang_gou = time.time()
+        try:
+            self._zhuren.ss_set_yin_yang(ming, yin)
+        except Exception as cuowu:      # noqa
+            self._zhuren.ss_tishi("切换显示失败", str(cuowu))
+
+    def _ying_yong_gou(self):
+        """把两列现在的勾状态整批交给宿主：没勾的 = 藏起来"""
+        shuo = set()
+        for i in range(self.lie_shuo.count()):
+            xiang = self.lie_shuo.item(i)
+            if xiang.checkState() != Qt.Checked:
+                shuo.add(str(xiang.data(Qt.UserRole) or ""))
+        yang = set()
+        for i in range(self.lie_yang.count()):
+            xiang = self.lie_yang.item(i)
+            if xiang.checkState() != Qt.Checked:
+                yang.add(str(xiang.data(Qt.UserRole) or ""))
+        try:
+            self._zhuren.ss_set_yin_ji(shuo, yang)
+        except Exception as cuowu:      # noqa
+            self._zhuren.ss_tishi("切换显示失败", str(cuowu))
+
+    def _an_ming_xuan(self):
+        """左边清单里选了谁，就把他们的字幕整批选中（多选 = 并起来）
+
+        只做客选，不往右边那几个输入框里写东西 —— 要按文字挑还是照原来那样
+        自己敲。说话人列选了几个 + 样式列选了几个，都算上。
+        """
+        if getattr(self, "_zai_tian", False):
+            return          # 正在填清单，不是用户点的
+        if time.time() - getattr(self, "_gang_gou", 0.0) < 0.2:
+            return          # 刚点的是前面那个勾：那一下只切显示，不挑字幕
+        shuo = {
+            str(x.data(Qt.UserRole) or "")
+            for x in self.lie_shuo.selectedItems()
+        }
+        yang = {
+            str(x.data(Qt.UserRole) or "")
+            for x in self.lie_yang.selectedItems()
+        }
+        if not shuo and not yang:
+            return
+        try:
+            hang = self._zhuren.ss_hang_men()
+        except Exception:       # noqa
+            return
+        xin = [
+            i for i, yi in enumerate(hang)
+            if str(yi["shuo"] or "").strip() in shuo
+            or str(yi["yang"] or "").strip() in yang
+        ]
+        self._zhuren.ss_she_xuan(xin)
+        self.ti_shi.setText(f"选中了 {len(xin)} 行")
+
+    def _gou_shuo(self, xiang):
+        """说话人那一列的勾变了：勾 = 显示，去掉 = 把这个人说的字幕藏起来
+        （藏起来 = 时间轴上不画这些块、画面也不画，数据一个字不动）
+        """
+        if getattr(self, "_zai_tian", False) or xiang is None:
+            return
+        ming = str(xiang.data(Qt.UserRole) or "")
+        if not ming:
+            return
+        yin = xiang.checkState() != Qt.Checked
+        self._gang_gou = time.time()
+        try:
+            self._zhuren.ss_set_yin_shuo(ming, yin)
+        except Exception as cuowu:      # noqa
+            self._zhuren.ss_tishi("切换显示失败", str(cuowu))
 
     def _shuaxin_tishi(self):
         """提示行：现在选中了几行"""
