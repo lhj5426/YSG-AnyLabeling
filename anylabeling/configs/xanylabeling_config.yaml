@@ -290,6 +290,7 @@ shortcuts:
   page_text_tool: Alt+8
   label_sync_tool: null
   containment_detection_tool: Ctrl+Alt+B
+  color_extract_tool: null
   highlight_settings_tool: Alt+9
   path_selection_settings_tool: Ctrl+Alt+P
   label_manager: Alt+0

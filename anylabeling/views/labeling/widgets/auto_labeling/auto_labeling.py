@@ -1227,7 +1227,9 @@ class AutoLabelingWidget(QWidget):
             self.run_split_boxes_on_all()
         elif mode == "text_color":
             # 仅检测颜色 全图：对画布上已有框提取颜色（支持标签过滤）
-            self.run_recog_color()
+            # 这里必须走 run_color_only（全图所有框），
+            # 原来误调 run_recog_color 只处理选中框，会提示「请先选中检测框」
+            self.run_color_only()
         else:
             self.run_prediction()
 
@@ -2045,10 +2047,21 @@ class AutoLabelingWidget(QWidget):
         filter_classes = self.model_manager.loaded_model_config.get(
             "filter_classes", None
         )
+        # 颜色提取窗口里填的「排除标签」也要生效，
+        # 否则 other / bubble 这种框也会被取色，写出一堆没意义的颜色
+        exclude_labels = set()
+        color_dialog = getattr(self.parent, "color_extract_dialog", None)
+        if color_dialog is not None:
+            try:
+                exclude_labels = color_dialog._exclude_labels()
+            except Exception:
+                exclude_labels = set()
 
         box_infos = []
         for shape in all_shapes:
             if filter_classes is not None and shape.label not in filter_classes:
+                continue
+            if shape.label in exclude_labels:
                 continue
             pts = [[int(p.x()), int(p.y())] for p in shape.points]
             box_infos.append((shape, pts))

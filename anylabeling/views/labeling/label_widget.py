@@ -100,6 +100,7 @@ from .widgets.horizontal_viewer_dialog import HorizontalViewerDialog
 from .widgets.vertical_viewer_dialog import VerticalViewerDialog
 from .widgets.thumbnail_viewer_dialog import MasonryThumbnailDialog
 from .widgets.containment_detection_dialog import ContainmentDetectionDialog
+from .widgets.color_extract_dialog import ColorExtractDialog
 from .ocr_text_replace import OCRTextReplaceDialog
 from .widgets.char_render_dialog import CharRenderDialog
 from .widgets.path_selection_settings_dialog import PathSelectionSettingsDialog
@@ -2526,6 +2527,14 @@ class LabelingWidget(QtWidgets.QWidget):
             tip=self.tr("检测标签包围关系，用于判断漫画气泡检测是否正确"),
         )
 
+        color_extract_tool = action(
+            self.tr("颜色提取"),
+            self.toggle_color_extract_dialog,
+            shortcuts.get("color_extract_tool"),
+            icon="color",
+            tip=self.tr("对框内文字取色，写入标注属性 fg / bg（纯算法，不加载模型）"),
+        )
+
         highlight_settings_tool = action(
             self.tr("高亮设置"),
             self.toggle_highlight_settings_dialog,
@@ -3451,6 +3460,7 @@ class LabelingWidget(QtWidgets.QWidget):
             shortcut_manager_tool=shortcut_manager_tool,
             rectangle_scale_tool=rectangle_scale_tool,
             page_text_tool=page_text_tool,
+            color_extract_tool=color_extract_tool,
             highlight_settings_tool=highlight_settings_tool,
             path_selection_settings_tool=path_selection_settings_tool,
             toggle_ghost_paste=toggle_ghost_paste,
@@ -3688,61 +3698,104 @@ class LabelingWidget(QtWidgets.QWidget):
             ),
         )
         utils.add_actions(self.menus.train, (ultralytics_train,))
+        # === 工具菜单分组 ===
+        # 一级菜单只留 3 个常用项，其余按功能收进二级子菜单。
+        # 只改挂载位置，action 对象本身不动，快捷键行为完全不变。
+        def _tool_group(title, member_actions, icon_name):
+            submenu = QtWidgets.QMenu(title, self.menus.tool)
+            submenu.setIcon(utils.new_icon(icon_name))
+            utils.add_actions(submenu, member_actions)
+            return submenu
+
         utils.add_actions(
             self.menus.tool,
             (
-                # === 统计与导出 ===
+                # === 常驻常用项 ===
                 overview,
                 save_crop,
                 None,
-                # === 自动标注 ===
                 toggle_auto_labeling_widget,
                 None,
                 # === 格式转换 ===
-                hbb_to_obb,
-                obb_to_hbb,
-                polygon_to_hbb,
-                polygon_to_obb,
-                None,
-                # === 标注编辑工具 ===
-                expand_margins,
-                tag_sort_tool,
-                angle_correction_tool,
-                alignment_tool,
-                segmentation_tool,
-                merge_shapes,
-                region_batch_delete_tool,
-                dual_color_label_tool,
-                mask_generator_tool,
-                traffic_light_tool,
-                rectangle_scale_tool,
-                page_text_tool,
-                label_sync_tool,
-                containment_detection_tool,
-                highlight_settings_tool,
-                path_selection_settings_tool,
-                toggle_ghost_paste,
-                None,
-                ocr_text_replace_action,
-                char_render_action,
-                None,
-                # === 管理器工具 ===
-                label_manager,
-                object_manager,
-                gid_manager,
-                digit_shortcut_manager,
-                image_category_manager_tool,
-                label_toggle_shortcut_manager,
-                keymap_tool,
-                color_manager_tool,
-                smart_guides_tool,
-                shortcut_manager_tool,
-                wheel_settings_tool,
-
-                rectangle3_width_tool,
-                horizontal_viewer_tool,
-                vertical_viewer_tool,
-                thumbnail_viewer_tool,
+                _tool_group(
+                    "格式转换",
+                    (hbb_to_obb, obb_to_hbb, polygon_to_hbb, polygon_to_obb),
+                    "convert",
+                ),
+                # === 标注框编辑 ===
+                _tool_group(
+                    "标注框编辑",
+                    (
+                        expand_margins,
+                        tag_sort_tool,
+                        angle_correction_tool,
+                        alignment_tool,
+                        segmentation_tool,
+                        merge_shapes,
+                        region_batch_delete_tool,
+                        rectangle_scale_tool,
+                        dual_color_label_tool,
+                        label_sync_tool,
+                    ),
+                    "edit",
+                ),
+                # === 分割与检测 ===
+                _tool_group(
+                    "分割与检测",
+                    (
+                        mask_generator_tool,
+                        containment_detection_tool,
+                        traffic_light_tool,
+                        page_text_tool,
+                        color_extract_tool,
+                    ),
+                    "crop",
+                ),
+                # === 显示设置 ===
+                _tool_group(
+                    "显示设置",
+                    (
+                        highlight_settings_tool,
+                        path_selection_settings_tool,
+                        toggle_ghost_paste,
+                    ),
+                    "eye",
+                ),
+                # === OCR 与文本 ===
+                _tool_group(
+                    "OCR 与文本",
+                    (ocr_text_replace_action, char_render_action),
+                    "docs",
+                ),
+                # === 管理器 ===
+                _tool_group(
+                    "管理器",
+                    (
+                        label_manager,
+                        object_manager,
+                        gid_manager,
+                        digit_shortcut_manager,
+                        image_category_manager_tool,
+                        label_toggle_shortcut_manager,
+                        keymap_tool,
+                        color_manager_tool,
+                    ),
+                    "objects",
+                ),
+                # === 界面与查看 ===
+                _tool_group(
+                    "界面与查看",
+                    (
+                        smart_guides_tool,
+                        shortcut_manager_tool,
+                        wheel_settings_tool,
+                        rectangle3_width_tool,
+                        horizontal_viewer_tool,
+                        vertical_viewer_tool,
+                        thumbnail_viewer_tool,
+                    ),
+                    "zoom",
+                ),
             ),
         )
         utils.add_actions(
@@ -9363,6 +9416,30 @@ class LabelingWidget(QtWidgets.QWidget):
         self.containment_detection_dialog.raise_()
         self.containment_detection_dialog.activateWindow()
 
+    def toggle_color_extract_dialog(self):
+        """切换颜色提取窗口（支持最小化恢复）"""
+        dialog = getattr(self, 'color_extract_dialog', None)
+        if dialog is None:
+            self.open_color_extract_dialog()
+        elif dialog.isMinimized():
+            dialog.showNormal()
+            dialog.raise_()
+            dialog.activateWindow()
+        elif dialog.isVisible():
+            dialog.hide()
+        else:
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+
+    def open_color_extract_dialog(self):
+        """打开颜色提取对话框"""
+        if getattr(self, 'color_extract_dialog', None) is None:
+            self.color_extract_dialog = ColorExtractDialog(self)
+        self.color_extract_dialog.show()
+        self.color_extract_dialog.raise_()
+        self.color_extract_dialog.activateWindow()
+
     def open_label_sync_dialog(self):
         """打开标签同步对话框（非阻塞式）"""
         # 创建或复用对话框（非阻塞式）
@@ -10538,6 +10615,7 @@ class LabelingWidget(QtWidgets.QWidget):
             ("矩形缩放工具",): "rectangle_scale_tool",
             ("页文本工具",): "page_text_tool",
             ("包围检测",): "containment_detection_tool",
+            ("颜色提取",): "color_extract_tool",
             ("高亮设置",): "highlight_settings_tool",
             ("路径线/框选设置",): "path_selection_settings_tool",
             ("标签管理器",): "label_manager",
