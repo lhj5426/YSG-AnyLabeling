@@ -21388,7 +21388,8 @@ class VideoWorkDialog(QtWidgets.QDialog):
             self.shijianzhou.shezhi_hang([(i, 0) for i in range(len(zimu))])
         self.shijianzhou.shezhi_xuan_zhong(-1)
         self._shezhi_bianji_zimu(zimu, -1)
-        self.shijianzhou.gundong_dao_ms(0, 0)
+        # 导入字幕不再把时间轴滚回开头：视图停在你看的地方，换一份字幕只是把
+        # 块换掉，眼睛不用跟着往回跑（真要回开头自己拖一下滚动条）
         self._zimu_tiao_wen = None
         self._shuaxin_zimu_tiao()
         self.zimu_wenjian = lu
