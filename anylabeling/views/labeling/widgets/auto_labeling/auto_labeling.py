@@ -62,6 +62,32 @@ def _normalize_classes(classes):
     return classes or []
 
 
+class _TuXiangOcrGongZuo(QThread):
+    """耗时的 OCR 计算放子线程跑，结果回主线程再往框上回填。
+
+    纯识别模型（Baberu）一个框就要好几秒，几个框一跑主线程就「未响应」。
+    """
+
+    jieguo = pyqtSignal(object)
+    chucuo = pyqtSignal(str)
+
+    def __init__(self, model, image, boxes, filename):
+        super().__init__()
+        self.model = model
+        self.image = image
+        self.boxes = boxes
+        self.filename = filename
+
+    def run(self):
+        try:
+            result, timing = self.model.predict_shapes_from_boxes(
+                self.image, self.boxes, self.filename
+            )
+            self.jieguo.emit((result, timing))
+        except Exception as e:  # noqa
+            self.chucuo.emit(str(e))
+
+
 class AutoLabelingWidget(QWidget):
     new_model_selected = pyqtSignal(str)
     new_custom_model_selected = pyqtSignal(str)
@@ -560,6 +586,7 @@ class AutoLabelingWidget(QWidget):
                     "favorite": model_dict.get("favorite", False),
                     "display_name": model_dict.get("display_name", model_name),
                     "config_path": config_path,
+                    "added_at": model_dict.get("added_at"),
                 }
 
                 self.model_info[model_key] = {
@@ -647,7 +674,35 @@ class AutoLabelingWidget(QWidget):
         sorted_data = collections.OrderedDict()
         for key in sorted_top_keys:
             inner_dict = model_data[key]
-            sorted_inner_items = sorted(inner_dict.items(), key=inner_sort_key)
+            if key == "Custom":
+                # 自定义模型按"加进来的先后"排，新加的放最上面；
+                # 按名字排的话，刚加的模型会跑到很下面，找不着。
+                head = []
+                if "load_custom_model" in inner_dict:
+                    head.append(
+                        ("load_custom_model", inner_dict["load_custom_model"])
+                    )
+                rest = [(k, v) for k, v in inner_dict.items() if k != "load_custom_model"]
+
+                def _shi_jian(item):
+                    _, v = item
+                    t = v.get("added_at")
+                    if not t:
+                        lu = v.get("config_path") or ""
+                        try:
+                            if lu and os.path.exists(lu):
+                                t = os.path.getmtime(lu)
+                        except Exception:  # noqa
+                            t = 0
+                    try:
+                        return float(t or 0)
+                    except Exception:  # noqa
+                        return 0.0
+
+                rest.sort(key=_shi_jian, reverse=True)
+                sorted_inner_items = head + rest
+            else:
+                sorted_inner_items = sorted(inner_dict.items(), key=inner_sort_key)
             sorted_data[key] = collections.OrderedDict(sorted_inner_items)
         return sorted_data
 
@@ -704,11 +759,14 @@ class AutoLabelingWidget(QWidget):
                         if os.path.normpath(existing_path) == config_file_normalized:
                             del models_data["Custom"][key]
                 
+                import time as _time
+
                 models_data["Custom"][model_key] = {
                     "selected": True,
                     "favorite": False,
                     "display_name": config_info["display_name"],
                     "config_path": config_file,
+                    "added_at": _time.time(),
                 }
                 # Update dropdown and save through its method to ensure consistency
                 self.model_dropdown.update_models_data(models_data)
@@ -835,7 +893,9 @@ class AutoLabelingWidget(QWidget):
 
         # "运行"按钮不受颜色模式切换影响，始终走全流程
         config = self.model_manager.loaded_model_config or {}
-        if config.get("type") == "hayai_ocr":
+        if config.get("type") in ("hayai_ocr_v27", "baberu_ocr", "wechat_ocr"):
+            # 纯识别模型没有检测能力：运行 = 把图里所有框都 OCR 一遍
+            # （遵守「过滤标签」，被过滤掉的类别不识别）
             self.run_recognition_on_all()
             return
 
@@ -1549,13 +1609,10 @@ class AutoLabelingWidget(QWidget):
             self.tr(f"正在识别 {len(box_infos)} 个框...")
         )
 
-        def _do_ocr():
+        boxes = [bi[1] for bi in box_infos]
+
+        def _huifu(result, timing, t0):
             import time
-            t0 = time.time()
-            boxes = [bi[1] for bi in box_infos]
-            result, timing = model.predict_shapes_from_boxes(
-                self.parent.image, boxes, self.parent.filename
-            )
             timing_str = f"[框识别耗时] 读图={timing.get('读图',0):.3f}s  裁剪+识别={timing.get('裁剪+识别',0):.3f}s  总={timing.get('总',0):.3f}s" if timing else f"耗时={time.time()-t0:.3f}s"
             # 按标签分组，保留完整坐标和置信度，并添加序号
             from collections import defaultdict
@@ -1628,6 +1685,33 @@ class AutoLabelingWidget(QWidget):
                 self.tr(f"全图框识别完成。共处理 {len(box_infos)} 个框。")
             )
 
+        def _do_ocr():
+            import time
+            t0 = time.time()
+            result, timing = model.predict_shapes_from_boxes(
+                self.parent.image, boxes, self.parent.filename
+            )
+            _huifu(result, timing, t0)
+
+        # 纯识别模型（Baberu）一个框就要好几秒，放子线程跑，
+        # 不然主线程被占住，界面一直「未响应」
+        if (self.model_manager.loaded_model_config or {}).get("type") in (
+            "baberu_ocr",
+            "hayai_ocr_v27",
+            "wechat_ocr",
+        ):
+            import time
+            t0 = time.time()
+            self._ocr_gongzuo = _TuXiangOcrGongZuo(
+                model, self.parent.image, boxes, self.parent.filename
+            )
+            self._ocr_gongzuo.jieguo.connect(lambda z: _huifu(z[0], z[1], t0))
+            self._ocr_gongzuo.chucuo.connect(
+                lambda m: self.model_manager.new_model_status.emit(f"识别失败：{m}")
+            )
+            self._ocr_gongzuo.start()
+            return
+
         QTimer.singleShot(0, _do_ocr)
 
     def _on_recog_selected_finished(self, description):
@@ -1681,6 +1765,10 @@ class AutoLabelingWidget(QWidget):
                     # Manga-OCR 使用 ocr_threshold 作为 OCR 置信度阈值
                     manga_model = self.model_manager.loaded_model_config.get("model")
                     initial_conf_value = manga_model.ocr_threshold if manga_model else 0.2
+                elif model_type == "baberu_ocr":
+                    # Baberu OCR 同样用 ocr_threshold
+                    baberu_model = self.model_manager.loaded_model_config.get("model")
+                    initial_conf_value = baberu_model.ocr_threshold if baberu_model else 0.0
                 else:
                     initial_conf_value = self.model_manager.loaded_model_config[
                         "conf_threshold"
@@ -1722,6 +1810,18 @@ class AutoLabelingWidget(QWidget):
         self._btn_popup_text_color.setVisible(
             model_config.get("type") == "manga_ocr"
         )
+
+        # 纯识别模型（不用检测器出框）：没有检测能力，
+        # 「裁切检测」「实时推理」对它们没用，藏起来
+        _chun_shibie = model_config.get("type") in (
+            "baberu_ocr",
+            "hayai_ocr_v27",
+            "wechat_ocr",
+        )
+        self.button_crop_detect.setVisible(not _chun_shibie)
+        # Koharu 布局分割模型跑实时推理会崩，只留「裁切检测」
+        _meiyou_shishi = model_config.get("type") == "koharu_rfdetr_seg"
+        self.button_realtime_infer.setVisible(not _chun_shibie and not _meiyou_shishi)
 
         # 模型加载完成后，根据当前模式同步保留原框按钮可见性
         # 只有检测能力强的模型（如 Manga-OCR）才支持大框拆分

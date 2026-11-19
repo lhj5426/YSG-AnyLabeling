@@ -1,0 +1,13 @@
+type: wechat_ocr
+name: wechat_ocr-r20261119
+provider: 微信 OCR（wxocr.dll 独立版，不用开微信）
+display_name: 微信 OCR (独立版)
+# 微信 OCR 的整套运行文件（ocr-cli.exe + runtime\），已放进 models\wechat_ocr
+# 路径必须纯英文，别挪到中文目录
+ocrcli_dir: models/wechat_ocr
+# 常驻引擎：开了就只冷启动一次，之后每张 1~2 秒（推荐）
+changzhu: true
+# 只有常驻引擎起不来、退回调 ocr-cli.exe 时才用这个并行数
+workers: 2
+# 低于这个置信度的碎块丢掉
+ocr_threshold: 0.0

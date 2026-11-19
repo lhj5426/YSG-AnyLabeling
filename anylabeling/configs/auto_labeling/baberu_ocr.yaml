@@ -1,0 +1,23 @@
+type: baberu_ocr
+name: baberu_ocr-r20261119
+provider: genshiai-daichi/baberu-ocr
+display_name: Baberu OCR (115M ja/zh/en, ONNX)
+# 相对路径以软件根目录为准。
+# decoder 用的是自己从 safetensors 导出的 fp32 版（原版 int8 在显卡上每步都要
+# 反量化一次，慢 3 倍）。int8 那两个文件留着给纯 CPU 机器用。
+vision_model_path: models/baberu_ocr/onnx/vision_int4.onnx
+prefill_model_path: models/baberu_ocr/onnx/decoder_prefill_fp32.onnx
+decode_model_path: models/baberu_ocr/onnx/decoder_step_fp32.onnx
+vocab_path: models/baberu_ocr/tokenizer/vocab.json
+max_new_tokens: 256
+repetition_penalty: 1.2
+# 单字 / 单符号连着重复到几次就掐掉（防「ーーーー」刷到上限）
+max_content_run: 12
+max_symbol_run: 16
+# 置信度低于这个数就当没认出来（0 = 不过滤）
+ocr_threshold: 0.0
+# 只给 CPU 用：显卡下强制串行（同一 session 多线程跑会非法访存）
+workers: 1
+# ONNX 线程数（0 = 让他自己定；4 核机器上填 2 实测更快）
+threads: 2
+use_gpu: true

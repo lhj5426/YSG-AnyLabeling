@@ -1,0 +1,35 @@
+type: koharu_rfdetr_seg
+name: koharu_layout_highres_1152
+display_name: Koharu Layout HighRes (RF-DETR Seg 2XL 1152)
+provider: local
+model_path: models/koharu_highres/koharu_highres_1152.onnx
+conf_threshold: 0.20
+iou_threshold: 0.50
+containment_threshold: 0.90
+num_select: 160
+input_width: 1152
+input_height: 1152
+mask_threshold: 0.0
+polygon_epsilon_factor: 0.0001
+polygon_min_area: 30
+output_order: boxes_logits_masks
+classes:
+  - text
+  - onomatopoeia
+  - bubble
+  - panel
+class_thresholds:
+  0: 0.25
+  1: 0.30
+  2: 0.50
+  3: 0.40
+shape_type_by_class:
+  text: rectangle
+  onomatopoeia: rectangle
+  bubble: polygon
+  panel: rectangle
+text_mask_classes:
+  - text
+
+text_mask_dilate_kernel_size: 3
+text_mask_dilate_iterations: 1

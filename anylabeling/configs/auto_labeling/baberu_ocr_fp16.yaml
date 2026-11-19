@@ -1,0 +1,18 @@
+type: baberu_ocr
+name: baberu_ocr_fp16-r20261119
+provider: genshiai-daichi/baberu-ocr
+display_name: Baberu OCR fp16 (115M ja/zh/en)
+# 精度版：vision 用 fp16（165MB），跟 PyTorch 那版几乎一模一样；
+# 比 int4 那版大 120MB，认字略稳，速度实测差不多。
+vision_model_path: models/baberu_ocr/onnx/vision_fp16.onnx
+prefill_model_path: models/baberu_ocr/onnx/decoder_prefill_int8.onnx
+decode_model_path: models/baberu_ocr/onnx/decoder_step_int8.onnx
+vocab_path: models/baberu_ocr/tokenizer/vocab.json
+max_new_tokens: 256
+repetition_penalty: 1.2
+max_content_run: 12
+max_symbol_run: 16
+ocr_threshold: 0.0
+threads: 2
+# fp16 这版在 CUDA 上认不出字（输出空、还慢），只能 CPU，别开
+use_gpu: false

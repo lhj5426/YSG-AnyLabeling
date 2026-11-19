@@ -3746,7 +3746,6 @@ class LabelingWidget(QtWidgets.QWidget):
                         mask_generator_tool,
                         containment_detection_tool,
                         traffic_light_tool,
-                        page_text_tool,
                         color_extract_tool,
                     ),
                     "crop",
@@ -3764,7 +3763,7 @@ class LabelingWidget(QtWidgets.QWidget):
                 # === OCR 与文本 ===
                 _tool_group(
                     "OCR 与文本",
-                    (ocr_text_replace_action, char_render_action),
+                    (page_text_tool, ocr_text_replace_action, char_render_action),
                     "docs",
                 ),
                 # === 管理器 ===

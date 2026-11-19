@@ -17556,9 +17556,13 @@ class VideoWorkDialog(QtWidgets.QDialog):
         ocr_moxing = None
         if canyu.get("ocr"):
             yuan = self._qu_moxing("ocr", canyu.get("ocr_lu") or "")
-            if yuan is None or not hasattr(yuan, "text_system"):
+            if yuan is not None and hasattr(yuan, "text_system"):
+                ocr_moxing = PPOCRv6Wrapper(yuan.text_system)
+            elif yuan is not None and hasattr(yuan, "ocr"):
+                # Baberu 这类只做识别的模型：自己就带 ocr()，直接拿来用
+                ocr_moxing = yuan
+            else:
                 return None, None, [], {}, "OCR 模型加载失败，看看 YAML 选对没有"
-            ocr_moxing = PPOCRv6Wrapper(yuan.text_system)
 
         return moxing, ocr_moxing, leibie_id, leibie_ming, ""
 

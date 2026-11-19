@@ -1,0 +1,11 @@
+type: wechat_ocr
+name: wechat_ocr_xitong-r20261119
+provider: 微信 OCR（用系统微信的常驻引擎）
+display_name: 微信 OCR (用系统微信·最快)
+# 借系统装的那个微信来认字：微信开着（不用登录，最小化就行）时，
+# 它的 OCR 子进程是常驻的，模型一直在内存，调用只发一条请求。
+# 微信关掉就用不了，那就换 wechat_ocr.yaml（自带运行时，纯 CPU，慢些）。
+ocrcli_dir: models/wechat_ocr
+yong_xitong_weixin: true
+changzhu: true
+ocr_threshold: 0.0

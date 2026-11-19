@@ -48,8 +48,8 @@ VIDEO_MODELS = [
 ]
 
 
-class HayaiBatchWorker(QThread):
-    """Run crop-level Hayai OCR away from the Qt GUI thread."""
+class OcrBatchWorker(QThread):
+    """只识别（crop-level OCR）那一类模型的批量线程，别占着界面线程。"""
 
     image_done = pyqtSignal(int, str)
 
@@ -628,10 +628,10 @@ def process_next_image(self, progress_dialog):
                     and self.auto_labeling_widget._ocr_mode_current == "existing_ocr"
                 )
 
-                # Hayai is crop-level OCR only.  In batch mode it must always
-                # recognize existing JSON boxes; it has no whole-page detector.
+                # Hayai / Baberu 都是只认字、不找位置的模型。批量时只能认
+                # JSON 里已有的框，它们没有整页检测器。
                 model_type = self.auto_labeling_widget.model_manager.loaded_model_config.get("type")
-                if model_type == "hayai_ocr":
+                if model_type in ("hayai_ocr_v27", "baberu_ocr"):
                     use_existing = True
 
                 # 仅检测颜色（下拉菜单：_ocr_mode_current == "text_color"）
@@ -799,8 +799,10 @@ def show_progress_dialog_and_process(self):
     progress_dialog.show()
 
     model_type = self.auto_labeling_widget.model_manager.loaded_model_config.get("type")
-    if model_type == "hayai_ocr":
-        worker = HayaiBatchWorker(self)
+    if model_type in ("hayai_ocr_v27", "baberu_ocr"):
+        # 只认字的模型：每张图都要挨个裁框识别，几十秒起步，
+        # 必须挪到子线程，不然进度框直接「未响应」
+        worker = OcrBatchWorker(self)
         self._hayai_batch_worker = worker  # Keep the QThread alive for its run.
         worker.image_done.connect(lambda value, _name: progress_dialog.setValue(value))
         worker.finished.connect(

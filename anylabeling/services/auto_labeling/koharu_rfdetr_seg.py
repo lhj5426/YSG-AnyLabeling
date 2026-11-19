@@ -28,7 +28,7 @@ class KoharuRFDETRSeg(RFDETR):
         self.text_mask_radius_scale = float(self.config.get('text_mask_radius_scale', 6.0))
         self.text_mask_dilate_kernel_size = int(self.config.get('text_mask_dilate_kernel_size', 3))
         self.text_mask_dilate_iterations = int(self.config.get('text_mask_dilate_iterations', 1))
-        self.output_order = 'logits_boxes_masks'
+        self.output_order = str(self.config.get('output_order', 'logits_boxes_masks'))
         self.mask_classes = None
         self.mask_thres = float(self.config.get('mask_threshold', 0.0))
         self.num_select = int(self.config.get('num_select', 160))
@@ -99,7 +99,13 @@ class KoharuRFDETRSeg(RFDETR):
 
     def postprocess(self, outs, image_shape):
         if len(outs) < 3: raise RuntimeError('Koharu output requires logits, boxes and masks')
-        logits, raw_boxes, raw_masks = outs[:3]
+        # 不同来源导出的 onnx 输出顺序不一样：
+        #   logits_boxes_masks —— 旧的 1152/768/648 那几份
+        #   boxes_logits_masks —— rfdetr 1.7 自己 export 的（dets, labels, masks）
+        if self.output_order == 'boxes_logits_masks':
+            raw_boxes, logits, raw_masks = outs[:3]
+        else:
+            logits, raw_boxes, raw_masks = outs[:3]
         prob = sigmoid(logits).reshape(logits.shape[0], -1)
         topk = min(self.num_select, prob.shape[1])
         indexes = np.argpartition(-prob, topk-1, axis=1)[:, :topk]

@@ -1,0 +1,15 @@
+type: hayai_ocr_v27
+name: hayai_ocr_v27-r20261119
+provider: JustANormalTinkerer/hayai-ocr-v2.7-supernova-onnx
+display_name: Hayai OCR v2.7 Supernova (ONNX)
+# 模型目录（下面几个文件名是固定的）
+model_dir: models/hayai_ocr_v27
+# 精度：int4 / int8 / fp16 / fp32。
+# 这台机器实测 int4 最快（int8 在显卡上反而 4 秒一个框，int4 是 0.1~0.2 秒）
+precision: int4
+# 一次最多送几个框进去（框越多越划算，显存不够就调小）
+batch_size: 32
+max_new_tokens: 96
+ocr_threshold: 0.0
+use_gpu: true
+threads: 0

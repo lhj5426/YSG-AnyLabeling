@@ -235,6 +235,22 @@ class ModelItem(QFrame):
         """
         )
 
+        # 自定义模型：鼠标悬停能看到什么时候加进来的
+        if self.is_custom_model and model_name != "load_custom_model":
+            import datetime
+
+            shi = model_data.get("added_at")
+            if not shi:
+                lu = model_data.get("config_path") or ""
+                try:
+                    if lu and os.path.exists(lu):
+                        shi = os.path.getmtime(lu)
+                except Exception:  # noqa
+                    shi = None
+            if shi:
+                z = datetime.datetime.fromtimestamp(float(shi))
+                self.setToolTip(f"加载于 {z.strftime('%Y-%m-%d %H:%M')}")
+
     def _on_delete_clicked(self):
         self.deleteRequested.emit(self.model_name)
 

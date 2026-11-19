@@ -209,9 +209,9 @@ def _load_model_from_yaml(yaml_path):
     config['config_file'] = osp.abspath(yaml_path)
     config_dir = osp.dirname(yaml_path)
     model_type = config.get('type', '')
-    # manga_ocr 的模型路径是按「项目根目录」写的（跟主界面一致），它自己有解析；
-    # 这里再按 YAML 所在目录补全就补错了（configs\auto_labeling\models\...），跳过。
-    if model_type != 'manga_ocr':
+    # manga_ocr / baberu_ocr 的模型路径是按「项目根目录」写的（跟主界面一致），
+    # 它们自己有解析；这里再按 YAML 所在目录补全就补错了，跳过。
+    if model_type not in ('manga_ocr', 'baberu_ocr'):
         for key in ['model_path', 'det_model_path', 'rec_model_path', 'rec_char_dict_path']:
             if key in config and not osp.isabs(str(config[key])):
                 config[key] = osp.abspath(osp.join(config_dir, config[key]))
@@ -234,6 +234,9 @@ def _load_model_from_yaml(yaml_path):
         "ppocr_v4": ("anylabeling.services.auto_labeling.ppocr_v4", "PPOCRv4"),
         "ppocr_v6": ("anylabeling.services.auto_labeling.ppocr_v6", "PPOCRv6"),
         "manga_ocr": ("anylabeling.services.auto_labeling.manga_ocr", "MangaOCR"),
+        "baberu_ocr": ("anylabeling.services.auto_labeling.baberu_ocr", "BaberuOCR"),
+        "hayai_ocr_v27": ("anylabeling.services.auto_labeling.hayai_ocr_v27", "HayaiOCRv27"),
+        "wechat_ocr": ("anylabeling.services.auto_labeling.wechat_ocr", "WechatOCR"),
     }
     try:
         if model_type in TYPE_MAP:
