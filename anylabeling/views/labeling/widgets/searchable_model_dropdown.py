@@ -9,6 +9,8 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QVBoxLayout,
     QWidget,
+    QMenu,
+    QApplication,
 )
 from PyQt5.QtCore import Qt, QSize, pyqtSignal
 from PyQt5.QtGui import QIcon
@@ -21,6 +23,23 @@ from anylabeling.views.labeling.utils.qt import new_icon, new_icon_path
 _MODELS_CONFIG_PATH = os.path.join(
     os.path.expanduser("~"), "xanylabeling_data/models.json"
 )
+
+def _yaml_lujing(model_data):
+    """把配置里的 YAML 路径还原成磁盘上的真实路径（内置模型写的是 :/xxx.yaml）"""
+    lu = (model_data or {}).get("config_path") or ""
+    if not lu:
+        return ""
+    if lu.startswith(":/"):
+        try:
+            from importlib.resources import files as _ziyuan
+
+            import anylabeling.configs as _peizhi
+
+            return str(_ziyuan(_peizhi).joinpath("auto_labeling", lu[2:]))
+        except Exception:  # noqa
+            return ""
+    return os.path.normpath(lu)
+
 
 # Maximum number of custom models to remember (excluding "load_custom_model")
 MAX_CUSTOM_MODELS = 30
@@ -268,8 +287,25 @@ class ModelItem(QFrame):
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
-        self.clicked.emit(self.model_name)
+        # 只有左键才加载；右键留给弹出菜单
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.model_name)
         super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):
+        """右键菜单：复制这个模型的 YAML 路径（内置的也能用）"""
+        lu = "" if self.model_name == "load_custom_model" else _yaml_lujing(
+            self.model_data
+        )
+        if not lu:
+            super().contextMenuEvent(event)
+            return
+        caidan = QMenu(self)
+        dong = caidan.addAction("复制 YAML 路径")
+        dong.setEnabled(bool(lu))
+        if caidan.exec_(event.globalPos()) == dong and lu:
+            QApplication.clipboard().setText(lu)
+        event.accept()
 
     def toggle_favorite(self):
         self.is_favorite = not self.is_favorite

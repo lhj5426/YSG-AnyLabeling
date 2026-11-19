@@ -28,6 +28,13 @@ from .model import Model
 from .types import AutoLabelingResult
 
 
+def _ping_jun(kuai):
+    """这一块图的置信度：引擎给的 rate 取平均"""
+    if not kuai:
+        return None
+    return float(sum(float(k.get("rate", 0.0)) for k in kuai) / len(kuai))
+
+
 def _ping_hang(kuai):
     """把同一行里的碎块拼成一句"""
     if not kuai:
@@ -207,7 +214,7 @@ class WechatOCR(Model):
 
     # ------------------------------------------------------------ 跑引擎
     def _pao(self, pian_lu):
-        """一批图片路径 -> {规范化路径: 文字}"""
+        """一批图片路径 -> {规范化路径: (文字, 置信度)}"""
         if not pian_lu:
             return {}
         if self.wcocr is not None:
@@ -238,7 +245,7 @@ class WechatOCR(Model):
                     k for k in (r.get("ocr_response") or [])
                     if float(k.get("rate", 0)) >= self.ocr_threshold
                 ]
-                out[key] = _ping_hang(kuai)
+                out[key] = (_ping_hang(kuai), _ping_jun(kuai))
         return out
 
     def _pao_cli(self, pian_lu):
@@ -286,7 +293,10 @@ class WechatOCR(Model):
                             k for k in (r.get("ocr_response") or [])
                             if float(k.get("rate", 0)) >= self.ocr_threshold
                         ]
-                        out[self._gui(str(rec.get("image_path", "")))] = _ping_hang(kuai)
+                        out[self._gui(str(rec.get("image_path", "")))] = (
+                            _ping_hang(kuai),
+                            _ping_jun(kuai),
+                        )
             return out
         finally:
             shutil.rmtree(gong, ignore_errors=True)
@@ -346,7 +356,7 @@ class WechatOCR(Model):
             lu_lie.append(p)
         jieguo = self._pao(lu_lie)
         wenben = [
-            jieguo.get(str(lu_lie[i]).replace("\\", "/").lower(), "")
+            jieguo.get(str(lu_lie[i]).replace("\\", "/").lower(), ("", None))
             for i in range(len(lu_lie))
         ]
 
@@ -355,11 +365,13 @@ class WechatOCR(Model):
         shapes = []
         for i, box in enumerate(boxes):
             pts = self._points(box)
-            text = wenben[i] if i < len(wenben) else ""
+            text, xin = wenben[i] if i < len(wenben) else ("", None)
             shape = Shape(
                 label="OCR", score=None, shape_type="rectangle", description=text
             )
             shape.points = [QPointF(float(x), float(y)) for x, y in pts]
+            if xin is not None:
+                shape.ocr_confidence = xin
             shapes.append(shape)
         t_done = time.time()
         return AutoLabelingResult(shapes, replace=False), {
@@ -378,7 +390,9 @@ class WechatOCR(Model):
         gong.mkdir(parents=True, exist_ok=True)
         p = gong / "one.png"
         cv2.imencode(".png", bgr)[1].tofile(str(p))
-        text = self._pao([p]).get(str(p).replace("\\", "/").lower(), "")
+        text, _xin = self._pao([p]).get(
+            str(p).replace("\\", "/").lower(), ("", None)
+        )
         if not text:
             return [[]]
         box = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)

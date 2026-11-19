@@ -211,7 +211,13 @@ class _Pipeline:
         return pv, pos_embeds, shapes, np.arange(l_vis, dtype=np.int64)
 
     def run(self, images, max_new_tokens=96, batch_size=32):
-        out = [""] * len(images)
+        return [
+            t for t, _ in self.run_with_score(images, max_new_tokens, batch_size)
+        ]
+
+    def run_with_score(self, images, max_new_tokens=96, batch_size=32):
+        """跟 run 一样，但每个结果多带一个置信度（各字概率的平均）"""
+        out = [("", None)] * len(images)
         # 按 patch 预算分桶，同桶的才拼一个 batch
         buckets = {}
         for idx, im in enumerate(images):
@@ -228,8 +234,8 @@ class _Pipeline:
                 preds = self._run_batch(
                     [images[i] for i in chunk], mp, max_new_tokens
                 )
-                for i, t in zip(chunk, preds):
-                    out[i] = t
+                for i, jieguo in zip(chunk, preds):
+                    out[i] = jieguo
         return out
 
     def _run_batch(self, images, max_patches, max_new_tokens):
@@ -252,6 +258,11 @@ class _Pipeline:
         nxt = np.argmax(logits, axis=-1).astype(np.int64)
         unfinished = (nxt != eos) & (nxt != pad)
         seqs = [[int(t)] for t in nxt]
+        probs = [[] for _ in range(b)]
+        _p = _ruan_max(logits.reshape(b, -1))
+        for j in range(b):
+            if unfinished[j]:
+                probs[j].append(float(_p[j, int(nxt[j])]))
         mask = np.concatenate([vis_valid, np.ones((b, 1), dtype=np.int64)], axis=1)
 
         for step in range(1, max_new_tokens):
@@ -271,17 +282,28 @@ class _Pipeline:
             nxt = np.where(
                 unfinished, np.argmax(logits, axis=-1).astype(np.int64), pad
             )
+            _p = _ruan_max(logits.reshape(b, -1))
             for j in range(b):
                 if unfinished[j]:
                     seqs[j].append(int(nxt[j]))
+                    probs[j].append(float(_p[j, int(nxt[j])]))
             unfinished &= (nxt != eos) & (nxt != pad)
 
-        return [
-            self.tokenizer.decode(
+        jieguo = []
+        for j, s in enumerate(seqs):
+            wenben = self.tokenizer.decode(
                 [t for t in s if t not in (bos, eos, pad)], skip_special_tokens=True
             )
-            for s in seqs
-        ]
+            xin = float(np.mean(probs[j])) if probs[j] else None
+            jieguo.append((wenben, xin))
+        return jieguo
+
+
+def _ruan_max(x):
+    """按最后一维做 softmax，拿每个候选词的概率"""
+    x = x - np.max(x, axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / np.sum(e, axis=-1, keepdims=True)
 
 
 class HayaiOCRv27(Model):
@@ -394,19 +416,21 @@ class HayaiOCRv27(Model):
 
         crops = [self._crop(bgr, b) for b in boxes]
         # 一次性整批送进去，这是 v2.7 比旧版快的地方
-        texts = self.pipe.run(
+        yuedu = self.pipe.run_with_score(
             crops, max_new_tokens=self.max_new_tokens, batch_size=self.batch_size
         )
 
         from anylabeling.views.labeling.shape import Shape
 
         shapes = []
-        for box, text in zip(boxes, texts):
+        for box, (text, xin) in zip(boxes, yuedu):
             pts = self._points(box)
             shape = Shape(
                 label="OCR", score=None, shape_type="rectangle", description=text or ""
             )
             shape.points = [QPointF(float(x), float(y)) for x, y in pts]
+            if xin is not None:
+                shape.ocr_confidence = xin
             shapes.append(shape)
 
         t_done = time.time()

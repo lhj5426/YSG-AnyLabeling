@@ -631,7 +631,7 @@ def process_next_image(self, progress_dialog):
                 # Hayai / Baberu 都是只认字、不找位置的模型。批量时只能认
                 # JSON 里已有的框，它们没有整页检测器。
                 model_type = self.auto_labeling_widget.model_manager.loaded_model_config.get("type")
-                if model_type in ("hayai_ocr_v27", "baberu_ocr"):
+                if model_type in ("hayai_ocr_v27", "baberu_ocr", "wechat_ocr"):
                     use_existing = True
 
                 # 仅检测颜色（下拉菜单：_ocr_mode_current == "text_color"）
@@ -799,7 +799,7 @@ def show_progress_dialog_and_process(self):
     progress_dialog.show()
 
     model_type = self.auto_labeling_widget.model_manager.loaded_model_config.get("type")
-    if model_type in ("hayai_ocr_v27", "baberu_ocr"):
+    if model_type in ("hayai_ocr_v27", "baberu_ocr", "wechat_ocr"):
         # 只认字的模型：每张图都要挨个裁框识别，几十秒起步，
         # 必须挪到子线程，不然进度框直接「未响应」
         worker = OcrBatchWorker(self)

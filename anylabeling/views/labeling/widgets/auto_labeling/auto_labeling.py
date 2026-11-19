@@ -706,6 +706,46 @@ class AutoLabelingWidget(QWidget):
             sorted_data[key] = collections.OrderedDict(sorted_inner_items)
         return sorted_data
 
+    def _ji_lu_jiazai(self, config_path):
+        """每次加载模型都把「加载时间」写成现在，历史列表按最近用过的排"""
+        if not config_path:
+            return
+        import time as _time
+
+        try:
+            quan = load_json(_MODELS_CONFIG_PATH)
+        except Exception:  # noqa
+            return
+        models_data = quan.get("models_data") or {}
+        custom = models_data.get("Custom") or {}
+        lu = os.path.normpath(os.path.abspath(config_path))
+        mudi = None
+        for key, info in custom.items():
+            if key == "load_custom_model":
+                continue
+            lujing = info.get("config_path") or ""
+            if lujing and os.path.normpath(os.path.abspath(lujing)) == lu:
+                info["added_at"] = _time.time()
+                mudi = key
+        if mudi is None:
+            return
+        try:
+            save_json(quan, _MODELS_CONFIG_PATH)
+        except Exception:  # noqa
+            return
+
+        # 立刻按新时间重排，并把刚加载的这个标成选中
+        try:
+            shuju = self.init_model_data()
+            if "load_custom_model" in shuju.get("Custom", {}):
+                shuju["Custom"]["load_custom_model"]["selected"] = False
+            if mudi in shuju.get("Custom", {}):
+                shuju["Custom"][mudi]["selected"] = True
+            self.model_dropdown.update_models_data(shuju)
+            self.model_dropdown.save_models_data()
+        except Exception:  # noqa
+            logger.exception("刷新模型加载时间失败")
+
     def show_model_dropdown(self):
         """Show the model dropdown"""
         button_pos = self.model_selection_button.mapToGlobal(QPoint(0, 0))
@@ -779,6 +819,9 @@ class AutoLabelingWidget(QWidget):
                 self.model_selection_button.setEnabled(False)
 
             return
+
+        # 每次加载都刷新时间，历史里就按最近用过的排
+        self._ji_lu_jiazai(self.model_info[model_name]["config_path"])
 
         self.clear_auto_labeling_action_requested.emit()
         self.model_selection_button.setText(
